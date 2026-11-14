@@ -159,11 +159,17 @@ fn offset_units_only_as_a_lone_literal() {
     }
     close(val("100 °C + 5 Δ°C ="), 378.15, Dim::TEMPERATURE);
     close(val("5 K + 100 °C ="), 378.15, Dim::TEMPERATURE);
-    // Variables holding absolute temperatures are not tracked.
+    close(val("5 Δ°F + 100 °C ="), 373.15 + 5.0 * 5.0 / 9.0, Dim::TEMPERATURE);
+    close(val("100 °C + 5 °R ="), 373.15 + 5.0 * 5.0 / 9.0, Dim::TEMPERATURE);
+    // An absolute literal beside a variable is refused; variables alone are not tracked.
     let mut env = Env::new();
     run(&mut env, "T_1 := 100 °C").expect("defines");
     run(&mut env, "T_2 := 20 °C").expect("defines");
     close(shown(&mut env, "T_1 - T_2 ="), 80.0, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_1 + 5 K ="), 378.15, Dim::TEMPERATURE);
+    for src in ["T_1 + 5 °C =", "100 °C + T_1 =", "T_1 - 5 °F =", "100 °C + 5 m ="] {
+        assert_eq!(run(&mut env, src), Err(CalcError::Unit(UnitError::AffineTemperature)), "{src}");
+    }
     for src in ["°F =", "1 / °F =", "5 °F / s =", "x := 2 °F^2 =", "3 + °C =", "-(5 °F) =", "(5 °F)^2 =", "2 (5 °F) =", "(5 °F) / 2 ="] {
         assert_eq!(err(src), CalcError::Unit(UnitError::AffineTemperature), "{src}");
     }

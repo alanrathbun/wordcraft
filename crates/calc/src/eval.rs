@@ -7,7 +7,7 @@
 
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, Op, Show, Stmt};
-use craft_units::{Quantity, Scale, UnitError, lookup, parse_unit};
+use craft_units::{Dim, Quantity, Scale, UnitError, lookup, parse_unit};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
@@ -192,9 +192,11 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Quantity,
             // Offset literals may be combined with an interval but not scaled (`5 °F/s` would be a
             // wrong number that looks right) or combined with each other.
             if matches!(op, Op::Add | Op::Sub) {
-                // Two absolute temperatures can't be added or subtracted (`100 °C + 5 °C` has no
-                // meaning); an absolute one with an interval (`100 °C + 5 K`) is fine.
-                if is_offset_literal(cx, fr, a) && is_offset_literal(cx, fr, b) {
+                // An absolute temperature literal may only be combined with a temperature
+                // interval literal (`100 °C + 5 K`); `100 °C + 5 °C`, `T + 5 °C` and `100 °C + T`
+                // have no meaning, and a variable can't be told apart from an absolute value.
+                let (abs_a, abs_b) = (is_offset_literal(cx, fr, a), is_offset_literal(cx, fr, b));
+                if (abs_a && !is_interval_literal(cx, fr, b)) || (abs_b && !is_interval_literal(cx, fr, a)) {
                     return Err(CalcError::Unit(UnitError::AffineTemperature));
                 }
             } else {
@@ -240,9 +242,9 @@ fn apply(op: Op, x: Quantity, y: Quantity) -> Result<Quantity, CalcError> {
     .map_err(unit)
 }
 
-/// `5 °F`: a number times an offset unit that no variable or constant shadows is an absolute
-/// temperature. Anything else involving an offset unit is refused in [`resolve`].
-fn offset_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> Option<Result<Quantity, CalcError>> {
+/// `number unit` where the unit name is not shadowed by a parameter, variable or constant: the
+/// number and the unit's scale.
+fn unit_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> Option<(f64, Scale)> {
     let v = match num {
         Expr::Num(v) => *v,
         Expr::Unary(Op::Neg, inner) => match &**inner {
@@ -257,8 +259,21 @@ fn offset_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> 
     if fr.param(n).is_some() || cx.env.entries.contains_key(n.as_str()) || is_constant(n) {
         return None;
     }
-    let scale = lookup(n).filter(|s| s.offset != 0.0)?;
-    Some(from_scale(v, &scale))
+    Some((v, lookup(n)?))
+}
+
+/// `5 °F`: a number times an offset unit that no variable or constant shadows is an absolute
+/// temperature. Anything else involving an offset unit is refused in [`resolve`].
+fn offset_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> Option<Result<Quantity, CalcError>> {
+    let (v, scale) = unit_literal(cx, fr, num, unit_name)?;
+    (scale.offset != 0.0).then(|| from_scale(v, &scale))
+}
+
+/// Whether `e` is `number unit` for a temperature unit with no offset (`5 K`, `5 °R`, `5 Δ°C`):
+/// a temperature interval.
+fn is_interval_literal(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr) -> bool {
+    matches!(e, Expr::Binary(Op::Mul, a, b)
+        if unit_literal(cx, fr, a, b).is_some_and(|(_, s)| s.offset == 0.0 && s.dim == Dim::TEMPERATURE))
 }
 
 /// Whether `e` is exactly a `number offset-unit` literal.
