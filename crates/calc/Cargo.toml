@@ -1,0 +1,17 @@
+[package]
+name = "wordcraft-calc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WordCraft calculation language: parser and syntax tree for Mathcad-style inline calculations"
+
+[lints]
+workspace = true
+
+[dependencies]
+craft-units = { path = "../../../craft-libs/crates/units" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
