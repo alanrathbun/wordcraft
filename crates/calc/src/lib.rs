@@ -3,7 +3,8 @@
 //! Inline calculations are written the way an engineer writes them on paper: `P := 1500 lbf`,
 //! `σ := P/A_b = ? ksi`, `f(x, y) := x^2 + y`. This crate turns that text into a syntax tree
 //! ([`parse`]), reports what a statement defines and uses ([`defined_name`], [`free_names`]), and
-//! evaluates it against the names defined so far ([`run_stmt`], [`Env`]).
+//! evaluates it against the names defined so far ([`run_stmt`], [`Env`]). [`recalc`] runs every
+//! calculation in a document in dependency order and rewrites what each one shows ([`render`]).
 //!
 //! The parser knows nothing about units or variables: `1500 lbf` is the product of the number 1500
 //! and the name `lbf`, and the evaluator decides what each name means. Source text is hostile
@@ -15,10 +16,13 @@ mod ast;
 mod eval;
 mod funcs;
 mod parse;
+mod recalc;
+pub mod render;
 
 pub use ast::{Expr, Op, Show, Stmt, defined_name, free_names};
 pub use eval::{Env, check_name, eval_expr, run_stmt};
 pub use parse::parse;
+pub use recalc::{RecalcReport, check_new_name, defined_names, mark_stale, recalc};
 
 /// An error from parsing or evaluating a calculation. The message is shown to the author next to
 /// the calculation, so it is written for them rather than for a programmer.
