@@ -285,7 +285,7 @@ fn equations_survive_a_round_trip() {
     let n = p.len();
     p.insert_object(
         n,
-        wordcraft_doc::para::InlineObject::Equation { linear: "π r^2".into(), display: false, math: Default::default() },
+        wordcraft_doc::para::InlineObject::Equation { linear: "π r^2".into(), display: false, math: Default::default(), calc: None },
         &Default::default(),
     )
     .unwrap();

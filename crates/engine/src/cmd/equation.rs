@@ -147,7 +147,7 @@ fn classified_noop(s: &mut Session) {
 /// equation that only gets normalized is a state change, never an IME content change.
 fn with_eq<R>(s: &mut Session, at: &Pos, f: impl FnOnce(&mut Math, &mut bool) -> R) -> Result<(R, EquationEffect), CmdError> {
     let para = s.doc.para_mut(at.story, &at.path)?;
-    let Some(InlineObject::Equation { linear, display, math }) = para.object_at_mut(at.off) else {
+    let Some(InlineObject::Equation { linear, display, math, .. }) = para.object_at_mut(at.off) else {
         return Err(CmdError::Failed("no equation there".into()));
     };
     let normalized = math.nodes.is_empty() && !linear.is_empty() && !math.linear;
@@ -236,7 +236,7 @@ fn insert_nodes_as_equation(s: &mut Session, nodes: Arg, v: &Value) -> CmdResult
         Some(p) if !nodes.is_empty() => p,
         _ => MathPos::new(Vec::new(), me::units(&nodes)),
     };
-    let obj = InlineObject::Equation { linear, display, math: Math { nodes, ..Default::default() } };
+    let obj = InlineObject::Equation { linear, display, math: Math { nodes, ..Default::default() }, calc: None };
     let end = s.doc.insert_object(&at, obj, &props)?;
     if p::bool(v, "edit").unwrap_or(true) {
         let Some(session) = crate::next_math_session() else {
@@ -776,7 +776,7 @@ fn set(s: &mut Session, v: &Value) -> CmdResult {
 
 fn get(s: &mut Session, _: &Value) -> CmdResult {
     let at = equation_at_caret(s).ok_or_else(|| CmdError::Disabled("no equation at the caret".into()))?;
-    let Some(InlineObject::Equation { linear, display, math }) = s.doc.para_at(&at).and_then(|p| p.object_at(at.off)) else {
+    let Some(InlineObject::Equation { linear, display, math, .. }) = s.doc.para_at(&at).and_then(|p| p.object_at(at.off)) else {
         return Err(CmdError::Failed("no equation there".into()));
     };
     let nodes = if math.nodes.is_empty() && !math.linear { parse_linear(linear) } else { math.nodes.clone() };

@@ -461,6 +461,7 @@ fn pasted_box_copies_count_the_objects_they_copy() {
         linear: String::new(),
         display: false,
         math: crate::math::Math { nodes: crate::math::parse_linear(&"z".repeat(5000)), ..Default::default() },
+        calc: None,
     };
     assert!(object_cost(&eq) >= 5000);
 }

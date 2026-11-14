@@ -79,6 +79,7 @@ impl Document {
             kept: Default::default(),
             missing_pictures: Default::default(),
             fit_state: None,
+            calc_settings: None,
         }
     }
 
@@ -158,6 +159,7 @@ impl Document {
             kept: _,
             missing_pictures: _,
             fit_state: _,
+            calc_settings,
         } = self;
         let Document {
             body: other_body,
@@ -180,6 +182,7 @@ impl Document {
             kept: _,
             missing_pictures: _,
             fit_state: _,
+            calc_settings: other_calc_settings,
         } = other;
         same_blocks(body, other_body)
             && same_parts(parts, other_parts)
@@ -197,6 +200,7 @@ impl Document {
             && same_bytes(media, other_media)
             && same_bytes(passthrough, other_passthrough)
             && same_glossary(glossary, other_glossary)
+            && calc_settings == other_calc_settings
     }
 
     pub fn story(&self, s: StoryRef) -> Option<&Blocks> {

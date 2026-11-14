@@ -2688,6 +2688,42 @@ fn select_extend_from_a_table_paragraph_selects_the_document() {
     assert_eq!(b, s.doc.end_of(StoryRef::Body));
 }
 
+/// A calculation equation, a quoted value and the document's calculation settings survive a
+/// `.json` save (WordCraft's native format, which AutoRecover snapshots share) and reopen.
+#[test]
+fn calc_survives_native_format() {
+    use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, UnitSystem, calc_field_instr};
+    use wordcraft_doc::para::{InlineObject, Paragraph};
+    let mut p = Paragraph::with_text("", Default::default());
+    let region = CalcRegion { id: 3, source: "σ_max := P / A".into(), unit: Some("ksi".into()), precision: Some(2), state: CalcState::Stale };
+    let calc = InlineObject::Equation { linear: "σ_max=12.5".into(), display: true, math: Default::default(), calc: Some(Box::new(region)) };
+    let quoted = InlineObject::Field {
+        instr: calc_field_instr("σ_max", Some("ksi"), Some(2)),
+        result: "12.50 ksi".into(),
+        locked: true,
+        dirty: false,
+        code: false,
+        form: String::new(),
+    };
+    for o in [calc, quoted] {
+        let end = p.len();
+        p.insert_object(end, o, &Default::default()).unwrap();
+    }
+    let mut doc = wordcraft_doc::Document::new();
+    doc.body = vec![wordcraft_doc::para_block(p)];
+    doc.calc_settings = Some(CalcSettings { system: UnitSystem::Si, precision: 5, manual: true });
+    let saved = crate::io::save_bytes("calc.json", &doc).unwrap();
+    let back = crate::io::open_bytes("calc.json", &saved).unwrap();
+    assert_eq!(back, doc);
+    assert_eq!(back.calc_settings, doc.calc_settings);
+    assert!(
+        matches!(&back.body[0].as_para().unwrap().objects[0], InlineObject::Equation { calc: Some(c), .. } if c.id == 3 && c.state == CalcState::Stale)
+    );
+    // A document that never used calculations writes neither key.
+    let plain = String::from_utf8(crate::io::save_bytes("plain.json", &wordcraft_doc::Document::new()).unwrap()).unwrap();
+    assert!(!plain.contains("calc"), "{plain}");
+}
+
 /// #1596, #3618: tables nest only as deep as a `.json` save (and so an AutoRecover snapshot)
 /// reads back. Insert › Table in the deepest cell says so; a table pasted there brings its text
 /// as paragraphs.

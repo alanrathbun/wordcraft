@@ -651,7 +651,7 @@ impl<'a> Builder<'a> {
                 Inline::Equation { linear, display } => {
                     let linear = clean_text(linear);
                     if !linear.is_empty() {
-                        let obj = InlineObject::Equation { linear, display: *display, math: Default::default() };
+                        let obj = InlineObject::Equation { linear, display: *display, math: Default::default(), calc: None };
                         append(&mut out, "", &CharProps::default(), Some(obj));
                     }
                 }

@@ -8,7 +8,7 @@ use wordcraft_doc::{Document, Paragraph, para_block};
 fn eq_para(before: &str, linear: &str, display: bool) -> std::sync::Arc<wordcraft_doc::Block> {
     let mut p = Paragraph::new();
     p.text = format!("{before}{OBJ}");
-    p.objects.push(InlineObject::Equation { linear: linear.into(), display, math: Default::default() });
+    p.objects.push(InlineObject::Equation { linear: linear.into(), display, math: Default::default(), calc: None });
     p.runs = vec![wordcraft_doc::para::Run { len: p.text.len(), props: Default::default() }];
     para_block(p)
 }

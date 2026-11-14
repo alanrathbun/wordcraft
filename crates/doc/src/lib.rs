@@ -12,6 +12,7 @@
 
 pub mod bidi;
 mod byte_store;
+pub mod calc;
 pub mod cfb_guard;
 pub mod chart;
 mod cjk_numbers;
@@ -149,6 +150,9 @@ pub struct Document {
     /// Cumulative fit-to-page typography reduction state; internal tracking outside user-visible custom properties.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fit_state: Option<shrink::FitState>,
+    /// Calculation settings (unit system, precision, manual mode); `None` = the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calc_settings: Option<calc::CalcSettings>,
 }
 
 #[cfg(test)]

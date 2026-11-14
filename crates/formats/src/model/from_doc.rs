@@ -612,7 +612,7 @@ fn flow_paras_in(doc: &Document, p: &Paragraph, opts: FlowOpts) -> Vec<Para> {
                     }
                     out.inlines.extend(graphic_inline(doc, (alt, *w, *h), float, graphic, opts));
                 }
-                Some(InlineObject::Equation { linear, display, math }) => {
+                Some(InlineObject::Equation { linear, display, math, .. }) => {
                     if !buf.is_empty() {
                         out.push_text(&std::mem::take(&mut buf), &f);
                     }

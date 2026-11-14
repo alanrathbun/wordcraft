@@ -6881,6 +6881,7 @@ fn a_paragraph_with_a_float_for_a_later_page_keeps_its_equation_numbers() {
         linear: s.into(),
         display: true,
         math: wordcraft_doc::math::Math { nodes: wordcraft_doc::math::parse_linear(s), ..Default::default() },
+        calc: None,
     };
     let mut d = Document::from_text(&format!("{}\n", "The quick brown fox jumps over the lazy dog. ".repeat(400)));
     let anchor = lines_on(&lay(&d), 1)[5].2;
@@ -11718,7 +11719,7 @@ fn an_equations_box_spans_its_width_and_its_line() {
     let mut d = Document::from_text("Inline  and text after it.");
     let math = wordcraft_doc::math::Math { nodes: wordcraft_doc::math::parse_linear("x=(a+b)/c"), ..Default::default() };
     let p = d.para_mut(StoryRef::Body, &Path::top(0)).unwrap();
-    p.insert_object(7, InlineObject::Equation { linear: "x=(a+b)/c".into(), display: false, math }, &Default::default()).unwrap();
+    p.insert_object(7, InlineObject::Equation { linear: "x=(a+b)/c".into(), display: false, math, calc: None }, &Default::default()).unwrap();
     let l = lay(&d);
     let b = l.equation_box(&Pos::body(0, 7), 0).unwrap();
     let before = l.caret(&Pos::body(0, 6)).unwrap();
@@ -11741,6 +11742,7 @@ fn relaid_paragraphs_keep_their_equation_numbers() {
         linear: s.into(),
         display: true,
         math: wordcraft_doc::math::Math { nodes: wordcraft_doc::math::parse_linear(s), ..Default::default() },
+        calc: None,
     };
     let mut d = Document::from_text("Before\n\nTail");
     // Paragraph 1: a numbered equation on a new page (laid out again there).
@@ -13074,6 +13076,7 @@ fn exact_math_keeps_run_baseline() {
                                 linear: text.into(),
                                 display,
                                 math: wordcraft_doc::math::Math { nodes: wordcraft_doc::math::parse_linear(text), ..Default::default() },
+                                calc: None,
                             },
                             &chr,
                         )
