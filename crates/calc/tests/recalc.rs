@@ -467,6 +467,22 @@ fn mark_stale_greys_results_with_approx() {
 }
 
 #[test]
+fn mark_stale_marks_quoted_values_once() {
+    let mut d = doc_of(vec![
+        para_block(para(vec![calc_eq(1, "P := 1500 lbf"), calc_eq(2, "A_b := 2.5 in^2"), calc_eq(3, "σ := P/A_b")])),
+        para_block(para(vec![field("WCCALC σ"), field("WCCALC nope")])),
+    ]);
+    recalc(&mut d, &no_page);
+    assert_eq!(field_results(&d), ["600 psi", "?"]);
+    mark_stale(&mut d);
+    assert_eq!(field_results(&d), ["≈ 600 psi", "?"]);
+    mark_stale(&mut d);
+    assert_eq!(field_results(&d), ["≈ 600 psi", "?"]);
+    recalc(&mut d, &no_page);
+    assert_eq!(field_results(&d), ["600 psi", "?"]);
+}
+
+#[test]
 fn mark_stale_without_a_readable_result_shows_a_grey_question_mark() {
     let mut d = doc_with(&["x := 2 ="]);
     if let Block::Para(p) = Arc::make_mut(&mut d.body[0])
@@ -495,6 +511,8 @@ fn display_renders_from_the_syntax_tree() {
     assert_eq!(render::display("A_b := 2.5 in^2", None, &CalcState::Fresh), "A_b≔2.5 \"in\"^2");
     assert_eq!(render::display("M := 5 kN*m", None, &CalcState::Fresh), "M≔5 \"kN\"·\"m\"");
     assert_eq!(render::display("f(x, y) := x^2 + y", None, &CalcState::Fresh), "f(x,y)≔x^2+y");
+    assert_eq!(render::display("f_a(t) := t^2", None, &CalcState::Fresh), "f_a(t)≔t^2");
+    assert_eq!(render::display("y := f_a(2) =", Some(&f("4", "")), &CalcState::Fresh), "y≔f_a(2)=4");
     assert_eq!(render::display("z := a*b/c", None, &CalcState::Fresh), "z≔(a·b)/c");
     assert_eq!(render::display("z := a/(b*c)", None, &CalcState::Fresh), "z≔a/(b·c)");
     assert_eq!(render::display("z := a - (b - c)", None, &CalcState::Fresh), "z≔a-(b-c)");
@@ -511,6 +529,18 @@ fn display_renders_from_the_syntax_tree() {
     assert_eq!(render::display("z := 1e300", None, &CalcState::Fresh), "z≔1×10^300");
     assert_eq!(render::display("z := 1.5e-7 m", None, &CalcState::Fresh), "z≔1.5×10^(-7) \"m\"");
     assert_eq!(render::display("z := 1.5×10^-5 m =", Some(&f("1.5×10^-5", "m")), &CalcState::Fresh).rsplit('=').next(), Some("1.5×10^(-5) \"m\""));
+}
+
+#[test]
+fn a_subscripted_function_keeps_its_arguments_out_of_the_subscript() {
+    let mut d = doc_with(&["f_a(t) := t^2"]);
+    recalc(&mut d, &no_page);
+    let (_, _, math) = region(&d, 1);
+    match math.nodes.first() {
+        Some(MNode::Script { sub, .. }) => assert_eq!(runs(sub).iter().map(|r| r.text.as_str()).collect::<String>(), "a"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(math.nodes.get(1), Some(MNode::Delim { .. })), "{:?}", math.nodes);
 }
 
 #[test]

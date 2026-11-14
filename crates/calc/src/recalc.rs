@@ -131,7 +131,8 @@ pub fn check_new_name(doc: &Document, name: &str, editing: Option<u64>) -> Resul
 }
 
 /// Mark every current ([`CalcState::Fresh`]) region in the body [`CalcState::Stale`], for manual
-/// recalculation: its result is redrawn grey after `≈`, so it never looks current.
+/// recalculation: its result is redrawn grey after `≈`, so it never looks current. Quoted values
+/// (`WCCALC` fields) get a leading `≈ ` too; [`recalc`] puts back the exact value.
 pub fn mark_stale(doc: &mut Document) {
     let found = collect(&doc.body);
     let mut edits = Vec::new();
@@ -144,6 +145,15 @@ pub fn mark_stale(doc: &mut Document) {
         let shown = stmt.as_ref().ok().filter(|s| shows_value(s)).and(old);
         let display = rendered(&stmt, &r.source, shown.as_ref(), &CalcState::Stale);
         edits.push(Edit { at: r.at.clone(), change: Change::Region { id: r.id, state: CalcState::Stale, display: Some(display) } });
+    }
+    // A quoted value is out of date too: it gets the same `≈`, once.
+    for f in &found.fields {
+        if let Some(InlineObject::Field { result, .. }) = object(&doc.body, &f.at)
+            && result != "?"
+            && !result.starts_with('≈')
+        {
+            edits.push(Edit { at: f.at.clone(), change: Change::Field { result: format!("≈ {result}") } });
+        }
     }
     apply(&mut doc.body, edits);
 }
