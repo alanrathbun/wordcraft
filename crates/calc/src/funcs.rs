@@ -130,9 +130,13 @@ fn same(a: Quantity, b: Quantity) -> Result<(), CalcError> {
 /// The dimension of a value that may come from either operand: the angle exponent is the shared
 /// one, else the non-zero one, else zero (the same rule as the units crate's sum).
 fn merge(a: Dim, b: Dim) -> Dim {
-    let (x, y) = (a.exp[7], b.exp[7]);
+    // The angle exponent is the one `Dim::ANGLE` sets.
+    let Some(i) = Dim::ANGLE.exp.iter().position(|&e| e != 0) else {
+        return a;
+    };
+    let (x, y) = (a.exp[i], b.exp[i]);
     let mut d = a;
-    d.exp[7] = if x == y || y == 0 {
+    d.exp[i] = if x == y || y == 0 {
         x
     } else if x == 0 {
         y
