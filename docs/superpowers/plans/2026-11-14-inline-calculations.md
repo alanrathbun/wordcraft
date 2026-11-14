@@ -10,7 +10,7 @@ to `.docx` as ordinary Word equations and become live again when reopened in Wor
 - **`craft-units`** is a new crate in the `craft-libs` fork. It owns dimensions, quantities, the
   unit catalog, unit-expression parsing and display formatting.
 - **`wordcraft-calc`** is a new crate in WordCraft. It owns the calculation language, the
-  evaluator and a document-order recalculation pass.
+  evaluator and a recalculation pass that evaluates in dependency order.
 - **No new rendering code in `wordcraft-doc`.** A calculation is the existing
   `InlineObject::Equation` with an optional `calc` payload; the pass writes the rendered result
   into the equation's existing `linear`/`math` fields, so layout and rendering need no change.
@@ -62,9 +62,10 @@ serde/serde_json, quick-xml (already used by `crates/docx`), proptest (already a
 
 ## Review Focus
 
-1. **Variable/unit name clashes:** `m := 5 kg` then `2 m =` must give `10 kg` (the variable shadows
-   metre from its definition onward), while `2 m =` *above* the definition gives `2 m`. Test:
-   Task 5 `shadowing_is_positional`.
+1. **Variable/unit name clashes:** `m := 5 kg` and `A := 2 in^2` are rejected as `ReservedName`.
+   `2 m =` anywhere in the document still means 2 metres. A pasted clash is an error, never a
+   silent re-meaning of the unit. Test: Task 5 `unit_names_cannot_be_variables`, Task 7
+   `pasted_unit_name_definition_is_error`.
 2. **Copy-paste of a calculation duplicates its region ID.** The recalculation pass must give
    duplicates fresh IDs, keeping the first. Test: Task 7 `duplicate_ids_are_reassigned`.
 3. **Hostile numeric input never panics:**
@@ -73,8 +74,9 @@ serde/serde_json, quick-xml (already used by `crates/docx`), proptest (already a
    - Test: Task 4 `hostile_sources_error_not_panic`, Task 5 `non_finite_results_are_errors`.
 4. **Undo/redo keeps results consistent.** After undoing an input change, every dependent result
    shows the old value again. Test: Task 8 `undo_restores_results`.
-5. **Tracked deletions:** a calculation inside a tracked-deleted range is skipped for definitions.
-   Its name is not defined below it. Test: Task 7 `tracked_deleted_region_is_ignored`.
+5. **Tracked deletions:** a calculation inside a tracked-deleted range defines nothing, so its
+   name is undefined everywhere, and re-typing that name elsewhere is not a duplicate. Test:
+   Task 7 `tracked_deleted_region_is_ignored`.
 
 ---
 
@@ -280,27 +282,35 @@ Repo: WordCraft. All later tasks are in this repo.
   - `pub enum Expr { Num(f64), Name(String), Quantity(f64, String) /* number+unit literal */, Unary(Op, Box<Expr>), Binary(Op, Box<Expr>, Box<Expr>), Call(String, Vec<Expr>), Abs(Box<Expr>) }`
   - `pub enum Op { Add, Sub, Mul, Div, Pow, Neg }`
   - `pub fn parse(src: &str) -> Result<Stmt, CalcError>`
-  - `#[derive(Debug, Clone, PartialEq, thiserror::Error)] pub enum CalcError { #[error("{0}")] Syntax(String), #[error("{0} isn't defined above this point")] Undefined(String), #[error("{0}")] Unit(#[from] craft_units::UnitError), #[error("result isn't a finite number")] NonFinite, #[error("too complex")] TooComplex, #[error("{0} expects {1} argument(s)")] Arity(String, usize), #[error("depends on an error above")] Upstream }`
+  - `#[derive(Debug, Clone, PartialEq, thiserror::Error)] pub enum CalcError { #[error("{0}")] Syntax(String), #[error("{0} isn't defined")] Undefined(String), #[error("{0}")] Unit(#[from] craft_units::UnitError), #[error("result isn't a finite number")] NonFinite, #[error("too complex")] TooComplex, #[error("{0} expects {1} argument(s)")] Arity(String, usize), #[error("depends on a calculation with an error")] Upstream, #[error("{name} is already defined {} — choose a unique name", page.map_or("elsewhere in the document".to_string(), |p| format!("on page {p}")))] Duplicate { name: String, page: Option<u32> }, #[error("{0} is a unit, function or constant name — choose another name")] ReservedName(String), #[error("{0} depend on each other")] Circular(String) }`
+    — `Circular` holds the names joined with `, `
 - **Lexing:**
   - `:=` and `≔` define; `=` evaluates; `·`, `×` and `*` multiply; `√` is `sqrt`; `|…|` is
     absolute value
   - names are a letter (including Greek) followed by letters, digits or `_`, with an optional
     `_subscript`
-  - a number immediately followed (with or without a space) by a name is a `Quantity` literal
-    when that name parses as a unit **and** isn't a variable. The evaluator decides that, so the
-    parser emits `Binary(Mul, Num, Name)` and keeps no unit/variable knowledge.
+  - a number immediately followed (with or without a space) by a name is emitted as
+    `Binary(Mul, Num, Name)`. The parser keeps no unit/variable knowledge, and the evaluator
+    resolves the name. Variables can never be unit names, so this is unambiguous.
+- **Also produces, in `ast.rs`:**
+  - `pub fn defined_name(s: &Stmt) -> Option<&str>`
+  - `pub fn free_names(s: &Stmt) -> Vec<String>` — the names an expression uses, minus a
+    function's own parameters, deduplicated, in first-use order; Task 7 builds the dependency
+    graph from it
   - implicit multiplication between adjacent factors (`2 P`, `P A`) is allowed
 - **Limits:** source above 16 kB is `TooComplex`; expression depth is limited to 64, beyond
   which it is `TooComplex`.
 
 - [ ] **Step 1: Write failing tests:**
   - `define_with_units` — `"P := 1500 lbf"` gives `Define{name:"P", params:[], body: Binary(Mul, Num(1500.0), Name("lbf")), show: None}`
-  - `define_and_show` — `"σ := P/A ="` gives `show: Some(Show{unit: None})`
+  - `define_and_show` — `"σ := P/A_b ="` gives `show: Some(Show{unit: None})`
   - `eval_with_unit` — `"σ = ? ksi"` and `"σ = ksi"` both give `Eval{.., show: Show{unit: Some("ksi")}}`
   - `function_def` — `"f(x, y) := x^2 + y"` gives params `["x","y"]`
   - `subscripted_greek` — `"σ_allow := 20 ksi"` gives name `"σ_allow"`
   - `precedence` — `"a + b*c^2"` gives the expected tree, `^` right-associative
   - `unary_minus_binds_looser_than_pow` — `"-x^2"` gives `Neg(Pow(x,2))`
+  - `free_names_excludes_params` — `free_names(parse("f(x) := x*k + g(x)"))` gives
+    `["k", "g"]`; `defined_name` of it is `Some("f")`
   - `hostile_sources_error_not_panic`:
     - `"(".repeat(200)` gives `TooComplex`
     - `"x:=" + "1+".repeat(60_000)` gives `TooComplex`
@@ -328,8 +338,13 @@ Repo: WordCraft. All later tasks are in this repo.
   - `pub fn eval_expr(env: &Env, e: &Expr) -> Result<Quantity, CalcError>`
   - `pub fn run_stmt(env: &mut Env, s: &Stmt) -> Result<Option<Quantity>, CalcError>` returns
     `Some(value)` when the statement shows a result
-- **Name resolution order:** user variable, then user function parameter in scope, then the
-  constants `π`/`pi` and `e`, then a unit (`lookup`), otherwise `Undefined`. Units resolve to
+- **Also produces:** `pub fn check_name(name: &str) -> Result<(), CalcError>`, which gives
+  `ReservedName` when the name is a unit (including prefixed forms such as `mm` or `kN`), a
+  built-in function, or `π`/`pi`/`e`. `run_stmt` calls it for every `Define` name and function
+  parameter. The env does not decide duplicates; Task 7 does, since only it sees the whole
+  document.
+- **Name resolution order:** function parameter in scope, then user variable, then the constants
+  `π`/`pi` and `e`, then a unit (`lookup`), otherwise `Undefined`. Units resolve to
   `Quantity { value: factor, dim }`. An offset unit (`°F`) used anywhere except a lone
   `number unit` literal is `AffineTemperature`.
 - **User functions:** evaluated in a child env holding the params. Recursion depth is limited to
@@ -347,15 +362,16 @@ Repo: WordCraft. All later tasks are in this repo.
   - wrong arity is `Arity`; any non-finite result is `NonFinite`
 
 - [ ] **Step 1: Write failing tests:**
-  - `stress_example` — run `"P := 1500 lbf"`, `"A := 2.5 in^2"`, `"σ := P/A ="`; the shown
+  - `stress_example` — run `"P := 1500 lbf"`, `"A_b := 2.5 in^2"`, `"σ := P/A_b ="`; the shown
     quantity formatted in US customary is `("600","psi")`
   - `mixed_systems` — `"L := 1 in + 25.4 mm ="` gives 0.0508 m within 1e-12
   - `unit_mismatch_message` — `"x := 1 in + 1 lbf ="` gives `Err(CalcError::Unit(UnitError::Mismatch{..}))`
   - `undefined_message` — `"y := z + 1 ="` with an empty env gives `Err(CalcError::Undefined("z"))`,
-    and its `to_string()` is `"z isn't defined above this point"`
+    and its `to_string()` is `"z isn't defined"`
   - `user_function` — `"f(x, y) := x^2 + y"`, then `"f(3 m, 1 m^2) ="` gives 10 m²
-  - `shadowing_is_positional` — `"2 m ="` gives 2 m; then `"m := 5 kg"`; then `"2 m ="` gives
-    10 kg
+  - `unit_names_cannot_be_variables` — `"m := 5 kg"`, `"A := 2 in^2"`, `"kN := 1"`, `"sin := 1"`
+    and `"f(m) := m"` each give `Err(ReservedName(..))`; `"A_b := 2 in^2"` is OK, and `"2 m ="`
+    still gives 2 m
   - `trig_takes_angles` — `"sin(30 deg) ="` gives 0.5 within 1e-12; `"sin(1 m) ="` gives
     `NotDimensionless`
   - `non_finite_results_are_errors` — `"10^400 ="`, `"1/0 ="` and `"sqrt(-1) ="` all give
@@ -422,18 +438,33 @@ Repo: WordCraft. All later tasks are in this repo.
 - Consumes: Tasks 4–6.
 - Produces:
   - `pub struct RecalcReport { pub regions: usize, pub errors: usize, pub reassigned_ids: usize }`
-  - `pub fn recalc(doc: &mut wordcraft_doc::Document) -> RecalcReport`, which:
-    - walks the body story in document order: paragraphs top to bottom, objects left to right,
-      table cells row by row; it skips other stories and tracked-deleted content
-    - keeps the first of any duplicate `id`s and reassigns the rest the next unused id (max + 1)
-    - for each calc equation: parses `source`, runs it, sets `state`, and writes the display
-      into `linear` and `math` (via `wordcraft_doc::math::parse_linear`) using
-      `render::display(...)`
-    - updates each WCCALC field's `result` from the env at that point
+  - `pub fn recalc(doc: &mut wordcraft_doc::Document, page_of: &dyn Fn(u64) -> Option<u32>) -> RecalcReport`
+    — `page_of` maps a region id to its page number, for duplicate messages; the engine passes
+    a layout lookup, and tests pass `&|_| None`. The pass:
+    1. **Collects** calc equations from the body story in document order (paragraphs top to
+       bottom, objects left to right, table cells row by row), skipping other stories and
+       tracked-deleted content. It keeps the first of any duplicate region `id`s and gives the
+       rest the next unused id (max + 1).
+    2. **Parses** each region's `source`. A parse error sets `Error` and defines nothing.
+    3. **Indexes names:** the first region in document order that defines a name owns it. Every
+       later region defining the same name gets
+       `Error(Duplicate { name, page: page_of(owner_id) })` and defines nothing.
+    4. **Builds the dependency graph** from `free_names` (owners only) and evaluates in
+       topological order (Kahn's algorithm). Regions on a cycle get `Error(Circular(..))` and
+       their names are marked failed. Dependents of failed names get `Upstream`. Eval-only
+       regions (`x =`) run after the definitions they use.
+    5. **Writes each region's display** into `linear` and `math` (via
+       `wordcraft_doc::math::parse_linear`) using `render::display(...)`.
+    6. **Updates every WCCALC field's `result`** from the final env, wherever the field sits.
+  - `pub fn defined_names(doc: &Document) -> Vec<(String, u64)>` — every valid (owning) name
+    with its region id, sorted by name
+  - `pub fn check_new_name(doc: &Document, name: &str, editing: Option<u64>) -> Result<(), wordcraft_calc::CalcError>`
+    — `ReservedName` via `check_name`, or `Duplicate` when another region (not `editing`)
+    already owns `name`. Task 8 uses it for the unique-name prompt.
   - `pub fn mark_stale(doc: &mut Document)` sets every `Fresh` region to `Stale` (manual mode)
   - `pub fn render::display(stmt_src: &str, shown: Option<&Formatted>, state: &CalcState) -> String`
     builds linear-format text:
-    - definition: `σ≔P/A`
+    - definition: `σ≔P/A_b`
     - shown result: append `=600 "psi"` (unit as upright text)
     - error: append ` ⚠` (layout already supports colour on math runs; set the error run's colour
       to the document's error red `Rgb(0xC0,0x00,0x00)` in `math` after parsing)
@@ -442,12 +473,21 @@ Repo: WordCraft. All later tasks are in this repo.
 
 - [ ] **Step 1: Write failing tests** (build docs with `Document::default()` plus the existing
   test helpers used in `crates/doc/src/tests.rs`):
-  - `recalculates_in_order` — three regions (`P`, `A`, `σ = `) produce `linear` ending
+  - `recalculates_in_order` — three regions (`P`, `A_b`, `σ = `) produce `linear` ending
     `=600 "psi"`
-  - `later_definition_replaces` — `x:=1`, `x =`, `x:=2`, `x =` produce results 1 then 2
-  - `use_before_define_is_error` — state `Error("x isn't defined above this point")`
-  - `quoted_value_updates` — a WCCALC field for `σ` after the regions gets result `"600 psi"`;
-    with `\u ksi \p 2` it gets `"0.6 ksi"`
+  - `use_before_define_works` — `σ := P/A_b =` placed **above** `P` and `A_b` shows `600 psi`
+  - `duplicate_definition_is_error` — `x:=1`, `x =`, `x:=2`: the first `x` is `Fresh`, the second
+    is `Error` with message `"x is already defined elsewhere in the document — choose a unique name"`,
+    and `x =` shows 1
+  - `circular_definitions_error` — `a := b + 1`, `b := a/2` both give `Error("a, b depend on each other")`,
+    and `c := a =` gives `Upstream`
+  - `pasted_unit_name_definition_is_error` — a region with source `A := 2 in^2` (as if pasted)
+    gives `Error(ReservedName)`, and `2 A =` elsewhere shows `2 A`
+  - `quoted_value_updates` — a WCCALC field for `σ` gets result `"600 psi"`, both after the
+    regions and in a paragraph **before** them; with `\u ksi \p 2` it gets `"0.6 ksi"`
+  - `check_new_name_reports` — with `P` defined: `check_new_name(doc, "P", None)` gives
+    `Duplicate`; `check_new_name(doc, "P", Some(p_id))` is OK; `"m"` gives `ReservedName`;
+    `"Q"` is OK
   - `table_cells_in_row_order`
   - `duplicate_ids_are_reassigned` — two regions with id 7 keep the first as 7, the second
     becomes 8, and `reassigned_ids == 1`
@@ -460,7 +500,7 @@ Repo: WordCraft. All later tasks are in this repo.
   `perf_2000_regions` passes. Add incremental re-evaluation only if it doesn't.
 - [ ] **Step 4: Run** `cargo test -p wordcraft-calc` and
   `cargo test -p wordcraft-calc --release -- --ignored perf_2000_regions`. Expected: PASS.
-- [ ] **Step 5: Commit**: `git commit -m "calc: document-order recalculation and display"`
+- [ ] **Step 5: Commit**: `git commit -m "calc: dependency-order recalculation, unique names and display"`
 
 ### Task 8: Engine commands and automatic recalculation
 
@@ -474,7 +514,7 @@ Repo: WordCraft. All later tasks are in this repo.
 - Test: `crates/engine/src/cmd/calc/tests.rs`
 
 **Interfaces:**
-- Consumes: `recalc`, `mark_stale` (Task 7); `CalcRegion`, `CalcSettings`, `calc_field_instr`
+- Consumes: `recalc`, `mark_stale`, `defined_names`, `check_new_name` (Task 7); `CalcRegion`, `CalcSettings`, `calc_field_instr`
   (Task 6).
 - **Produces these command ids:**
 
@@ -483,7 +523,13 @@ Repo: WordCraft. All later tasks are in this repo.
   | `insert.calculation` | `{ "source": string, "display": bool }` | inserts a calc equation with a fresh id; returns `{ "id": u64 }` |
   | `calc.setSource` | `{ "id": u64, "source": string }` | replaces a region's source |
   | `insert.calcValue` | `{ "name": string, "unit"?: string, "precision"?: u8 }` | inserts a locked WCCALC field |
-  | `calc.names` | `{}` | returns the names defined before the caret, for the UI picker |
+  | `calc.names` | `{}` | returns every valid name in the document (`defined_names`), for the UI picker |
+  | `calc.checkName` | `{ "name": string, "id"?: u64 }` | returns `{ "ok": true }`, or `{ "ok": false, "reason": "duplicate"\|"reserved", "message": string, "existing"?: u64 }`, via `check_new_name` |
+
+  `insert.calculation` and `calc.setSource` also run `check_new_name` on the source's defined
+  name. On failure they return a `CmdError` whose message is the `CalcError` text and change
+  nothing. The UI checks first with `calc.checkName`, so this is the backstop for the CLI, MCP and
+  agents.
   | `calc.recalculate` | `{}` | returns a `RecalcReport` as JSON |
   | `calc.settings` | `{ "system"?: "us"\|"si", "precision"?: u8, "manual"?: bool }` | sets document calc settings |
   | `calc.resolveEdited` | `{ "id": u64, "keep": "source"\|"word" }` | `"source"` re-renders from source; `"word"` sets `calc = None`, leaving a plain equation |
@@ -502,9 +548,15 @@ Repo: WordCraft. All later tasks are in this repo.
 
 - [ ] **Step 1: Write failing tests** (use the `run(&mut s, id, json!(…))` helper pattern from
   `crates/engine/src/tests.rs:45`):
-  - `insert_and_recalculate` — insert `P`, `A`, `σ := P/A =`; the third equation's `linear` ends
+  - `insert_and_recalculate` — insert `P`, `A_b`, `σ := P/A_b =`; the third equation's `linear` ends
     `=600 "psi"`
   - `editing_input_updates_result` — `calc.setSource` on P to `3000 lbf` gives `=1200 "psi"`
+  - `duplicate_insert_is_refused` — `insert.calculation {source: "P := 2 lbf"}` with P already
+    defined returns an error containing `"already defined"`, and the document is unchanged;
+    `calc.checkName {name:"P"}` gives `ok:false, reason:"duplicate"`; `{name:"m"}` gives
+    `reason:"reserved"`; `{name:"P", id:<P's id>}` gives `ok:true`
+  - `duplicate_message_names_page` — with the engine's layout page lookup, the pasted-duplicate
+    error message contains `"on page 1"`
   - `undo_restores_results` — undo after that gives `=600 "psi"` again
   - `manual_mode_marks_stale` — after `calc.settings {manual:true}` and an edit, the state is
     `Stale` and `linear` contains `≈`; after `calc.recalculate` it is `Fresh`
@@ -556,7 +608,7 @@ Repo: WordCraft. All later tasks are in this repo.
   - if it differs, it restores `calc` with `state = EditedOutside` and keeps Word's `linear`/`math`
   - a stored region with no matching control is dropped
   - untagged equations are left alone
-  - then it calls `recalc` **except** on `EditedOutside` regions, whose display is preserved
+  - then it calls `recalc(doc, &|_| None)` **except** on `EditedOutside` regions, whose display is preserved
 
 - [ ] **Step 1: Write failing tests:**
   - `calc_round_trips_through_docx` — save a doc with 3 regions and a WCCALC field; reopen;
@@ -567,8 +619,8 @@ Repo: WordCraft. All later tasks are in this repo.
   - `edited_in_word_is_flagged` — change the `m:t` text of one equation inside the saved zip
     (string replace), reopen; that region is `EditedOutside`, its text is Word's version, and the
     others are `Fresh`
-  - `deleted_in_word_makes_dependents_error` — remove the `w:sdt` defining `A`; reopen; `σ` is
-    `Error("A isn't defined above this point")`
+  - `deleted_in_word_makes_dependents_error` — remove the `w:sdt` defining `A_b`; reopen; `σ` is
+    `Error("A_b isn't defined")`
   - `no_store_means_plain` — a docx with a tagged control but no store part opens as a plain
     equation
   - `hostile_store_ignored` — a store with malformed JSON or 1e6 regions opens without panic,
@@ -594,6 +646,16 @@ Repo: WordCraft. All later tasks are in this repo.
 **Behaviour:**
 - **Insert › Calculation** opens a single-line source box at the caret. Enter commits via
   `insert.calculation`; Esc cancels.
+- **Unique-name prompt:** before committing (insert or edit), the box calls `calc.checkName`
+  with the defined name.
+  - If it isn't OK, a prompt shows the message ("P is already defined on page 4 — choose a
+    unique name" / "A is a unit, function or constant name — choose another name") with:
+    - a "New name" field, pre-filled with the name plus `_1`, `_2` and so on (the first that
+      passes `calc.checkName`)
+    - **Rename**, which rewrites the defined name in the source and commits
+    - **Go to existing** (duplicates only), which moves the caret to the owning region
+    - **Cancel**, which returns to the box
+  - Nothing is inserted under a clashing name.
 - **Typing `:` then `=`** in the box shows `≔`. The box keeps the ASCII `:=`; the parser accepts
   both.
 - **Double-clicking a calculation** opens the box with its `source`; committing runs
@@ -610,13 +672,17 @@ Repo: WordCraft. All later tasks are in this repo.
   - `calc_box_commits_source` — simulate typing `P := 1500 lbf` and Enter; the doc has one calc
     region with that source
   - `double_click_opens_source`
+  - `duplicate_name_prompts_for_rename` — with `P` defined, typing `P := 2 lbf` and Enter shows
+    the prompt pre-filled `P_1`; clicking Rename inserts `P_1 := 2 lbf`, and the original P is
+    untouched
+  - `unit_name_prompts_for_rename` — typing `A := 2 in^2` shows the reserved-name message
   - `options_dialog_sets_settings`
 - [ ] **Step 2: Run them and confirm they fail:** `cargo test -p wordcraft-ui-egui calc`.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `cargo test -p wordcraft-ui-egui`. Expected: PASS.
 - [ ] **Step 5: Manual check.**
   - Run `cargo run --release -p wordcraft`.
-  - Insert `P := 1500 lbf`, `A := 2.5 in^2` and `σ := P/A =`; confirm `σ = 600 psi` renders
+  - Insert `P := 1500 lbf`, `A_b := 2.5 in^2` and `σ := P/A_b =`; confirm `σ = 600 psi` renders
     built up.
   - Edit P and watch σ update.
   - Take a screenshot with the repo's `ui_shot` example if useful.

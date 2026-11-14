@@ -35,8 +35,8 @@ release when it happens.
 ## Goals (Stage 1)
 
 - **Live calculations in the document flow**, in Mathcad style:
-  - definitions with units: `P := 1500 lbf`, `A := 2.5 in^2`
-  - evaluations: `σ := P/A` then `σ =` shows `σ = 600 psi`
+  - definitions with units: `P := 1500 lbf`, `A_b := 2.5 in^2`
+  - evaluations: `σ := P/A_b` then `σ =` shows `σ = 600 psi`
   - user-defined functions: `f(x, y) := x^2 + y`
 - **Real unit arithmetic and checking.** Dimensions are tracked through every operation:
   `lbf/in^2` is a pressure; `1 in + 1 lbf` is an error with a clear message. Mixed systems
@@ -44,6 +44,11 @@ release when it happens.
 - **Chosen result units.** A result is shown in the document's default unit system unless the
   author names a unit (`σ = ? ksi` shows `σ = 0.6 ksi`). Display precision is a document setting
   with a per-result override.
+- **Definitions anywhere, each name defined once.** A variable or function can be defined
+  anywhere in the document and used anywhere else, above or below. Each name is defined exactly
+  once, and redefinition is not allowed. When the author types a name that is already defined,
+  or that is a unit name, WordCraft prompts them to choose a unique one. (Unlike Mathcad, which
+  reads top to bottom and allows redefinition.)
 - **Calculation placement:** a calculation can be its own display equation (its own paragraph,
   optionally numbered like any WordCraft equation) or sit inline inside a sentence.
 - **Linked values in text.** An inline "calculated value" can show a variable's current value
@@ -159,8 +164,9 @@ new code, do that.**
   - a unit placeholder after `=` sets the display unit
 - **Numbers and units:**
   - a number followed by a unit is a quantity (`5 in`, `5in`, `5·in`)
-  - variables and units share one namespace, and a user variable shadows a unit from its
-    definition onwards (Mathcad behaviour); the editor should mark the shadowing
+  - variable and function names may not be unit names, built-in function names or the constants
+    `π`/`e`. This stops a definition like `A := …` (A is the ampere) from silently changing what
+    a unit means across the whole document. Use `A_bolt`, `m_1` and similar instead.
   - subscripts in names are allowed and display as subscripts (`σ_allow`, typed `σ_allow`)
   - Greek letters can be typed with the existing math autocorrect (`\sigma`)
 - **Operators:** `+ - * / ^`, unary minus, parentheses, `·` and `×` for multiplication, `√` and
@@ -174,20 +180,28 @@ new code, do that.**
     adapter strips the quantity to an SI magnitude, applies the unit rule, calls the function,
     and re-attaches the result unit. Where calling GridCraft costs more than `f64` std maths (for
     example plain `sin`), the builder uses std.
-- **Evaluation order is document order** (top to bottom, then left to right within a line; table
-  cells row by row). A name must be defined before it is used, and a later definition replaces an
-  earlier one from that point on. This is Mathcad's model and what the user's team already
-  expects.
+- **Names are global and defined once; position doesn't matter.** A definition can be used above
+  or below where it sits, and quoted values can appear before the calculation (for example, a
+  summary at the front of a report quoting results from an appendix). The engine evaluates in
+  dependency order, not document order.
+  - **Duplicates:** if a name is defined more than once (by pasting, merging documents, or a file
+    edited elsewhere), the first definition in document order (top to bottom, left to right,
+    table cells row by row) stays valid. Every later one is an error: "x is already defined on
+    page 4 — choose a unique name".
+  - **Circular definitions** (`a := b + 1`, `b := a/2`) are an error on every region in the cycle:
+    "a, b depend on each other".
+  - **Case 2 calculations** use new names (`P_1`, `P_2`) or a function defined once and called
+    with each case's inputs.
 - **Errors appear at the region,** in the error style with a plain-language message ("can't add
-  lbf to in", "σ_allow isn't defined above this point"). Regions that depend on a failed region
+  lbf to in", "σ_allow isn't defined"). Regions that depend on a failed region
   show that they depend on an error rather than a value. Errors never block saving.
 
 ### Recalculation
 
 - A calculation's identity is a stable ID stored on the region, not its text or position.
-- On any edit, the engine re-parses changed regions, rebuilds the define/use graph in document
-  order, and re-evaluates only regions downstream of the change. Layout updates their displayed
-  results.
+- On any edit, the engine re-parses changed regions, rebuilds the define/use graph, checks it for
+  duplicates and cycles, and re-evaluates in dependency order: only the regions that depend on
+  the change, where practical. Layout updates their displayed results.
 - **Target:** a document with 2,000 calculation regions recalculates and repaints in under 100 ms
   after a single edit on the user's machine (32 cores, ~45 GB RAM). The builder adds a benchmark.
 - **Modes:** automatic (default) or manual. A document setting chooses the mode, and a
@@ -245,7 +259,11 @@ new code, do that.**
 - **Insert › Calculation** (with a keyboard shortcut) opens an empty region. The user types
   linear text, and it renders built up on leaving the region. Clicking back in shows the source
   text for editing. Typing `:` then `=` produces `:=`.
-- **Insert › Calculated Value** picks a defined variable from a list valid at that point.
+- **Unique-name prompt:** committing a calculation whose name is already defined elsewhere, or
+  is a unit, built-in function or constant name, opens a prompt. It says why ("σ is already
+  defined on page 4" / "A is the unit ampere") and asks for a new name, with a button to jump to
+  the existing definition. The calculation is not inserted under the clashing name.
+- **Insert › Calculated Value** picks from every variable defined anywhere in the document.
 - **Calculation settings:** unit system, precision, recalculation mode.
 - **A Recalculate command.**
 - Errors and stale states are visible on screen and in print preview, but **not** written into
@@ -259,7 +277,10 @@ new code, do that.**
 - The user can rebuild a typical Mathcad sheet as part of a report. For example, a flange or bolt
   stress calculation using only Stage 1 features: inputs with units, intermediate results, a
   user function, results in chosen units, and a sentence that quotes a result.
-- **Changing one input updates every dependent result and quoted value.**
+- **Changing one input updates every dependent result and quoted value,** including a quoted
+  value placed before the calculation it quotes.
+- **Typing a duplicate or unit name prompts for a unique one;** a pasted duplicate shows an
+  error.
 - **The saved `.docx` opens in Microsoft Word** with every calculation showing as a proper
   editable equation and nothing broken. The user checks this by hand in Word.
 - **Reopening that `.docx` in WordCraft makes the calculations live again.** An equation edited
