@@ -104,26 +104,38 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
     RecalcReport { regions: regions.len(), errors, reassigned_ids }
 }
 
-/// Every name owned by a definition, with its region's id, sorted by name. Owning means the
-/// first region in document order that defines the name, with a name that isn't a unit,
-/// function or constant.
+/// Every variable owned by a definition, with its region's id, sorted by name: what a quoted
+/// value can show. Owning means the first region in document order that defines the name, with
+/// a name that isn't a unit, function or constant. User functions are left out (they have no
+/// single value); ids are the ones [`recalc`] gives, a repeated id already replaced.
 pub fn defined_names(doc: &Document) -> Vec<(String, u64)> {
-    let found = collect(&doc.body);
-    let ids: Vec<u64> = found.regions.iter().map(|r| r.id).collect();
-    let index = Index::build(&found.regions, &ids, &|_| None);
-    let mut names: Vec<(String, u64)> = index.owners.iter().map(|(name, &i)| (name.clone(), ids.get(i).copied().unwrap_or(0))).collect();
+    let (ids, index) = names_of(doc);
+    let mut names: Vec<(String, u64)> = index
+        .owners
+        .iter()
+        .filter(|&(_, &i)| matches!(index.parsed.get(i), Some(Ok(Stmt::Define { params, .. })) if params.is_empty()))
+        .map(|(name, &i)| (name.clone(), ids.get(i).copied().unwrap_or(0)))
+        .collect();
     names.sort();
     names
 }
 
+/// The regions' ids as [`recalc`] gives them (a repeated id replaced) and who owns each name.
+fn names_of(doc: &Document) -> (Vec<u64>, Index) {
+    let found = collect(&doc.body);
+    let (ids, _) = assign_ids(&found);
+    let index = Index::build(&found.regions, &ids, &|_| None);
+    (ids, index)
+}
+
 /// Whether `name` may be given to a new calculation, or to the region `editing` (whose own
 /// definition of the name doesn't count): [`CalcError::ReservedName`] for a unit, function or
-/// constant name, [`CalcError::Duplicate`] when another region already owns it.
+/// constant name, [`CalcError::Duplicate`] when another region already owns it (a variable or a
+/// function).
 pub fn check_new_name(doc: &Document, name: &str, editing: Option<u64>) -> Result<(), CalcError> {
     check_name(name)?;
-    let found = collect(&doc.body);
-    let ids: Vec<u64> = found.regions.iter().map(|r| r.id).collect();
-    let index = Index::build(&found.regions, &ids, &|_| None);
+    // Ids as recalculation gives them, so a pasted copy's repeated id can't stand for its owner.
+    let (ids, index) = names_of(doc);
     match index.owners.get(name).and_then(|&i| ids.get(i)) {
         Some(&owner) if Some(owner) != editing => Err(CalcError::Duplicate { name: name.to_string(), page: None }),
         _ => Ok(()),
@@ -677,7 +689,9 @@ fn set_nodes(math: &mut wordcraft_doc::math::Math, nodes: Arg) {
 /// Apply the edits that change something, copying only the paragraphs they touch.
 fn apply(body: &mut Blocks, edits: Vec<Edit>) {
     let mut edits: Vec<Edit> = edits.into_iter().filter(|e| object(body, &e.at).is_some_and(|o| differs(o, &e.change))).collect();
-    // Edits come in document order, so one paragraph's are together.
+    // Bring each paragraph's edits (its regions' and its fields') together, so it is copied and
+    // touched once. The sort is stable: within a paragraph, edits keep their order.
+    edits.sort_by(|a, b| a.at.path.cmp(&b.at.path));
     let mut rest = edits.drain(..).peekable();
     while let Some(first) = rest.next() {
         let path = first.at.path.clone();

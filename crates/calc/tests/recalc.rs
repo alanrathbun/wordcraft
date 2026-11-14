@@ -274,7 +274,39 @@ fn check_new_name_reports() {
 #[test]
 fn defined_names_lists_owners_sorted() {
     let d = doc_with(&["b := 1", "a := 2", "b := 3", "m := 1", "a + b =", "f(x) := x"]);
-    assert_eq!(defined_names(&d), [("a".to_string(), 2), ("b".to_string(), 1), ("f".to_string(), 6)]);
+    // A function has no single value to quote, so it isn't listed.
+    assert_eq!(defined_names(&d), [("a".to_string(), 2), ("b".to_string(), 1)]);
+    // Its name is still taken.
+    assert_eq!(check_new_name(&d, "f", None), Err(CalcError::Duplicate { name: "f".into(), page: None }));
+}
+
+#[test]
+fn names_use_the_ids_recalculation_gives() {
+    // A pasted copy kept the id 7 of the region above it.
+    let mut d = doc_with(&["Q := 1", "P := 2"]);
+    edit_region(&mut d, 2, |c, _| c.id = 7);
+    edit_region(&mut d, 1, |c, _| c.id = 7);
+    // Renaming the first region (id 7) to P clashes with the pasted region, which recalculation
+    // gives id 8.
+    assert_eq!(check_new_name(&d, "P", Some(7)), Err(CalcError::Duplicate { name: "P".into(), page: None }));
+    assert_eq!(check_new_name(&d, "P", Some(8)), Ok(()));
+    assert_eq!(defined_names(&d), [("P".to_string(), 8), ("Q".to_string(), 7)]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 8).0.source, "P := 2");
+}
+
+#[test]
+fn a_paragraph_with_regions_and_fields_updates_both() {
+    let mut d = doc_of(vec![para_block(para(vec![calc_eq(1, "x := 3 ="), field("WCCALC x")]))]);
+    let before = match &*d.body[0] {
+        Block::Para(p) => p.rev,
+        Block::Table(_) => unreachable!(),
+    };
+    recalc(&mut d, &no_page);
+    let Block::Para(p) = &*d.body[0] else { unreachable!() };
+    assert_ne!(p.rev, before);
+    assert_eq!(field_results(&d), ["3"]);
+    assert_eq!(region(&d, 1).1, "x≔3=3");
 }
 
 #[test]
@@ -525,7 +557,7 @@ fn display_renders_from_the_syntax_tree() {
     assert_eq!(render::display("z := x^(-1)", None, &CalcState::Fresh), "z≔x^(-1)");
     assert_eq!(render::display("z := x^0.5", None, &CalcState::Fresh), "z≔x^(0.5)");
     assert_eq!(render::display("z := |a - b|", None, &CalcState::Fresh), "z≔|a-b|");
-    assert_eq!(render::display("z := sin(θ) + max(a, b)", None, &CalcState::Fresh), "z≔sin(θ)+max(a,b)");
+    assert_eq!(render::display("z := sin(θ) + max(a, b)", None, &CalcState::Fresh), "z≔sin(θ)+max((a,b))");
     assert_eq!(render::display("z := 1e300", None, &CalcState::Fresh), "z≔1×10^300");
     assert_eq!(render::display("z := 1.5e-7 m", None, &CalcState::Fresh), "z≔1.5×10^(-7) \"m\"");
     assert_eq!(render::display("z := 1.5×10^-5 m =", Some(&f("1.5×10^-5", "m")), &CalcState::Fresh).rsplit('=').next(), Some("1.5×10^(-5) \"m\""));
@@ -541,6 +573,70 @@ fn a_subscripted_function_keeps_its_arguments_out_of_the_subscript() {
         other => panic!("{other:?}"),
     }
     assert!(matches!(math.nodes.get(1), Some(MNode::Delim { .. })), "{:?}", math.nodes);
+}
+
+/// The math tree shown for `z := <expr>` (after its `z≔` run).
+fn tree(expr: &str) -> Vec<MNode> {
+    let mut d = doc_with(&[&format!("z := {expr}")]);
+    recalc(&mut d, &no_page);
+    let (_, _, math) = region(&d, 1);
+    let mut nodes = math.nodes;
+    match nodes.first_mut() {
+        Some(MNode::Run(r)) if r.text == "z≔" => {
+            nodes.remove(0);
+        }
+        Some(MNode::Run(r)) if r.text.starts_with("z≔") => r.text = r.text.replacen("z≔", "", 1),
+        other => panic!("{other:?}"),
+    }
+    // Drop the error marker of an undefined name.
+    if matches!(nodes.last(), Some(MNode::Run(r)) if r.text == "⚠") {
+        nodes.pop();
+    }
+    nodes
+}
+
+fn text_of(nodes: &[MNode]) -> String {
+    let mut out = String::new();
+    for n in nodes {
+        match n {
+            MNode::Run(r) => out.push_str(&r.text),
+            MNode::Delim { beg, end, elems, .. } => {
+                out.extend(*beg);
+                out.push_str(&elems.iter().map(|e| text_of(e)).collect::<Vec<_>>().join("|"));
+                out.extend(*end);
+            }
+            MNode::Func { name, e } => out.push_str(&format!("[{}: {}]", text_of(name), text_of(e))),
+            MNode::Script { base, sup, sub, .. } => out.push_str(&format!("{{{}}}_{{{}}}^{{{}}}", text_of(base), text_of(sub), text_of(sup))),
+            MNode::Frac { num, den, .. } => out.push_str(&format!("{{{}}}/{{{}}}", text_of(num), text_of(den))),
+            MNode::Rad { e, .. } => out.push_str(&format!("√{{{}}}", text_of(e))),
+            other => out.push_str(&format!("{other:?}")),
+        }
+    }
+    out
+}
+
+#[test]
+fn function_calls_show_the_structure_that_was_evaluated() {
+    // A built-in UnicodeMath function keeps its argument in brackets when it is not a lone atom.
+    assert_eq!(text_of(&tree("sin(θ+1)")), "[sin: (θ+1)]");
+    assert_eq!(text_of(&tree("sin(θ)")), "[sin: θ]");
+    // What follows the call is outside it.
+    let max = tree("max(a, b) + c");
+    assert!(matches!(max.first(), Some(MNode::Func { .. })), "{max:?}");
+    assert_eq!(text_of(&max), "[max: (a,b)]+c");
+    // A call used as a base is raised whole, not just its argument.
+    assert_eq!(text_of(&tree("cos(θ)^2")), "{([cos: θ])}_{}^{2}");
+    assert_eq!(text_of(&tree("sin(θ+1)^2")), "{([sin: (θ+1)])}_{}^{2}");
+    assert_eq!(text_of(&tree("f(x)^2")), "{(f(x))}_{}^{2}");
+    // A call as a numerator is the whole numerator.
+    assert_eq!(text_of(&tree("sin(θ)/2")), "{[sin: θ]}/{2}");
+    // Names holding a function name are never split into a letter and a function.
+    let asin = tree("asin(x) + atan2(y, x)");
+    assert_eq!(text_of(&asin), "asin(x)+atan2(y,x)");
+    assert!(runs(&asin).iter().any(|r| r.text == "asin" && r.sty == Some(MSty::Plain)), "{asin:?}");
+    assert_eq!(text_of(&tree("xmax(t) + 1")), "xmax(t)+1");
+    assert_eq!(text_of(&tree("f_max(t)")), "{f}_{max}^{}(t)");
+    assert_eq!(text_of(&tree("σ_max + len")), "{σ}_{max}^{}+len");
 }
 
 #[test]

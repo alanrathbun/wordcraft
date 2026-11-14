@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use craft_units::{Formatted, lookup};
 use wordcraft_doc::Rgb;
 use wordcraft_doc::calc::CalcState;
-use wordcraft_doc::math::{Arg, MNode, MRun, MSty, parse_linear};
+use wordcraft_doc::math::{Arg, FUNCTION_NAMES, MNode, MRun, MSty, parse_linear};
 use wordcraft_doc::math_linear::map_args;
 
-use crate::{CalcError, Expr, Op, Stmt, parse};
+use crate::{CalcError, Expr, Op, Stmt, funcs, parse};
 
 /// Colour of the error marker.
 pub const ERROR_RED: Rgb = Rgb(0xC0, 0x00, 0x00);
@@ -27,7 +27,7 @@ const ERROR_MARK: &str = "⚠";
 const MAX_SHOWN_SOURCE: usize = 2000;
 /// First private-use character standing for a unit while the linear text is parsed into a tree.
 const SENTINEL_BASE: u32 = 0xE000;
-/// How many distinct units one display can stand in for (the private-use area's size).
+/// How many distinct units and names one display can stand in for (the private-use area's size).
 const MAX_SENTINELS: usize = 6400;
 /// Separates a number from the unit after it in the math tree (spaces in linear text are dropped).
 const THIN_SPACE: char = '\u{2009}';
@@ -71,7 +71,7 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
         }
     };
     let mut linear = out.linear;
-    let mut math = restore_units(parse_linear(&out.parsed), &out.units);
+    let mut math = restore_pieces(parse_linear(&out.parsed), &out.pieces);
     if stmt.is_err() || matches!(state, CalcState::Error(_)) {
         linear.push(' ');
         linear.push_str(ERROR_MARK);
@@ -144,15 +144,35 @@ fn paint(arg: Arg, colour: Rgb) -> Arg {
 // Statement → linear text
 // ---------------------------------------------------------------------------------------------
 
+/// What a sentinel stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    /// A unit: upright, set apart from a number before it.
+    Unit,
+    /// A name or part of one, in the default math style (letters italic).
+    Name,
+    /// A built-in function name or a multi-letter subscript: upright.
+    Upright,
+}
+
+/// A piece of text a sentinel stands for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Piece {
+    text: String,
+    kind: Kind,
+}
+
 /// The text being built: `linear` is what is stored and shown; `parsed` is the same text with
-/// each unit replaced by a private-use sentinel, which [`parse_linear`] keeps as one atom so a
-/// unit like `m/s²` or `lbf·in` never becomes a fraction or product.
+/// each unit and each multi-letter name replaced by a private-use sentinel, which
+/// [`parse_linear`] keeps as one atom. So a unit like `m/s²` or `lbf·in` never becomes a fraction
+/// or product, and a name like `asin`, `xmax` or `f_max` never has a function name (`sin`, `max`)
+/// found inside it and applied to what follows.
 #[derive(Default)]
 struct Out {
     linear: String,
     parsed: String,
-    units: Vec<String>,
-    sentinels: HashMap<String, char>,
+    pieces: Vec<Piece>,
+    sentinels: HashMap<Piece, char>,
 }
 
 impl Out {
@@ -163,18 +183,56 @@ impl Out {
 
     fn unit(&mut self, unit: &str) {
         self.linear.push_str(&format!("\"{unit}\""));
-        if let Some(&c) = self.sentinels.get(unit) {
+        self.sentinel(Piece { text: unit.to_string(), kind: Kind::Unit }, &format!("\"{unit}\""));
+    }
+
+    /// Name text: a sentinel when UnicodeMath could read part of it as a function name.
+    fn name_piece(&mut self, text: &str, kind: Kind) {
+        self.linear.push_str(text);
+        if text.chars().filter(char::is_ascii_alphabetic).count() >= 2 {
+            self.sentinel(Piece { text: text.to_string(), kind }, text);
+        } else {
+            self.parsed.push_str(text);
+        }
+    }
+
+    /// Put `piece`'s sentinel into the parsed text, or `fallback` when the sentinels run out.
+    fn sentinel(&mut self, piece: Piece, fallback: &str) {
+        if let Some(&c) = self.sentinels.get(&piece) {
             self.parsed.push(c);
             return;
         }
-        let sentinel = (self.units.len() < MAX_SENTINELS).then(|| char::from_u32(SENTINEL_BASE + self.units.len() as u32)).flatten();
+        let k = self.pieces.len();
+        let sentinel = (k < MAX_SENTINELS).then(|| u32::try_from(k).ok().and_then(|k| char::from_u32(SENTINEL_BASE + k))).flatten();
         match sentinel {
             Some(c) => {
-                self.sentinels.insert(unit.to_string(), c);
-                self.units.push(unit.to_string());
+                self.sentinels.insert(piece.clone(), c);
+                self.pieces.push(piece);
                 self.parsed.push(c);
             }
-            None => self.parsed.push_str(&format!("\"{unit}\"")),
+            None => self.parsed.push_str(fallback),
+        }
+    }
+
+    /// A name with its subscripts: `σ_allow` is σ with subscript allow; each further `_`
+    /// lowers the rest again, in parentheses (`a_(b_(c))`) so all of it is lowered.
+    fn name(&mut self, name: &str) {
+        let mut parts = name.split('_');
+        let base = parts.next().unwrap_or_default();
+        self.name_piece(base, Kind::Name);
+        let mut open = 0usize;
+        for (i, sub) in parts.enumerate() {
+            if i == 0 {
+                self.text("_");
+            } else {
+                self.text("_(");
+                open += 1;
+            }
+            let kind = if sub.chars().count() >= 2 { Kind::Upright } else { Kind::Name };
+            self.name_piece(sub, kind);
+        }
+        for _ in 0..open {
+            self.text(")");
         }
     }
 }
@@ -188,10 +246,16 @@ enum Step<'a> {
 fn write_stmt(stmt: &Stmt, out: &mut Out) {
     match stmt {
         Stmt::Define { name, params, body, .. } => {
-            out.text(&name_text(name));
+            out.name(name);
             if !params.is_empty() {
-                let params: Vec<String> = params.iter().map(|p| name_text(p)).collect();
-                out.text(&format!("({})", params.join(",")));
+                out.text("(");
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        out.text(",");
+                    }
+                    out.name(p);
+                }
+                out.text(")");
             }
             out.text("≔");
             write_expr(body, out);
@@ -249,9 +313,10 @@ fn sqrt_simple(e: &Expr) -> bool {
     plain_num(e) || matches!(e, Expr::Name(n) if !n.contains('_'))
 }
 
-/// Needs no parentheses as the base of `^`.
+/// Needs no parentheses as the base of `^`. A call does: `sin(θ)^2` would raise the argument
+/// (UnicodeMath applies the script to a function's operand) and `f(x)^2` only the `(x)`.
 fn base_simple(e: &Expr) -> bool {
-    plain_num(e) || matches!(e, Expr::Name(_) | Expr::Abs(_)) || (matches!(e, Expr::Call(..)) && !is_sqrt(e))
+    plain_num(e) || matches!(e, Expr::Name(_) | Expr::Abs(_))
 }
 
 /// Needs no parentheses as an exponent: a whole number or a name without a subscript.
@@ -263,9 +328,10 @@ fn exponent_simple(e: &Expr) -> bool {
     }
 }
 
-/// Needs no parentheses as the numerator or denominator of `/`.
+/// Needs no parentheses as the numerator or denominator of `/` (a call gets them, which the
+/// fraction drops, so its whole application is the operand).
 fn fraction_simple(e: &Expr) -> bool {
-    plain_num(e) || matches!(e, Expr::Name(_) | Expr::Abs(_)) || (matches!(e, Expr::Call(..)) && !is_sqrt(e))
+    plain_num(e) || matches!(e, Expr::Name(_) | Expr::Abs(_))
 }
 
 /// Push `e`, in parentheses when `parens`.
@@ -293,17 +359,19 @@ fn write_expr(root: &Expr, out: &mut Out) {
         match e {
             Expr::Num(v) => out.text(&num_text(*v)),
             Expr::Name(n) if is_unit(n) => out.unit(n),
-            Expr::Name(n) => out.text(&name_text(n)),
+            Expr::Name(n) => out.name(n),
             Expr::Quantity(v, unit) => {
                 out.text(&num_text(*v));
                 out.text(" ");
                 out.unit(unit);
             }
-            Expr::Unary(_, a) => {
-                // Only `-` is a prefix operator; a product or sum under it keeps its parentheses.
+            Expr::Unary(Op::Neg, a) => {
+                // A product or sum under `-` keeps its parentheses.
                 wrap(&mut todo, a, prec(a) <= 3);
                 todo.push(Step::Text("-"));
             }
+            // No other prefix operator exists (the evaluator refuses one); show the operand only.
+            Expr::Unary(_, a) => wrap(&mut todo, a, true),
             Expr::Abs(a) => {
                 todo.push(Step::Text("|"));
                 todo.push(Step::Expr(a));
@@ -316,15 +384,28 @@ fn write_expr(root: &Expr, out: &mut Out) {
                 todo.push(Step::Text("√"));
             }
             Expr::Call(name, args) => {
-                todo.push(Step::Text(")"));
+                // UnicodeMath builds `sin(…)` into a function applied to its operand and drops
+                // the operand's parentheses (shown as `sin θ`), so anything but a lone atom gets a
+                // second pair: `sin((θ+1))` shows sin(θ+1), not (sin θ)+1. Other names are
+                // sentinels, so their parentheses stay as written.
+                let applied = FUNCTION_NAMES.contains(&name.as_str());
+                let lone = matches!(args.as_slice(), [a] if plain_num(a) || matches!(a, Expr::Name(n) if !n.contains('_') && !is_unit(n)));
+                let doubled = applied && !lone;
+                todo.push(Step::Text(if doubled { "))" } else { ")" }));
                 for (i, a) in args.iter().enumerate().rev() {
                     todo.push(Step::Expr(a));
                     if i > 0 {
                         todo.push(Step::Text(","));
                     }
                 }
-                todo.push(Step::Text("("));
-                out.text(&name_text(name));
+                todo.push(Step::Text(if doubled { "((" } else { "(" }));
+                if applied {
+                    out.text(name);
+                } else if funcs::is_builtin(name) {
+                    out.name_piece(name, Kind::Upright);
+                } else {
+                    out.name(name);
+                }
             }
             Expr::Binary(op, a, b) => match op {
                 Op::Add | Op::Sub | Op::Neg => {
@@ -377,49 +458,55 @@ fn num_text(v: f64) -> String {
     }
 }
 
-/// A name with its subscript: `σ_allow` stays `σ_allow`; a subscript holding another `_` is
-/// parenthesised so all of it is lowered.
-fn name_text(name: &str) -> String {
-    match name.split_once('_') {
-        Some((base, sub)) if !base.is_empty() && sub.contains('_') => format!("{base}_({sub})"),
-        _ => name.to_string(),
+// ---------------------------------------------------------------------------------------------
+// Sentinels → runs
+// ---------------------------------------------------------------------------------------------
+
+fn sentinel_piece(c: char, pieces: &[Piece]) -> Option<&Piece> {
+    let k = usize::try_from((c as u32).checked_sub(SENTINEL_BASE)?).ok()?;
+    pieces.get(k)
+}
+
+fn is_unit_sentinel(c: char, pieces: &[Piece]) -> bool {
+    sentinel_piece(c, pieces).is_some_and(|p| p.kind == Kind::Unit)
+}
+
+/// Whether a unit after `prev` needs a thin space to stand apart from it (`1500 lbf`, `len m`).
+fn needs_space(prev: Option<char>, pieces: &[Piece]) -> bool {
+    prev.is_some_and(|c| c.is_alphanumeric() || c == ')' || sentinel_piece(c, pieces).is_some_and(|p| p.kind != Kind::Unit))
+}
+
+/// The run a sentinel turns back into, after `prev` (in the same run), coloured like its run.
+fn piece_run(piece: &Piece, prev: Option<char>, pieces: &[Piece], template: &MRun) -> MRun {
+    match piece.kind {
+        Kind::Unit => {
+            let space = if needs_space(prev, pieces) { THIN_SPACE.to_string() } else { String::new() };
+            MRun { color: template.color, ..unit_run(format!("{space}{}", piece.text)) }
+        }
+        Kind::Name => MRun { text: piece.text.clone(), ..template.clone() },
+        Kind::Upright => MRun { text: piece.text.clone(), sty: Some(MSty::Plain), ..template.clone() },
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Sentinels → upright unit runs
-// ---------------------------------------------------------------------------------------------
-
-fn sentinel_unit(c: char, units: &[String]) -> Option<&str> {
-    let k = (c as u32).checked_sub(SENTINEL_BASE)? as usize;
-    units.get(k).map(String::as_str)
-}
-
-/// Whether a unit after `prev` needs a thin space to stand apart from it (`1500 lbf`).
-fn needs_space(prev: Option<char>) -> bool {
-    prev.is_some_and(|c| c.is_alphanumeric() || c == ')')
-}
-
-/// Replace each unit sentinel in the tree with an upright run of the unit's text. The tree comes
-/// from [`parse_linear`], which caps its depth, so recursing over it is bounded.
-fn restore_units(arg: Arg, units: &[String]) -> Arg {
-    if units.is_empty() {
+/// Replace each sentinel in the tree with a run of its text. The tree comes from
+/// [`parse_linear`], which caps its depth, so recursing over it is bounded.
+fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
+    if pieces.is_empty() {
         return arg;
     }
     let mut out: Arg = Vec::with_capacity(arg.len());
     for node in arg {
         match node {
-            MNode::Run(r) if r.text.chars().any(|c| sentinel_unit(c, units).is_some()) => {
+            MNode::Run(r) if r.text.chars().any(|c| sentinel_piece(c, pieces).is_some()) => {
                 let mut buf = String::new();
                 let mut prev: Option<char> = None;
                 for c in r.text.chars() {
-                    match sentinel_unit(c, units) {
-                        Some(unit) => {
+                    match sentinel_piece(c, pieces) {
+                        Some(piece) => {
                             if !buf.is_empty() {
                                 out.push(MNode::Run(MRun { text: std::mem::take(&mut buf), ..r.clone() }));
                             }
-                            let space = if needs_space(prev) { THIN_SPACE.to_string() } else { String::new() };
-                            out.push(MNode::Run(MRun { color: r.color, ..unit_run(format!("{space}{unit}")) }));
+                            out.push(MNode::Run(piece_run(piece, prev, pieces, &r)));
                         }
                         None => buf.push(c),
                     }
@@ -431,22 +518,21 @@ fn restore_units(arg: Arg, units: &[String]) -> Arg {
             }
             MNode::Script { kind, base, sub, sup } => {
                 // A unit raised to a power right after a number: `2 in^2`.
-                let unit_base =
-                    matches!(base.first(), Some(MNode::Run(r)) if r.text.chars().next().is_some_and(|c| sentinel_unit(c, units).is_some()));
+                let unit_base = matches!(base.first(), Some(MNode::Run(r)) if r.text.chars().next().is_some_and(|c| is_unit_sentinel(c, pieces)));
                 let prev = match out.last() {
                     Some(MNode::Run(r)) => r.text.chars().last(),
                     _ => None,
                 };
-                let mut base = restore_units(base, units);
+                let mut base = restore_pieces(base, pieces);
                 if unit_base
-                    && needs_space(prev)
+                    && needs_space(prev, pieces)
                     && let Some(MNode::Run(r)) = base.first_mut()
                 {
                     r.text.insert(0, THIN_SPACE);
                 }
-                out.push(MNode::Script { kind, base, sub: restore_units(sub, units), sup: restore_units(sup, units) });
+                out.push(MNode::Script { kind, base, sub: restore_pieces(sub, pieces), sup: restore_pieces(sup, pieces) });
             }
-            other => out.push(map_args(other, &|a| restore_units(a, units))),
+            other => out.push(map_args(other, &|a| restore_pieces(a, pieces))),
         }
     }
     out
