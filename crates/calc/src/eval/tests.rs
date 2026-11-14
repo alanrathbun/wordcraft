@@ -153,8 +153,17 @@ fn offset_units_only_as_a_lone_literal() {
     close(val("100 °C ="), 373.15, Dim::TEMPERATURE);
     close(val("-40 °F ="), 233.15, Dim::TEMPERATURE);
     close(val("(5 °C) ="), 278.15, Dim::TEMPERATURE);
-    // A difference of two absolute temperatures is a valid interval.
-    close(val("100 °C - 0 °C ="), 100.0, Dim::TEMPERATURE);
+    // Two absolute temperatures can't be added or subtracted, but an interval can be added.
+    for src in ["100 °C + 5 °C =", "100 °C - 5 °F ="] {
+        assert_eq!(err(src), CalcError::Unit(UnitError::AffineTemperature), "{src}");
+    }
+    close(val("100 °C + 5 Δ°C ="), 378.15, Dim::TEMPERATURE);
+    close(val("5 K + 100 °C ="), 378.15, Dim::TEMPERATURE);
+    // Variables holding absolute temperatures are not tracked.
+    let mut env = Env::new();
+    run(&mut env, "T_1 := 100 °C").expect("defines");
+    run(&mut env, "T_2 := 20 °C").expect("defines");
+    close(shown(&mut env, "T_1 - T_2 ="), 80.0, Dim::TEMPERATURE);
     for src in ["°F =", "1 / °F =", "5 °F / s =", "x := 2 °F^2 =", "3 + °C =", "-(5 °F) =", "(5 °F)^2 =", "2 (5 °F) =", "(5 °F) / 2 ="] {
         assert_eq!(err(src), CalcError::Unit(UnitError::AffineTemperature), "{src}");
     }
@@ -204,7 +213,8 @@ fn exponential_work_is_bounded() {
 
 #[test]
 fn deep_expressions_evaluate_and_hostile_depth_is_refused() {
-    // Parser-limit depth: 1000 nested parentheses and a 1000-term sum evaluate fine.
+    // Parser-limit shapes: 30 nested parentheses (its nesting limit is 64) and a 1000-term sum
+    // (a tree 1000 high) evaluate fine.
     let nested = format!("{}1{} =", "(-".repeat(30), ")".repeat(30));
     assert!(run(&mut Env::new(), &nested).is_ok());
     let sum = format!("{} =", vec!["1"; 1000].join("+"));
@@ -305,6 +315,9 @@ fn min_max_round_mod() {
     close(val("mod(7 m, 3 m) ="), 1.0, Dim::LENGTH);
     close(val("mod(-1, 3) ="), 2.0, Dim::ONE);
     close(val("mod(5, -3) ="), -1.0, Dim::ONE);
+    // A remainder too small to move the divisor is 0, never exactly the divisor.
+    close(val("mod(-1/10^20 m, 3 m) ="), 0.0, Dim::LENGTH);
+    assert!(val("mod(-1/10^20, 3) =").value < 3.0);
     assert_eq!(err("mod(5, 0) ="), CalcError::NonFinite);
     assert!(matches!(err("mod(1 m, 1 s) ="), CalcError::Unit(UnitError::Mismatch { .. })));
 }

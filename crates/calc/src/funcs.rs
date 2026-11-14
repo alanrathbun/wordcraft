@@ -187,7 +187,10 @@ fn modulo(args: &[Quantity]) -> Result<Quantity, CalcError> {
     same(*a, *b)?;
     let mut r = a.value % b.value;
     if r != 0.0 && (r < 0.0) != (b.value < 0.0) {
-        r += b.value;
+        // A remainder too small to move `b` (e.g. -1e-20 mod 3) would round up to exactly `b`,
+        // which is out of range; it is 0 to the precision there is.
+        let shifted = r + b.value;
+        r = if shifted == b.value { 0.0 } else { shifted };
     }
     number(r, merge(a.dim, b.dim))
 }

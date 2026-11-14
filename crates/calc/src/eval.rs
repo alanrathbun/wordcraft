@@ -189,10 +189,15 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Quantity,
             {
                 return q;
             }
-            // Offset literals may be added and subtracted (a difference of two absolute
-            // temperatures is an interval) but not scaled: `5 °F/s` would be a wrong number that
-            // looks right.
-            if !matches!(op, Op::Add | Op::Sub) {
+            // Offset literals may be combined with an interval but not scaled (`5 °F/s` would be a
+            // wrong number that looks right) or combined with each other.
+            if matches!(op, Op::Add | Op::Sub) {
+                // Two absolute temperatures can't be added or subtracted (`100 °C + 5 °C` has no
+                // meaning); an absolute one with an interval (`100 °C + 5 K`) is fine.
+                if is_offset_literal(cx, fr, a) && is_offset_literal(cx, fr, b) {
+                    return Err(CalcError::Unit(UnitError::AffineTemperature));
+                }
+            } else {
                 refuse_offset_operand(cx, fr, &[a, b])?;
             }
             let x = eval(cx, fr, a, depth + 1)?;
@@ -216,6 +221,7 @@ fn from_scale(v: f64, scale: &Scale) -> Result<Quantity, CalcError> {
     finite_q(Quantity::new(scale.to_si(v), scale.dim))
 }
 
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
 fn apply(op: Op, x: Quantity, y: Quantity) -> Result<Quantity, CalcError> {
     match op {
@@ -296,6 +302,7 @@ fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Quantity, CalcErro
     Err(CalcError::Undefined(name.to_string()))
 }
 
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
 fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) -> Result<Quantity, CalcError> {
     // Resolve what is being called before evaluating the arguments, so a missing name is reported
