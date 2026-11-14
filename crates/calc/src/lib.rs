@@ -2,7 +2,8 @@
 //!
 //! Inline calculations are written the way an engineer writes them on paper: `P := 1500 lbf`,
 //! `σ := P/A_b = ? ksi`, `f(x, y) := x^2 + y`. This crate turns that text into a syntax tree
-//! ([`parse`]) and reports what a statement defines and uses ([`defined_name`], [`free_names`]).
+//! ([`parse`]), reports what a statement defines and uses ([`defined_name`], [`free_names`]), and
+//! evaluates it against the names defined so far ([`run_stmt`], [`Env`]).
 //!
 //! The parser knows nothing about units or variables: `1500 lbf` is the product of the number 1500
 //! and the name `lbf`, and the evaluator decides what each name means. Source text is hostile
@@ -11,9 +12,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod ast;
+mod eval;
+mod funcs;
 mod parse;
 
 pub use ast::{Expr, Op, Show, Stmt, defined_name, free_names};
+pub use eval::{Env, check_name, eval_expr, run_stmt};
 pub use parse::parse;
 
 /// An error from parsing or evaluating a calculation. The message is shown to the author next to
