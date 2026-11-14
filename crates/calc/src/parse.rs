@@ -11,12 +11,17 @@
 //! unary     := "-" unary | power                               so -x^2 is -(x^2)
 //! power     := atom [ "^" unary ]                              right-associative
 //! atom      := number | name | name"(" args ")" | "(" expr ")" | "|" expr "|" | "√" atom
+//! postfix   := atom { "²" | "³" | "⁻¹" ... }                   one superscript digit, like `^`
 //! ```
+//!
+//! Adjacency (implicit multiplication) groups exactly like `*`, left to right, so `1/2 x` is
+//! `(1/2) x` and not `1/(2 x)` (the Mathcad convention). A number directly after a number, name
+//! or closing bracket (`1 500`, `x 2`) is an error rather than a product.
 //!
 //! The parser knows nothing about units or variables. `5 kN` is `5 * kN`; the evaluator decides
 //! what `kN` is. Hostile input is bounded three ways: the source is at most [`MAX_SOURCE_BYTES`],
-//! the token list at most [`MAX_TOKENS`], and both the parser's recursion and the height of the
-//! tree it builds at most [`MAX_DEPTH`], so nothing downstream recurses deeply.
+//! the token list at most [`MAX_TOKENS`], the parser's recursion (nesting) at most [`MAX_DEPTH`] and
+//! the height of the tree it builds at most [`MAX_HEIGHT`], so nothing downstream recurses deeply.
 
 use crate::{CalcError, Expr, Op, Show, Stmt};
 
@@ -27,9 +32,12 @@ mod tests;
 const MAX_SOURCE_BYTES: usize = 16 * 1024;
 /// Most tokens accepted.
 const MAX_TOKENS: usize = 10_000;
-/// Deepest nesting of expressions (parentheses, calls, `|…|`, prefix and `^` operands), and
-/// tallest syntax tree (levels, counting the leaves), accepted: one more is `TooComplex`.
+/// Deepest nesting of expressions (parentheses, calls, `|…|`, prefix signs and `^` operands)
+/// accepted: one more is `TooComplex`.
 const MAX_DEPTH: usize = 64;
+/// Tallest syntax tree (levels, counting the leaves) accepted. A flat sum of `n` terms is `n`
+/// levels tall, so this also bounds how long a sum or product can be.
+const MAX_HEIGHT: usize = 1024;
 
 // Binding powers: (left, right) for infix operators; a higher number binds tighter.
 const ADD_BP: (u8, u8) = (10, 11);
@@ -92,6 +100,8 @@ enum Kind {
     RParen,
     Comma,
     Sqrt,
+    /// A superscript exponent such as `²` or `⁻¹`, already decoded.
+    Sup(i32),
     /// `:=` or `≔`
     Define,
     /// A lone `=`; the lexer stops here, and the text after it is the unit.
@@ -113,6 +123,7 @@ impl Kind {
             Kind::RParen => "`)`".into(),
             Kind::Comma => "`,`".into(),
             Kind::Sqrt => "`√`".into(),
+            Kind::Sup(_) => "a superscript".into(),
             Kind::Define => "`:=`".into(),
             Kind::Eq => "`=`".into(),
         }
@@ -135,7 +146,39 @@ fn is_name_start(c: char) -> bool {
 
 /// A name continues with letters, digits, `_` (the subscript) and the unit marks.
 fn is_name_continue(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '°' | '∆' | 'Δ' | 'µ' | 'μ')
+    (c.is_alphanumeric() && superscript_digit(c).is_none()) || matches!(c, '_' | '°' | '∆' | 'Δ' | 'µ' | 'μ')
+}
+
+/// The value of a superscript digit (`⁰`..`⁹`). These are not name characters: `x²` is `x^2`.
+fn superscript_digit(c: char) -> Option<i32> {
+    match c {
+        '⁰' => Some(0),
+        '¹' => Some(1),
+        '²' => Some(2),
+        '³' => Some(3),
+        '⁴' => Some(4),
+        '⁵' => Some(5),
+        '⁶' => Some(6),
+        '⁷' => Some(7),
+        '⁸' => Some(8),
+        '⁹' => Some(9),
+        _ => None,
+    }
+}
+
+/// A run of superscript characters is one optional `⁻` and exactly one digit.
+fn decode_superscript(run: &[char]) -> Result<i32, CalcError> {
+    let (negative, digits) = match run.split_first() {
+        Some(('⁻', rest)) => (true, rest),
+        _ => (false, run),
+    };
+    match digits {
+        [d] => match superscript_digit(*d) {
+            Some(v) => Ok(if negative { -v } else { v }),
+            None => Err(syntax("a superscript needs a digit")),
+        },
+        _ => Err(syntax("a superscript exponent must be a single digit (use `^` for others)")),
+    }
 }
 
 fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
@@ -151,7 +194,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
         let mut end = start + c.len_utf8();
         let kind = match c {
             '+' => Kind::Plus,
-            '-' | '\u{2212}' => Kind::Minus,
+            '-' | '\u{2212}' | '\u{2013}' => Kind::Minus,
             '*' | '·' | '×' | '\u{22C5}' => Kind::Star,
             '/' | '÷' => Kind::Slash,
             '^' => Kind::Caret,
@@ -168,6 +211,14 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
                 }
                 None => return Err(syntax("unexpected character `:` (did you mean `:=`?)")),
             },
+            c if superscript_digit(c).is_some() || c == '⁻' => {
+                let mut run = vec![c];
+                while let Some((i, n)) = chars.next_if(|&(_, n)| superscript_digit(n).is_some() || n == '⁻') {
+                    end = i + n.len_utf8();
+                    run.push(n);
+                }
+                Kind::Sup(decode_superscript(&run)?)
+            }
             '=' => {
                 toks.push(Tok { kind: Kind::Eq, start, end });
                 return Ok(toks);
@@ -289,10 +340,10 @@ impl Node {
         Node { expr, height: 1 }
     }
 
-    /// A node over `children`, rejecting a tree taller than [`MAX_DEPTH`].
+    /// A node over `children`, rejecting a tree taller than [`MAX_HEIGHT`].
     fn over(children_height: usize, expr: Expr) -> Result<Self, CalcError> {
         let height = children_height + 1;
-        if height > MAX_DEPTH { Err(CalcError::TooComplex) } else { Ok(Node { expr, height }) }
+        if height > MAX_HEIGHT { Err(CalcError::TooComplex) } else { Ok(Node { expr, height }) }
     }
 }
 
@@ -363,6 +414,18 @@ impl<'a> Parser<'a> {
     fn expr_inner(&mut self, min_bp: u8) -> Result<Node, CalcError> {
         let mut lhs = self.prefix()?;
         loop {
+            if let Some(&Tok { kind: Kind::Sup(exp), start, .. }) = self.peek() {
+                // A superscript applies to the factor just before it, like `^`, and must touch it.
+                let touches = self.pos.checked_sub(1).and_then(|i| self.toks.get(i)).is_some_and(|prev| prev.end == start);
+                if !touches || POW_BP.0 < min_bp {
+                    break;
+                }
+                self.pos += 1;
+                let magnitude = Expr::Num(f64::from(exp.unsigned_abs()));
+                let exponent = if exp < 0 { Node::over(1, Expr::Unary(Op::Neg, Box::new(magnitude)))? } else { Node::leaf(magnitude) };
+                lhs = Node::over(lhs.height.max(exponent.height), Expr::Binary(Op::Pow, Box::new(lhs.expr), Box::new(exponent.expr)))?;
+                continue;
+            }
             let (op, (left_bp, right_bp), implicit) = match self.peek_kind() {
                 Some(Kind::Plus) => (Op::Add, ADD_BP, false),
                 Some(Kind::Minus) => (Op::Sub, ADD_BP, false),
@@ -376,6 +439,9 @@ impl<'a> Parser<'a> {
             if left_bp < min_bp {
                 break;
             }
+            if implicit && self.peek_kind().is_some_and(|k| matches!(k, Kind::Num(_))) && self.after_value() {
+                return Err(syntax("two values in a row \u{2014} did you mean `*`?"));
+            }
             if !implicit {
                 self.pos += 1;
             }
@@ -383,6 +449,13 @@ impl<'a> Parser<'a> {
             lhs = Node::over(lhs.height.max(rhs.height), Expr::Binary(op, Box::new(lhs.expr), Box::new(rhs.expr)))?;
         }
         Ok(lhs)
+    }
+
+    /// Whether the token just consumed ends a value: a number, name, closing bracket or bar, or a
+    /// superscript.
+    fn after_value(&self) -> bool {
+        let prev = self.pos.checked_sub(1).and_then(|i| self.toks.get(i));
+        prev.is_some_and(|t| matches!(t.kind, Kind::Num(_) | Kind::Name(_) | Kind::RParen | Kind::Bar | Kind::Sup(_)))
     }
 
     fn prefix(&mut self) -> Result<Node, CalcError> {

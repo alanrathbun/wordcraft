@@ -146,9 +146,9 @@ fn source_size_limit_is_16_kib() {
 }
 
 #[test]
-fn depth_limits() {
-    // Each shape is accepted up to the limit (64 levels of nesting or tree height) and refused
-    // at one more.
+fn nesting_depth_limit() {
+    // Nesting (parentheses, calls, bars, prefix signs, power operands) is accepted to 64 levels
+    // and refused at 65.
     let ok = |src: String| assert!(parse(&src).is_ok(), "{} should parse", &src[..src.len().min(40)]);
     let too_complex = |src: String| assert_eq!(parse(&src), Err(CalcError::TooComplex), "{}", &src[..src.len().min(40)]);
 
@@ -156,30 +156,111 @@ fn depth_limits() {
     ok(parens(64));
     too_complex(parens(65));
 
-    // A flat chain builds a left-leaning tree: k additions are k + 1 levels tall.
-    let chain = |k: usize| format!("x := {}1", "1+".repeat(k));
-    ok(chain(63));
-    too_complex(chain(64));
-
     let negations = |k: usize| format!("x := {}1", "-".repeat(k));
-    ok(negations(63));
-    too_complex(negations(64));
+    ok(negations(64));
+    too_complex(negations(65));
 
     let powers = |k: usize| format!("x := {}1", "2^".repeat(k));
-    ok(powers(63));
-    too_complex(powers(64));
+    ok(powers(64));
+    too_complex(powers(65));
 
     let abs = |k: usize| format!("x := {}1{}", "|".repeat(k), "|".repeat(k));
-    ok(abs(63));
-    too_complex(abs(64));
+    ok(abs(64));
+    too_complex(abs(65));
 
     let calls = |k: usize| format!("x := {}1{}", "f(".repeat(k), ")".repeat(k));
-    ok(calls(63));
-    too_complex(calls(64));
+    ok(calls(64));
+    too_complex(calls(65));
 
     // Far beyond any limit.
     too_complex(parens(5_000));
-    too_complex(chain(5_000));
+}
+
+#[test]
+fn tree_height_limit_allows_long_flat_expressions() {
+    // A flat chain builds a left-leaning tree: k operators are k + 1 levels tall, up to 1024.
+    let sum = |k: usize| format!("x := {}1", "1+".repeat(k));
+    assert!(parse(&sum(500)).is_ok());
+    assert!(parse(&sum(1023)).is_ok());
+    assert!(parse(&sum(1024)) == Err(CalcError::TooComplex));
+    assert!(parse(&sum(1100)) == Err(CalcError::TooComplex));
+    assert!(parse(&sum(5_000)) == Err(CalcError::TooComplex));
+    let product = format!("x := {}a", "a ".repeat(500));
+    assert!(parse(&product).is_ok());
+    let product = format!("x := {}a", "a ".repeat(1100));
+    assert!(parse(&product) == Err(CalcError::TooComplex));
+    // The height of a nested group counts towards the same limit.
+    assert!(parse(&format!("x := (1+1)+{}1", "1+".repeat(1022))) == Err(CalcError::TooComplex));
+    assert!(parse(&format!("x := (1+1)+{}1", "1+".repeat(1021))).is_ok());
+}
+
+#[test]
+fn adjacent_numbers_are_an_error() {
+    for src in ["1 500 lbf", "1 000", "x 2", "(a) 2", "|a| 2", "2 3", "x² 2", "f(x) 2", "1.5 2.5"] {
+        match parse(&format!("{src} =")) {
+            Err(CalcError::Syntax(m)) => assert_eq!(m, "two values in a row \u{2014} did you mean `*`?", "{src}"),
+            other => panic!("{src:?} gave {other:?}"),
+        }
+    }
+    // A number before a name or a bracket is still implicit multiplication.
+    assert_eq!(expr_of("2 P"), bin(Op::Mul, num(2.0), name("P")));
+    assert_eq!(expr_of("5 in"), bin(Op::Mul, num(5.0), name("in")));
+    assert_eq!(expr_of("P A"), bin(Op::Mul, name("P"), name("A")));
+    assert_eq!(expr_of("2 (a+b)"), bin(Op::Mul, num(2.0), bin(Op::Add, name("a"), name("b"))));
+    assert_eq!(expr_of("a (2)"), bin(Op::Mul, name("a"), num(2.0)));
+    assert_eq!(expr_of("2 √x"), bin(Op::Mul, num(2.0), call("sqrt", vec![name("x")])));
+}
+
+#[test]
+fn superscript_digits_are_postfix_powers() {
+    assert_eq!(expr_of("x²"), expr_of("x^2"));
+    assert_eq!(expr_of("x²"), bin(Op::Pow, name("x"), num(2.0)));
+    assert_eq!(expr_of("in³"), bin(Op::Pow, name("in"), num(3.0)));
+    assert_eq!(expr_of("s⁻¹"), expr_of("s^-1"));
+    assert_eq!(expr_of("s⁻¹"), bin(Op::Pow, name("s"), neg(num(1.0))));
+    assert_eq!(expr_of("(a+b)²"), bin(Op::Pow, bin(Op::Add, name("a"), name("b")), num(2.0)));
+    assert_eq!(expr_of("|a|²"), bin(Op::Pow, Expr::Abs(Box::new(name("a"))), num(2.0)));
+    assert_eq!(expr_of("5²"), bin(Op::Pow, num(5.0), num(2.0)));
+    assert_eq!(expr_of("f(x)²"), bin(Op::Pow, call("f", vec![name("x")]), num(2.0)));
+    assert_eq!(expr_of("√x²"), bin(Op::Pow, call("sqrt", vec![name("x")]), num(2.0)));
+    for (sup, digit) in [("⁰", 0.0), ("¹", 1.0), ("²", 2.0), ("³", 3.0), ("⁴", 4.0), ("⁵", 5.0), ("⁶", 6.0), ("⁷", 7.0), ("⁸", 8.0), ("⁹", 9.0)]
+    {
+        assert_eq!(expr_of(&format!("x{sup}")), bin(Op::Pow, name("x"), num(digit)), "{sup}");
+    }
+    // It binds like `^`: tighter than multiplication and than a prefix minus.
+    assert_eq!(expr_of("2 m²"), bin(Op::Mul, num(2.0), bin(Op::Pow, name("m"), num(2.0))));
+    assert_eq!(expr_of("kN/m²"), bin(Op::Div, name("kN"), bin(Op::Pow, name("m"), num(2.0))));
+    assert_eq!(expr_of("-x²"), neg(bin(Op::Pow, name("x"), num(2.0))));
+    assert_eq!(expr_of("lbf/in²"), expr_of("lbf/in^2"));
+    // A subscript digit is still part of a name.
+    assert_eq!(expr_of("x₂"), name("x₂"));
+}
+
+#[test]
+fn superscript_errors() {
+    for src in ["x¹²", "x⁻¹²", "x⁻", "x ²", "²", "x² ²", "a + ²", "x⁻⁻1"] {
+        let r = parse(&format!("{src} ="));
+        assert!(matches!(r, Err(CalcError::Syntax(_))), "{src:?} gave {r:?}");
+    }
+    match parse("x¹² =") {
+        Err(CalcError::Syntax(m)) => assert!(m.contains("single digit"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn en_dash_is_minus() {
+    assert_eq!(expr_of("a \u{2013} b"), bin(Op::Sub, name("a"), name("b")));
+    assert_eq!(expr_of("\u{2013}a"), neg(name("a")));
+}
+
+#[test]
+fn implicit_multiplication_has_the_precedence_of_multiplication() {
+    // Adjacency groups like `*`, left to right (the Mathcad convention), so `1/2 x` is `(1/2) x`,
+    // not `1/(2 x)`.
+    assert_eq!(expr_of("1/2 x"), bin(Op::Mul, bin(Op::Div, num(1.0), num(2.0)), name("x")));
+    assert_eq!(expr_of("1/2 x"), expr_of("1/2*x"));
+    assert_eq!(expr_of("a/b c"), bin(Op::Mul, bin(Op::Div, name("a"), name("b")), name("c")));
 }
 
 #[test]

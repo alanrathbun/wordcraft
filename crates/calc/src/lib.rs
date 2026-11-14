@@ -7,6 +7,7 @@
 //! The parser knows nothing about units or variables: `1500 lbf` is the product of the number 1500
 //! and the name `lbf`, and the evaluator decides what each name means. Source text is hostile
 //! input, so the parser bounds source size, token count and expression depth and never panics.
+#![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod ast;
