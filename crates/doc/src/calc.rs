@@ -25,6 +25,18 @@ pub struct CalcRegion {
     pub state: CalcState,
 }
 
+impl CalcRegion {
+    /// Bytes this region owns beyond its own size: its source, unit and error message, all of
+    /// which come from files. What the paste and clone cost guards count.
+    pub fn heap_bytes(&self) -> usize {
+        let error = if let CalcState::Error(message) = &self.state { message.len() } else { 0 };
+        std::mem::size_of::<CalcRegion>()
+            .saturating_add(self.source.len())
+            .saturating_add(self.unit.as_ref().map_or(0, String::len))
+            .saturating_add(error)
+    }
+}
+
 /// Where a [`CalcRegion`] stands with respect to its displayed result.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum CalcState {
@@ -151,7 +163,7 @@ pub fn parse_calc_field(instr: &str) -> Option<(String, Option<String>, Option<u
         }
         let (value, _) = words.next()?;
         match switch.as_str() {
-            "\\u" if unit.is_none() && !value.trim().is_empty() => unit = Some(value),
+            "\\u" if unit.is_none() && !value.trim().is_empty() && !value.starts_with('\\') => unit = Some(value),
             "\\p" if precision.is_none() => {
                 // `u8::from_str` takes a leading `+`; a field code doesn't.
                 if !value.bytes().all(|b| b.is_ascii_digit()) {

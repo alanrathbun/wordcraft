@@ -63,6 +63,8 @@ fn instr_rejects_malformed() {
         "WCCALC x extra",
         "WCCALC x \\u \"unterminated",
         "WCCALC x \\u \"\"",
+        "WCCALC x \\u \\p",
+        "WCCALC x \\u \\p 2",
         "WCCALC \"x y\"",
         "",
     ] {
