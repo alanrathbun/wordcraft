@@ -196,7 +196,9 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Quantity,
                 // interval literal (`100 °C + 5 K`); `100 °C + 5 °C`, `T + 5 °C` and `100 °C + T`
                 // have no meaning, and a variable can't be told apart from an absolute value.
                 let (abs_a, abs_b) = (is_offset_literal(cx, fr, a), is_offset_literal(cx, fr, b));
-                if (abs_a && !is_interval_literal(cx, fr, b)) || (abs_b && !is_interval_literal(cx, fr, a)) {
+                // Subtracting an absolute temperature from anything (`5 K - 100 °C`) is meaningless.
+                let sub_abs = *op == Op::Sub && abs_b;
+                if sub_abs || (abs_a && !is_non_offset_temperature_literal(cx, fr, b)) || (abs_b && !is_non_offset_temperature_literal(cx, fr, a)) {
                     return Err(CalcError::Unit(UnitError::AffineTemperature));
                 }
             } else {
@@ -271,7 +273,7 @@ fn offset_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> 
 
 /// Whether `e` is `number unit` for a temperature unit with no offset (`5 K`, `5 °R`, `5 Δ°C`):
 /// a temperature interval.
-fn is_interval_literal(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr) -> bool {
+fn is_non_offset_temperature_literal(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr) -> bool {
     matches!(e, Expr::Binary(Op::Mul, a, b)
         if unit_literal(cx, fr, a, b).is_some_and(|(_, s)| s.offset == 0.0 && s.dim == Dim::TEMPERATURE))
 }

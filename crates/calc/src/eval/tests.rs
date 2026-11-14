@@ -159,6 +159,11 @@ fn offset_units_only_as_a_lone_literal() {
     }
     close(val("100 °C + 5 Δ°C ="), 378.15, Dim::TEMPERATURE);
     close(val("5 K + 100 °C ="), 378.15, Dim::TEMPERATURE);
+    close(val("100 °C - 5 Δ°C ="), 368.15, Dim::TEMPERATURE);
+    close(val("100 °C - 5 K ="), 368.15, Dim::TEMPERATURE);
+    for src in ["5 K - 100 °C =", "5 Δ°C - 100 °C =", "5 Δ°F - 100 °C ="] {
+        assert_eq!(err(src), CalcError::Unit(UnitError::AffineTemperature), "{src}");
+    }
     close(val("5 Δ°F + 100 °C ="), 373.15 + 5.0 * 5.0 / 9.0, Dim::TEMPERATURE);
     close(val("100 °C + 5 °R ="), 373.15 + 5.0 * 5.0 / 9.0, Dim::TEMPERATURE);
     // An absolute literal beside a variable is refused; variables alone are not tracked.
