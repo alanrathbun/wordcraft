@@ -153,6 +153,11 @@ pub struct Document {
     /// Calculation settings (unit system, precision, manual mode); `None` = the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calc_settings: Option<calc::CalcSettings>,
+    /// The calculation store of a file just read, or about to be written (`.docx`): what
+    /// `wordcraft-calc` turns back into live calculations, or made from them. Transient: never
+    /// saved natively, and taken as soon as the file is opened.
+    #[serde(skip)]
+    pub calc_store: Option<calc::CalcStore>,
 }
 
 #[cfg(test)]

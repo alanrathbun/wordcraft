@@ -173,6 +173,37 @@ fn missing_pictures_from_shared(source: craft_wordmodel::MissingPictures) -> Res
     Ok(target)
 }
 
+/// Most custom XML parts looked at for a calculation store that isn't under its own name.
+const MAX_STORE_CANDIDATES: usize = 256;
+
+/// Take the calculation store out of the kept parts: under the name it was written with, or (Word
+/// may rename the custom XML parts it keeps) any custom XML part holding one. The part found is
+/// removed, so a save never writes a stale copy beside the new one; so is a part under our name
+/// that doesn't hold a sound store. Anyone else's part is never touched. `None` when there is no
+/// sound store.
+fn take_calc_store(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<u8>>>) -> Option<wordcraft_doc::calc::CalcStore> {
+    let is_ours = |k: &str| k.eq_ignore_ascii_case(crate::calc_store::PART);
+    if let Some(key) = passthrough.keys().find(|k| is_ours(k)).cloned() {
+        let store = passthrough.remove(&key).and_then(|bytes| crate::calc_store::read_from_bytes(&bytes));
+        if store.is_some() {
+            return store;
+        }
+    }
+    let renamed = passthrough
+        .iter()
+        .filter(|(k, _)| k.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("customxml/")))
+        .take(MAX_STORE_CANDIDATES)
+        // Cheap test first: a store names its kind near the start.
+        .filter(|(_, bytes)| {
+            let head = bytes.get(..bytes.len().min(512)).unwrap_or(bytes);
+            head.windows(crate::calc_store::KIND.len()).any(|w| w == crate::calc_store::KIND.as_bytes())
+        })
+        .find_map(|(k, bytes)| crate::calc_store::read_from_bytes(bytes).map(|store| (k.clone(), store)));
+    let (key, store) = renamed?;
+    passthrough.remove(&key);
+    Some(store)
+}
+
 /// Converts the shared reader's model without copying the full document or its embedded media.
 pub fn from_shared_model(mut source: craft_wordmodel::Document) -> Result<wordcraft_doc::Document, DocxError> {
     let mut fit_state = None;
@@ -184,6 +215,7 @@ pub fn from_shared_model(mut source: craft_wordmodel::Document) -> Result<wordcr
         fit_state = Some(state);
         source.passthrough.remove(&key);
     }
+    let calc_store = take_calc_store(&mut source.passthrough);
 
     let craft_wordmodel::Document {
         body,
@@ -226,6 +258,7 @@ pub fn from_shared_model(mut source: craft_wordmodel::Document) -> Result<wordcr
     document.glossary = glossary.into_iter().map(|g| glossary_value_from_shared(g, &mut graphics)).collect::<Result<_, _>>()?;
     document.missing_pictures = missing_pictures_from_shared(missing_pictures)?;
     document.fit_state = fit_state;
+    document.calc_store = calc_store;
     Ok(document)
 }
 
@@ -380,6 +413,30 @@ fn missing_pictures_to_shared(source: &wordcraft_doc::MissingPictures) -> Result
     Ok(target)
 }
 
+/// Have the writer save `xml` as custom XML part `part` of the main document: its bytes, its
+/// manifest entry and its relationship, each added once.
+fn keep_custom_xml_part(document: &mut craft_wordmodel::Document, part: &str, xml: Vec<u8>) {
+    const CUSTOM_XML_ROOTS: &str = "wordcraft:customXml.roots";
+    const EMBEDDED_PARTS: &str = "wordcraft:embedded.parts";
+
+    document.passthrough.insert(part.into(), Arc::new(xml));
+    let mut add_line = |key: &str, line: String| {
+        let text = match document.passthrough.get(key) {
+            Some(existing) => {
+                let mut text = String::from_utf8_lossy(existing).to_string();
+                if !text.contains(part) {
+                    text.push_str(&line);
+                }
+                text
+            }
+            None => line,
+        };
+        document.passthrough.insert(key.into(), Arc::new(text.into_bytes()));
+    };
+    add_line(EMBEDDED_PARTS, format!("P\t{part}\tapplication/xml\n"));
+    add_line(CUSTOM_XML_ROOTS, format!("D\thttp://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\t{part}\n"));
+}
+
 /// Converts a WordCraft document to the shared model for serialization.
 pub fn to_shared_model(source: &wordcraft_doc::Document) -> Result<craft_wordmodel::Document, DocxError> {
     let mut document = craft_wordmodel::Document::new();
@@ -401,38 +458,12 @@ pub fn to_shared_model(source: &wordcraft_doc::Document) -> Result<craft_wordmod
     document.glossary = source.glossary.iter().map(glossary_value_to_shared).collect::<Result<_, _>>()?;
     document.missing_pictures = missing_pictures_to_shared(&source.missing_pictures)?;
 
-    // Handle fit_state preservation through custom XML passthrough
+    // WordCraft's own stores travel as custom XML parts.
     if let Some(fit) = &source.fit_state {
-        let xml = crate::fit::write(fit)?;
-        document.passthrough.insert(crate::fit::PART.into(), Arc::new(xml));
-        const CUSTOM_XML_ROOTS: &str = "wordcraft:customXml.roots";
-        const EMBEDDED_PARTS: &str = "wordcraft:embedded.parts";
-
-        let manifest_entry = format!("P\t{}\tapplication/xml\n", crate::fit::PART);
-        let manifest = match document.passthrough.get_mut(EMBEDDED_PARTS) {
-            Some(existing) => {
-                let mut text = String::from_utf8_lossy(existing).to_string();
-                if !text.contains(crate::fit::PART) {
-                    text.push_str(&manifest_entry);
-                }
-                Arc::new(text.into_bytes())
-            }
-            None => Arc::new(manifest_entry.into_bytes()),
-        };
-        document.passthrough.insert(EMBEDDED_PARTS.into(), manifest);
-
-        let root_entry = format!("D\thttp://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\t{}\n", crate::fit::PART);
-        let roots = match document.passthrough.get_mut(CUSTOM_XML_ROOTS) {
-            Some(existing) => {
-                let mut text = String::from_utf8_lossy(existing).to_string();
-                if !text.contains(crate::fit::PART) {
-                    text.push_str(&root_entry);
-                }
-                Arc::new(text.into_bytes())
-            }
-            None => Arc::new(root_entry.into_bytes()),
-        };
-        document.passthrough.insert(CUSTOM_XML_ROOTS.into(), roots);
+        keep_custom_xml_part(&mut document, crate::fit::PART, crate::fit::write(fit)?);
+    }
+    if let Some(store) = source.calc_store.as_ref().filter(|s| !s.is_empty()) {
+        keep_custom_xml_part(&mut document, crate::calc_store::PART, crate::calc_store::write(store)?);
     }
 
     Ok(document)

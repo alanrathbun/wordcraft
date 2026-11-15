@@ -499,3 +499,86 @@ fn only_a_wccalc_field_counts() {
     s.doc.insert_object(&at, field(" wccalc y"), &Default::default()).unwrap();
     assert!(super::has_calc(&s.doc));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Opening and saving
+// ---------------------------------------------------------------------------------------------
+
+/// A session on `name` reopened from what `s` saves under that name.
+fn reopen(s: &Session, name: &str) -> Session {
+    let bytes = crate::io::save_bytes(name, &s.doc).unwrap();
+    Session::new(crate::io::open_bytes(name, &bytes).unwrap())
+}
+
+#[test]
+fn docx_save_and_open_keeps_calculations_live() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    run(&mut s, "insert.calcValue", json!({"name": "σ", "unit": "psi"}));
+    let before = s.doc.clone();
+    let back = reopen(&s, "report.docx");
+    assert_eq!(s.doc, before, "saving leaves the live document alone");
+    assert_eq!(regions(&back).len(), 3);
+    for (r, linear) in regions(&back) {
+        assert_eq!(r.state, CalcState::Fresh, "{} → {linear}", r.source);
+    }
+    assert_eq!(region(&back, p).0.source, "P := 1500 lbf");
+    assert_eq!(region(&back, sigma).1, region(&s, sigma).1);
+    assert_eq!(field_results(&back), field_results(&s));
+    // Flat XML too.
+    assert_eq!(regions(&reopen(&s, "report.xml")).len(), 3);
+}
+
+#[test]
+fn opening_recalculates_stale_results() {
+    let mut s = session();
+    let (_, _, sigma) = sample(&mut s);
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    run(&mut s, "insert.calculation", json!({"source": "Q := 2 lbf"}));
+    assert_eq!(region(&s, sigma).0.state, CalcState::Stale);
+    // Native JSON keeps the stale state; opening makes the results current.
+    let back = reopen(&s, "report.json");
+    for (r, linear) in regions(&back) {
+        assert_eq!(r.state, CalcState::Fresh, "{} → {linear}", r.source);
+    }
+    // And through .docx, which shows the stale `≈` in Word.
+    let bytes = crate::io::save_bytes("report.docx", &s.doc).unwrap();
+    let xml = {
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut z.by_name("word/document.xml").unwrap(), &mut xml).unwrap();
+        xml
+    };
+    assert!(xml.contains('≈'), "Word sees what WordCraft showed");
+    let back = Session::new(crate::io::open_bytes("report.docx", &bytes).unwrap());
+    assert!(regions(&back).iter().all(|(r, _)| r.state == CalcState::Fresh));
+}
+
+#[test]
+fn opening_a_plain_document_changes_nothing() {
+    let mut s = session();
+    run(&mut s, "text.insert", json!({"text": "Plain text"}));
+    run(&mut s, "insert.equation", json!({"linear": "x^2", "edit": false}));
+    for name in ["plain.docx", "plain.json"] {
+        let bytes = crate::io::save_bytes(name, &s.doc).unwrap();
+        let mut read = if name.ends_with("docx") { wordcraft_docx::read(&bytes).unwrap() } else { serde_json::from_slice(&bytes).unwrap() };
+        read.ensure_nonempty();
+        let opened = crate::io::open_bytes(name, &bytes).unwrap();
+        assert!(opened.same_content(&read), "{name}");
+    }
+    let mut doc = s.doc.clone();
+    super::after_open(&mut doc);
+    assert_eq!(doc, s.doc);
+}
+
+#[test]
+fn a_panicking_open_pass_leaves_nothing_looking_current() {
+    let mut s = session();
+    let (_, _, sigma) = sample(&mut s);
+    let bytes = crate::io::save_bytes("report.json", &s.doc).unwrap();
+    INJECT_PANIC.with(|p| p.set(true));
+    let opened = crate::io::open_bytes("report.json", &bytes);
+    INJECT_PANIC.with(|p| p.set(false));
+    let back = Session::new(opened.unwrap());
+    assert_eq!(region(&back, sigma).0.state, CalcState::Stale);
+}

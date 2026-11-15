@@ -78,6 +78,47 @@ impl Default for CalcSettings {
     }
 }
 
+/// The tag prefix of the content control a calculation is saved in (`.docx`): the region's id
+/// follows (`wordcraft-calc:7`). WordCraft's own bookkeeping, never shown as a form field.
+pub const CALC_TAG_PREFIX: &str = "wordcraft-calc:";
+
+/// Most regions a [`CalcStore`] read from a file may hold; a larger one is ignored.
+pub const MAX_STORED_REGIONS: usize = 100_000;
+
+/// Largest serialized [`CalcStore`] read from a file, bytes; a larger one is ignored.
+pub const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
+
+/// What a saved file (`.docx`) keeps of its calculations beside the ordinary equations Word
+/// shows: the document's settings and each region's source, keyed by the id in its content
+/// control's tag ([`CALC_TAG_PREFIX`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CalcStore {
+    pub settings: CalcSettings,
+    pub regions: Vec<StoredRegion>,
+}
+
+impl CalcStore {
+    /// Nothing worth saving: no regions and the default settings.
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty() && self.settings == CalcSettings::default()
+    }
+}
+
+/// One region of a [`CalcStore`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredRegion {
+    pub id: u64,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision: Option<u8>,
+    /// Hash of the equation as saved: when the equation read back hashes differently, it was
+    /// edited outside WordCraft.
+    pub fingerprint: u64,
+}
+
 /// The field type of a quoted value: a locked [`crate::para::InlineObject::Field`] whose code is
 /// built by [`calc_field_instr`] and whose result is the value as it was quoted.
 pub const CALC_FIELD: &str = "WCCALC";

@@ -7085,6 +7085,7 @@ dependencies = [
  "quick-xml 0.41.0",
  "serde",
  "serde_json",
+ "wordcraft-calc",
  "wordcraft-doc",
  "wordcraft-geom",
  "zip 3.0.0",

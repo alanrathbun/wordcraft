@@ -117,6 +117,33 @@ pub(crate) fn after_command(s: &mut Session, id: &str, before: &Document) {
     s.status = format!("Calculations couldn't be updated: {message}");
 }
 
+/// After a document is opened (any format): calculations saved in a `.docx` come back live from
+/// the store read with it (`wordcraft_calc::docx::import`), and every calculation is
+/// recalculated so the results are current; regions edited outside WordCraft keep what they
+/// show. A document with no calculations is left as it was read.
+///
+/// The pass reads file content, so it runs inside `catch_unwind` like [`after_command`]: a panic
+/// puts the document back as read and greys every result, so none looks current.
+pub(crate) fn after_open(doc: &mut Document) {
+    let store = doc.calc_store.take();
+    if store.is_none() && !has_calc(doc) && !wordcraft_calc::docx::has_calc_controls(doc) {
+        return;
+    }
+    let saved = doc.clone();
+    let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        tests::maybe_inject_panic();
+        wordcraft_calc::docx::import(doc, store);
+    }));
+    if pass.is_ok() {
+        return;
+    }
+    *doc = saved.clone();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mark_stale(doc))).is_err() {
+        *doc = saved;
+    }
+}
+
 /// Recalculate the document. A duplicate-name message names the page of the first definition,
 /// so when two regions define the same name the document is laid out (print view) to find it;
 /// otherwise no layout is made.

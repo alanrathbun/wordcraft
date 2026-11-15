@@ -80,6 +80,7 @@ impl Document {
             missing_pictures: Default::default(),
             fit_state: None,
             calc_settings: None,
+            calc_store: None,
         }
     }
 
@@ -160,6 +161,7 @@ impl Document {
             missing_pictures: _,
             fit_state: _,
             calc_settings,
+            calc_store: _,
         } = self;
         let Document {
             body: other_body,
@@ -183,6 +185,7 @@ impl Document {
             missing_pictures: _,
             fit_state: _,
             calc_settings: other_calc_settings,
+            calc_store: _,
         } = other;
         same_blocks(body, other_body)
             && same_parts(parts, other_parts)

@@ -163,6 +163,7 @@ fn open_encrypted_odt(bytes: &[u8], password: Option<&str>, page: &wordcraft_doc
 fn opened(doc: &mut Document) {
     doc.ensure_nonempty();
     crate::cmd::references::refresh_date_fields(doc);
+    crate::cmd::calc::after_open(doc);
 }
 
 /// Parse a document from bytes; `name` gives the format by extension.

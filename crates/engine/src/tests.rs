@@ -2713,11 +2713,19 @@ fn calc_survives_native_format() {
     doc.body = vec![wordcraft_doc::para_block(p)];
     doc.calc_settings = Some(CalcSettings { system: UnitSystem::Si, precision: 5, manual: true });
     let saved = crate::io::save_bytes("calc.json", &doc).unwrap();
-    let back = crate::io::open_bytes("calc.json", &saved).unwrap();
+    // The file itself holds everything as it was, state included.
+    let back: wordcraft_doc::Document = serde_json::from_slice(&saved).unwrap();
     assert_eq!(back, doc);
     assert_eq!(back.calc_settings, doc.calc_settings);
     assert!(
         matches!(&back.body[0].as_para().unwrap().objects[0], InlineObject::Equation { calc: Some(c), .. } if c.id == 3 && c.state == CalcState::Stale)
+    );
+    // Opening it recalculates, so no result is left out of date: `P` and `A` are defined nowhere
+    // here, so the region is an error rather than a stale 12.5.
+    let opened = crate::io::open_bytes("calc.json", &saved).unwrap();
+    assert_eq!(opened.calc_settings, doc.calc_settings);
+    assert!(
+        matches!(&opened.body[0].as_para().unwrap().objects[0], InlineObject::Equation { calc: Some(c), .. } if c.id == 3 && matches!(c.state, CalcState::Error(_)))
     );
     // A document that never used calculations writes neither key.
     let plain = String::from_utf8(crate::io::save_bytes("plain.json", &wordcraft_doc::Document::new()).unwrap()).unwrap();

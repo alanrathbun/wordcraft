@@ -177,14 +177,14 @@ pub fn mark_stale(doc: &mut Document) {
 /// Where an object sits: the path to its paragraph (body block index, then row, cell and block
 /// index for each table level) and its index in the paragraph's objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct At {
-    path: Vec<u32>,
-    obj: usize,
+pub(crate) struct At {
+    pub(crate) path: Vec<u32>,
+    pub(crate) obj: usize,
 }
 
-struct FoundRegion {
-    at: At,
-    id: u64,
+pub(crate) struct FoundRegion {
+    pub(crate) at: At,
+    pub(crate) id: u64,
     source: String,
     unit: Option<String>,
     precision: Option<u8>,
@@ -199,15 +199,15 @@ struct FoundField {
 }
 
 #[derive(Default)]
-struct Found {
-    regions: Vec<FoundRegion>,
+pub(crate) struct Found {
+    pub(crate) regions: Vec<FoundRegion>,
     fields: Vec<FoundField>,
     /// Ids of tracked-deleted regions: never reused for a reassigned id.
     deleted_ids: Vec<u64>,
 }
 
 /// The calculation regions and quoted values of the body, in document order.
-fn collect(body: &Blocks) -> Found {
+pub(crate) fn collect(body: &Blocks) -> Found {
     let mut found = Found::default();
     for (i, b) in body.iter().enumerate() {
         let top = u32::try_from(i).unwrap_or(u32::MAX);
@@ -283,7 +283,7 @@ fn visit(path: &[u32], p: &Paragraph, found: &mut Found) {
 
 /// Each region's id, the first of any repeated id kept and the rest given the next unused one;
 /// and how many were reassigned.
-fn assign_ids(found: &Found) -> (Vec<u64>, usize) {
+pub(crate) fn assign_ids(found: &Found) -> (Vec<u64>, usize) {
     let mut used: HashSet<u64> = found.regions.iter().map(|r| r.id).chain(found.deleted_ids.iter().copied()).collect();
     let mut next = used.iter().max().and_then(|m| m.checked_add(1));
     let mut probe: u64 = 0;
@@ -632,7 +632,7 @@ fn para<'a>(body: &'a Blocks, path: &[u32]) -> Option<&'a Paragraph> {
 }
 
 /// The paragraph at `path`, to change: only the blocks on the way to it are copied when shared.
-fn para_mut<'a>(body: &'a mut Blocks, path: &[u32]) -> Option<&'a mut Paragraph> {
+pub(crate) fn para_mut<'a>(body: &'a mut Blocks, path: &[u32]) -> Option<&'a mut Paragraph> {
     let (&first, mut rest) = path.split_first()?;
     let mut block: &mut Block = Arc::make_mut(body.get_mut(first as usize)?);
     loop {
