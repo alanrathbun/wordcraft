@@ -183,15 +183,12 @@ pub fn region_at<'a>(doc: &'a Document, at: &Pos) -> Option<&'a CalcRegion> {
     }
 }
 
-/// Where the body region `id` sits.
+/// Where the body region `id` sits (found the way the engine finds it, table cells at any depth).
 pub fn region_pos(doc: &Document, id: u64) -> Option<Pos> {
-    doc.para_paths(StoryRef::Body).into_iter().find_map(|path| {
-        let para = doc.para(StoryRef::Body, &path)?;
-        let off = para.objects_with_offsets().find_map(|(off, o)| match o {
-            InlineObject::Equation { calc: Some(c), .. } if c.id == id => Some(off),
-            _ => None,
-        })?;
-        Some(Pos { story: StoryRef::Body, path, off })
+    wordcraft_calc::body_regions(doc).into_iter().find(|(_, _, c)| c.id == id).map(|(path, off, _)| Pos {
+        story: StoryRef::Body,
+        path: wordcraft_doc::Path(path),
+        off,
     })
 }
 

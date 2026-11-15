@@ -897,3 +897,25 @@ fn a_temperature_difference_never_shows_on_an_offset_scale() {
         .collect();
     assert_eq!(quoted, ["?", "16.667 Δ°C", "21.111 °C"]);
 }
+
+#[test]
+fn body_regions_reach_every_depth_with_recalculation_ids() {
+    use wordcraft_calc::body_regions;
+    // A region 20 tables deep (deeper than ordinary paragraph walks go), and a copy of id 1.
+    let mut block = para_block(para(vec![calc_eq(1, "deep := 2 =")]));
+    for _ in 0..20 {
+        let cell = Cell { blocks: vec![block], ..Cell::empty() };
+        block = Arc::new(Block::Table(Table { rows: vec![Row { cells: vec![cell], ..Default::default() }], ..Default::default() }));
+    }
+    let mut d = doc_of(vec![para_block(para(vec![calc_eq(1, "top := deep + 1 =")])), block]);
+    let found = body_regions(&d);
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[1].0.len(), 1 + 3 * 20, "the path goes all the way down");
+    assert_eq!((found[0].2.id, found[1].2.id), (1, 2), "the copy gets the id recalculation gives it");
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).1, "top≔deep+1=3");
+    assert_eq!(region(&d, 2).1, "deep≔2=2");
+    // The offset is the region's object character.
+    let p = d.para(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path(found[1].0.clone())).unwrap();
+    assert!(matches!(p.object_at(found[1].1), Some(InlineObject::Equation { calc: Some(c), .. }) if c.id == 2));
+}

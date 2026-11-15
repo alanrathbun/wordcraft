@@ -261,53 +261,12 @@ fn region_pages(s: &mut Session) -> std::sync::Arc<HashMap<u64, u32>> {
 
 /// Every live calculation region in the body (table cells included, tracked deletions left out),
 /// in document order, with where its equation sits, and with the id recalculation gives it: the
-/// first region with an id keeps it, a later one with the same id (a pasted copy not yet
-/// recalculated, as in manual mode) gets the next id above every id in the body, deleted ones
-/// included — the same ids as `wordcraft_calc::defined_names` and `check_new_name` use.
+/// same traversal and ids as the recalculation pass itself (`wordcraft_calc::body_regions`).
 fn body_regions(doc: &Document) -> Vec<(Pos, CalcRegion)> {
-    let mut live = Vec::new();
-    let mut used: HashSet<u64> = HashSet::new();
-    for path in doc.para_paths(StoryRef::Body) {
-        let Some(para) = doc.para(StoryRef::Body, &path) else { continue };
-        if !para.objects.iter().any(|o| matches!(o, InlineObject::Equation { calc: Some(_), .. })) {
-            continue;
-        }
-        let deleted = para.deleted_ranges();
-        for (off, o) in para.objects_with_offsets() {
-            if let InlineObject::Equation { calc: Some(c), .. } = o {
-                used.insert(c.id);
-                if !deleted.iter().any(|r| r.contains(&off)) {
-                    live.push((Pos { story: StoryRef::Body, path: path.clone(), off }, (**c).clone()));
-                }
-            }
-        }
-    }
-    let mut next = used.iter().max().and_then(|m| m.checked_add(1));
-    let mut probe: u64 = 0;
-    let mut seen: HashSet<u64> = HashSet::new();
-    for (_, c) in &mut live {
-        if seen.insert(c.id) {
-            continue;
-        }
-        let id = match next {
-            Some(n) => {
-                next = n.checked_add(1);
-                n
-            }
-            // The top of the range is taken: the lowest free id (there are far fewer regions
-            // than ids, so one is found).
-            None => {
-                while used.contains(&probe) {
-                    probe = probe.saturating_add(1);
-                }
-                probe
-            }
-        };
-        used.insert(id);
-        seen.insert(id);
-        c.id = id;
-    }
-    live
+    wordcraft_calc::body_regions(doc)
+        .into_iter()
+        .map(|(path, off, c)| (Pos { story: StoryRef::Body, path: wordcraft_doc::Path(path), off }, c))
+        .collect()
 }
 
 /// Where the region `id` (as recalculation numbers it) sits.

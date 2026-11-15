@@ -108,6 +108,25 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
     RecalcReport { regions: regions.len(), errors, reassigned_ids, edited }
 }
 
+/// Every live calculation region of the body (table cells to any depth, tracked deletions left
+/// out) in document order: the path of its paragraph (block index, then row, cell and block index
+/// for each table level), the byte offset of its object character there, and the region with the
+/// id [`recalc`] gives it (a repeated id already replaced). The one traversal every caller uses,
+/// so ids found here are the ids recalculation uses.
+pub fn body_regions(doc: &Document) -> Vec<(Vec<u32>, usize, calc::CalcRegion)> {
+    let found = collect(&doc.body);
+    let (ids, _) = assign_ids(&found);
+    found
+        .regions
+        .into_iter()
+        .zip(ids)
+        .map(|(r, id)| {
+            let region = calc::CalcRegion { id, source: r.source, unit: r.unit, precision: r.precision, numbered: r.numbered, state: r.state };
+            (r.at.path, r.off, region)
+        })
+        .collect()
+}
+
 /// Every variable owned by a definition, with its region's id, sorted by name: what a quoted
 /// value can show. Owning means the first region in document order that defines the name, with
 /// a name that isn't a unit, function or constant. User functions are left out (they have no
@@ -215,6 +234,8 @@ pub(crate) struct At {
 
 pub(crate) struct FoundRegion {
     pub(crate) at: At,
+    /// Byte offset of its object character in the paragraph's text.
+    off: usize,
     pub(crate) id: u64,
     source: String,
     unit: Option<String>,
@@ -431,6 +452,7 @@ fn visit(path: &[u32], p: &Paragraph, found: &mut Found) {
                 } else {
                     found.regions.push(FoundRegion {
                         at: at(),
+                        off,
                         id: c.id,
                         source: c.source.clone(),
                         unit: c.unit.clone(),
