@@ -380,7 +380,7 @@ pub fn freeze_outside_body(doc: &mut Document) -> usize {
     let mut todo: Vec<(u32, Vec<u32>)> = Vec::new();
     for (&id, part) in &doc.parts {
         walk_paras(&part.blocks, &mut |path, p| {
-            if p.objects.iter().any(|o| needs_freezing(o)) {
+            if p.objects.iter().any(needs_freezing) {
                 todo.push((id, path.to_vec()));
             }
         });

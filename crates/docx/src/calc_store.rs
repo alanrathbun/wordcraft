@@ -75,7 +75,14 @@ mod tests {
     fn store() -> CalcStore {
         CalcStore {
             settings: Default::default(),
-            regions: vec![StoredRegion { id: 7, source: "σ := P/A_b = ? ksi <&>".into(), unit: None, precision: Some(2), fingerprint: u64::MAX }],
+            regions: vec![StoredRegion {
+                id: 7,
+                source: "σ := P/A_b = ? ksi <&>".into(),
+                unit: None,
+                precision: Some(2),
+                numbered: true,
+                fingerprint: u64::MAX,
+            }],
         }
     }
 
