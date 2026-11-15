@@ -186,7 +186,8 @@ const MAX_SCANNED_BYTES: usize = 32 * 1024 * 1024;
 fn take_calc_store(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<u8>>>) -> Option<wordcraft_doc::calc::CalcStore> {
     let is_ours = |k: &str| k.eq_ignore_ascii_case(crate::calc_store::PART);
     if let Some(key) = passthrough.keys().find(|k| is_ours(k)).cloned() {
-        let store = passthrough.remove(&key).and_then(|bytes| crate::calc_store::read_from_bytes(&bytes));
+        let store = passthrough.get(&key).and_then(|bytes| crate::calc_store::read_from_bytes(bytes));
+        forget_kept_part(passthrough, &key);
         if store.is_some() {
             return store;
         }
@@ -207,8 +208,54 @@ fn take_calc_store(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<
         })
         .find_map(|(k, bytes)| crate::calc_store::read_from_bytes(bytes).map(|store| (k.clone(), store)));
     let (key, store) = renamed?;
-    passthrough.remove(&key);
+    forget_kept_part(passthrough, &key);
     Some(store)
+}
+
+/// Drop a kept custom XML part that is read into the model (one of WordCraft's stores), with what
+/// came with it: its properties parts (`customXmlProps` relationships), their manifest lines and
+/// the relationship to it. A save then carries properties only for the stores it writes, never a
+/// stale one (or a second with the same data store id) beside them.
+fn forget_kept_part(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<u8>>>, part: &str) {
+    const CUSTOM_XML_ROOTS: &str = "wordcraft:customXml.roots";
+    const EMBEDDED_PARTS: &str = "wordcraft:embedded.parts";
+    passthrough.remove(part);
+    let manifest = passthrough.get(EMBEDDED_PARTS).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+    // `R\tpart\tid\ttype\ttarget\tI|E`: the part's internal properties parts.
+    let props: Vec<String> = manifest
+        .lines()
+        .filter_map(|l| match l.split('\t').collect::<Vec<_>>().as_slice() {
+            ["R", from, _, kind, target, "I"] if *from == part && kind.ends_with("/customXmlProps") => Some((*target).to_string()),
+            _ => None,
+        })
+        .collect();
+    for p in &props {
+        passthrough.remove(p);
+    }
+    let gone = |name: &str| name == part || props.iter().any(|p| p == name);
+    let kept: String = manifest
+        .lines()
+        .filter(|l| match l.split('\t').collect::<Vec<_>>().as_slice() {
+            ["P", name, _] => !gone(name),
+            ["R", from, ..] => !gone(from),
+            _ => true,
+        })
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    set_or_remove(passthrough, EMBEDDED_PARTS, kept);
+    if let Some(roots) = passthrough.get(CUSTOM_XML_ROOTS).map(|b| String::from_utf8_lossy(b).to_string()) {
+        let kept: String = roots.lines().filter(|l| l.rsplit('\t').next() != Some(part)).flat_map(|l| [l, "\n"]).collect();
+        set_or_remove(passthrough, CUSTOM_XML_ROOTS, kept);
+    }
+}
+
+/// Keep `text` under `key`, or nothing when it is empty.
+fn set_or_remove(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<u8>>>, key: &str, text: String) {
+    if text.is_empty() {
+        passthrough.remove(key);
+    } else {
+        passthrough.insert(key.into(), Arc::new(text.into_bytes()));
+    }
 }
 
 /// Converts the shared reader's model without copying the full document or its embedded media.
@@ -220,7 +267,7 @@ pub fn from_shared_model(mut source: craft_wordmodel::Document) -> Result<wordcr
         && let Some(state) = crate::fit::read_from_bytes(xml_bytes)
     {
         fit_state = Some(state);
-        source.passthrough.remove(&key);
+        forget_kept_part(&mut source.passthrough, &key);
     }
     let calc_store = take_calc_store(&mut source.passthrough);
 

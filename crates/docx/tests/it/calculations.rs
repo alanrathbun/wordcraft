@@ -462,3 +462,119 @@ fn stores_are_proper_custom_xml_data_stores() {
     let props = again.values().filter(|d| d.windows(13).any(|w| w == b"datastoreItem")).count();
     assert_eq!(props, 2, "{:?}", again.keys().collect::<Vec<_>>());
 }
+
+/// Every internal relationship target in the package that names no part: `(rels part, target)`.
+fn dangling(p: &BTreeMap<String, Vec<u8>>) -> Vec<(String, String)> {
+    let has = |name: &str| p.keys().any(|k| k.eq_ignore_ascii_case(name));
+    let mut out = Vec::new();
+    for (name, data) in p.iter().filter(|(k, _)| k.ends_with(".rels")) {
+        let base = name.split("_rels/").next().unwrap_or("");
+        for rel in String::from_utf8_lossy(data).split("<Relationship ").skip(1) {
+            if rel.contains("TargetMode=\"External\"") {
+                continue;
+            }
+            let target = rel.split("Target=\"").nth(1).and_then(|t| t.split('"').next()).unwrap_or("");
+            let mut path: Vec<&str> = if target.starts_with('/') { Vec::new() } else { base.split('/').filter(|s| !s.is_empty()).collect() };
+            for seg in target.split('/').filter(|s| !s.is_empty()) {
+                match seg {
+                    ".." => {
+                        path.pop();
+                    }
+                    "." => {}
+                    s => path.push(s),
+                }
+            }
+            if !has(&path.join("/")) {
+                out.push((name.clone(), target.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// The `ds:itemID`s of every properties part in the package, one entry per part.
+fn item_ids(p: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    p.values()
+        .filter_map(|d| {
+            let s = String::from_utf8_lossy(d);
+            s.contains("datastoreItem").then(|| s.split("itemID=\"").nth(1).and_then(|t| t.split('"').next()).unwrap_or("").to_string())
+        })
+        .collect()
+}
+
+fn with_fit(mut doc: Document) -> Document {
+    doc.fit_state = Some(wordcraft_doc::FitState { cum_delta: 1.0, ..Default::default() });
+    doc
+}
+
+#[test]
+fn dropping_the_stores_leaves_no_trace() {
+    let bytes = save(&with_fit(report()));
+    let mut back = open(&bytes);
+    assert!(back.fit_state.is_some() && !regions(&back).is_empty());
+    // Taken with everything that came with it: its properties part, manifest lines and relationship.
+    for (k, v) in &back.passthrough {
+        let k = k.to_ascii_lowercase();
+        assert!(!k.contains("wordcraftcalc") && !k.contains("wordcraftfit"), "{k}");
+        let text = String::from_utf8_lossy(v).to_ascii_lowercase();
+        assert!(!k.starts_with("wordcraft:") || !(text.contains("wordcraftcalc") || text.contains("wordcraftfit")), "{k}: {text}");
+    }
+    // Every calculation made plain, Fit One Page undone, default settings.
+    for b in back.body.iter_mut() {
+        if let Block::Para(p) = std::sync::Arc::make_mut(b) {
+            for o in &mut p.objects {
+                if let InlineObject::Equation { calc, .. } = o {
+                    *calc = None;
+                }
+            }
+        }
+    }
+    back.fit_state = None;
+    back.calc_settings = None;
+    let saved = save(&back);
+    let p = parts(&saved);
+    assert!(item_ids(&p).is_empty(), "{:?}", p.keys().collect::<Vec<_>>());
+    assert!(!p.keys().any(|k| k.to_ascii_lowercase().contains("wordcraft")), "{:?}", p.keys().collect::<Vec<_>>());
+    assert!(dangling(&p).is_empty(), "{:?}", dangling(&p));
+    let types = String::from_utf8(p["[Content_Types].xml"].clone()).unwrap();
+    assert!(!types.contains("wordcraft"), "{types}");
+    wordcraft_docx::read(&saved).unwrap();
+}
+
+#[test]
+fn stores_renamed_by_word_are_written_once() {
+    // Word saves the custom XML it keeps as `item1.xml` + `itemProps1.xml`, keeping their ids.
+    let mut p = parts(&save(&with_fit(report())));
+    let renames = [
+        ("wordcraftcalcProps.xml", "itemProps1.xml"),
+        ("wordcraftcalc.xml", "item1.xml"),
+        ("wordcraftfitProps.xml", "itemProps2.xml"),
+        ("wordcraftfit.xml", "item2.xml"),
+    ];
+    let rename = |s: &str| renames.iter().fold(s.to_string(), |s, (a, b)| s.replace(a, b));
+    p = p
+        .into_iter()
+        .map(|(k, v)| {
+            let v = if k.ends_with(".rels") || k == "[Content_Types].xml" { rename(&String::from_utf8(v).unwrap()).into_bytes() } else { v };
+            (rename(&k), v)
+        })
+        .collect();
+    assert!(
+        p.contains_key("customxml/itemProps1.xml") || p.keys().any(|k| k.eq_ignore_ascii_case("customxml/itemProps1.xml")),
+        "{:?}",
+        p.keys().collect::<Vec<_>>()
+    );
+    let renamed = zip(&p);
+    let back = open(&renamed);
+    assert_eq!(regions(&back).len(), SOURCES.len());
+    assert!(!back.passthrough.keys().any(|k| k.eq_ignore_ascii_case("customxml/itemProps1.xml")), "the renamed store's properties go with it");
+    let saved = parts(&save(&back));
+    let mut ids = item_ids(&saved);
+    ids.sort();
+    let mut unique = ids.clone();
+    unique.dedup();
+    assert_eq!(ids, unique, "no itemID twice: {:?}", saved.keys().collect::<Vec<_>>());
+    assert_eq!(ids.len(), 2, "one properties part per store: {:?}", saved.keys().collect::<Vec<_>>());
+    assert!(dangling(&saved).is_empty(), "{:?}", dangling(&saved));
+    assert_eq!(regions(&open(&zip(&saved))).len(), SOURCES.len());
+}
