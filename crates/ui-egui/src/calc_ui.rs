@@ -200,6 +200,13 @@ fn calc_at_caret(app: &WordApp) -> Option<(Pos, CalcRegion)> {
     std::iter::once(focus.clone()).chain(before).find_map(|at| region_at(&app.session.doc, &at).map(|c| (at.clone(), c.clone())))
 }
 
+/// Whether the selection is exactly one calculation (its object character, either way round).
+pub fn selected_calc(app: &WordApp) -> bool {
+    let sel = &app.session.sel;
+    let (a, b) = if sel.anchor.off <= sel.focus.off { (&sel.anchor, &sel.focus) } else { (&sel.focus, &sel.anchor) };
+    a.story == b.story && a.path == b.path && b.off == a.off + OBJ_LEN && region_at(&app.session.doc, a).is_some()
+}
+
 // ---------------------------------------------------------------------------------------------
 // The source box
 

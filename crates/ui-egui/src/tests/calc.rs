@@ -430,3 +430,47 @@ fn calc_go_to_existing_finds_a_definition_in_a_table() {
     assert_eq!(h.state().session.sel.focus, owner, "the caret is at the owning region");
     assert_eq!(sources(h.state()), ["P := 1500 lbf"]);
 }
+
+/// Keyboard routes to the source box: Mod+Alt+= opens a new one, F2 the calculation at the caret,
+/// and Enter a selected calculation; Enter beside one still starts a new paragraph.
+#[test]
+fn calc_keyboard_opens_the_source_box() {
+    let mut a = app();
+    a.run("insert.calculation", json!({"source": "P := 1500 lbf", "display": false})).unwrap();
+    let mut h = ready(a);
+    h.state_mut().canvas.want_focus = true;
+    h.run_steps(3);
+    assert!(h.state().canvas.focused, "the page has the keyboard");
+    let id = regions(h.state())[0].1.id;
+    // F2 with the caret just after the calculation.
+    h.key_press(egui::Key::F2);
+    h.run_steps(3);
+    assert_eq!(calc_box(h.state()).and_then(|b| b.editing), Some(id), "F2 opens the box on the calculation");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none());
+    // Enter with the calculation selected.
+    let (at, _) = regions(h.state()).remove(0);
+    let end = Pos { off: at.off + '\u{FFFC}'.len_utf8(), ..at.clone() };
+    h.state_mut().run("select.range", json!({"anchor": at, "focus": end})).unwrap();
+    h.state_mut().canvas.want_focus = true;
+    h.run_steps(3);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_eq!(calc_box(h.state()).and_then(|b| b.editing), Some(id), "Enter opens the box on a selected calculation");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    // Enter with the caret beside it: a new paragraph, no box.
+    h.state_mut().run("caret.set", json!({"pos": end})).unwrap();
+    h.state_mut().canvas.want_focus = true;
+    h.run_steps(3);
+    let paragraphs = h.state().session.doc.paragraph_count();
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none());
+    assert_eq!(h.state().session.doc.paragraph_count(), paragraphs + 1);
+    // Mod+Alt+= opens a new calculation.
+    h.key_press_modifiers(egui::Modifiers { command: true, ctrl: !cfg!(target_os = "macos"), alt: true, ..Default::default() }, egui::Key::Equals);
+    h.run_steps(3);
+    assert_eq!(h.state().dialog.as_ref().map(dialogs::Dialog::name), Some("calculation"));
+}

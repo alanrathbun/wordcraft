@@ -1036,6 +1036,7 @@ fn input_dialog_insert(id: &str, params: &Value) -> Option<&'static str> {
         "insert.crossReference" if !has_value(params, "target") => Some("crossReference"),
         "insert.calculation" if !has_value(params, "source") => Some("calculation"),
         "insert.calcValue" if !has_value(params, "name") => Some("calcValue"),
+        "calc.edit" => Some("editCalculation"),
         _ => None,
     }
 }

@@ -958,3 +958,20 @@ fn duplicate_pages_are_looked_up_only_in_print_layout_and_once_per_revision() {
     let after = super::region_pages(&mut s);
     assert!(!std::sync::Arc::ptr_eq(&first, &after));
 }
+
+#[test]
+fn calculation_commands_have_keys() {
+    let reg = crate::cmd::registry();
+    assert_eq!(reg.by_shortcut("Mod+Alt+=").map(|c| c.id), Some("insert.calculation"));
+    assert_eq!(reg.by_shortcut("F2").map(|c| c.id), Some("calc.edit"));
+    // calc.edit names the calculation at the caret (on it, just after it, or selected) and is
+    // greyed out anywhere else.
+    let mut s = session();
+    let (p, _, _) = sample(&mut s);
+    run(&mut s, "caret.docEnd", json!({}));
+    assert!(s.why_disabled("calc.edit").is_some());
+    caret_after(&mut s, p);
+    assert_eq!(run(&mut s, "calc.edit", json!({})), json!({"id": p, "source": "P := 1500 lbf"}));
+    copy_object(&mut s, 0);
+    assert_eq!(run(&mut s, "calc.edit", json!({}))["id"], json!(p));
+}

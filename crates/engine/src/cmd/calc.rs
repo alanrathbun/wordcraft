@@ -36,8 +36,13 @@ const NO_AUTO_PASS: [&str; 5] = ["edit.undo", "edit.redo", "edit.undoTo", "calc.
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("insert.calculation", "Calculation", "Insert › Symbols", insert_calculation)
+            .key("Mod+Alt+=")
             .params(r#"{"source": string (e.g. "P := 1500 lbf", "σ := P/A_b = ? ksi"), "display"?: bool}"#),
-        CommandSpec::new("calc.setSource", "Edit Calculation", "Calculation", set_source).params(r#"{"id": n, "source": string}"#),
+        CommandSpec::new("calc.setSource", "Set Calculation Source", "Calculation", set_source).params(r#"{"id": n, "source": string}"#),
+        CommandSpec::new("calc.edit", "Edit Calculation", "Calculation", edit)
+            .key("F2")
+            .pure()
+            .when(|s| calc_at_caret(s).is_none().then_some("no calculation at the caret")),
         CommandSpec::new("insert.calcValue", "Calculated Value", "Insert › Symbols", insert_value)
             .params(r#"{"name": string (a variable, see calc.names), "unit"?: string, "precision"?: n (0–15)}"#),
         CommandSpec::new("calc.names", "Calculation Names", "Calculation", names).pure(),
@@ -405,6 +410,28 @@ fn insert_calculation(s: &mut Session, v: &Value) -> CmdResult {
     s.sel = Selection::caret(end);
     s.set_ime_edit_outcome(ImeEditOutcome { classified: true, content_changed: true, state_changed: true, ..ImeEditOutcome::default() });
     Ok(json!({"id": id}))
+}
+
+/// The calculation the caret is on or just after (a selection of exactly one calculation ends
+/// just after it), with its id.
+fn calc_at_caret(s: &Session) -> Option<(u64, String)> {
+    let f = &s.sel.focus;
+    if f.story != StoryRef::Body {
+        return None;
+    }
+    let para = s.doc.para_at(f)?;
+    let at = |off: usize| match para.object_at(off) {
+        Some(InlineObject::Equation { calc: Some(c), .. }) => Some((c.id, c.source.clone())),
+        _ => None,
+    };
+    at(f.off).or_else(|| f.off.checked_sub(wordcraft_doc::para::OBJ.len_utf8()).and_then(at))
+}
+
+/// The calculation at the caret, for its source box (the interface opens the box on this
+/// command: F2, or Enter on a selected calculation).
+fn edit(s: &mut Session, _: &Value) -> CmdResult {
+    let (id, source) = calc_at_caret(s).ok_or_else(|| CmdError::Disabled("no calculation at the caret".into()))?;
+    Ok(json!({"id": id, "source": source}))
 }
 
 /// Replaces a region's source. The region is current again (an error or an edit outside the

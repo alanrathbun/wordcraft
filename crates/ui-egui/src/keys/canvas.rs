@@ -431,6 +431,14 @@ fn key_press(app: &mut WordApp, ctx: &egui::Context, key: Key, modifiers: Modifi
         }
         return;
     }
+    // Enter on a selected calculation opens its source box, as a double-click does; with the
+    // caret beside it, Enter starts a new paragraph as usual (F2 opens the box there).
+    if key == Key::Enter && modifiers.is_none() && crate::calc_ui::selected_calc(app) {
+        // The box opening this frame must not take the same Enter as its own (and commit).
+        ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+        let _ = app.run("calc.edit", json!({}));
+        return;
+    }
     if crate::objects::key(app, key, modifiers) {
         return;
     }
