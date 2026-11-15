@@ -667,10 +667,27 @@ fn names_with_several_or_empty_subscripts() {
     // Empty parts show as nothing, never a dangling `_`.
     assert_eq!(text_of(&tree("a__b + 1")), "{a}_{b}^{}+1");
     assert_eq!(render::display("x_ := 3", None, &CalcState::Fresh), "x≔3");
+    // Such a name is refused (`check_name`), but its display stays safe: nothing is lowered.
     let mut d = doc_with(&["x_ := 3 ="]);
     recalc(&mut d, &no_page);
     let (_, _, math) = region(&d, 1);
-    assert_eq!(text_of(&math.nodes), "x≔3=3");
+    assert_eq!(text_of(&math.nodes), "x≔3⚠");
+}
+
+#[test]
+fn names_with_an_empty_subscript_are_refused() {
+    let message = |n: &str| CalcState::Error(format!("{n} has an empty subscript — write a name like a_b"));
+    let mut d = doc_with(&["a__b := 1", "x_ := 3", "f(t_) := t_", "a_b := 2 ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, message("a__b"));
+    assert_eq!(region(&d, 2).0.state, message("x_"));
+    assert_eq!(region(&d, 3).0.state, message("t_"));
+    assert_eq!(region(&d, 4).0.state, CalcState::Fresh);
+    let syntax = |n: &str| Err(CalcError::Syntax(format!("{n} has an empty subscript — write a name like a_b")));
+    assert_eq!(check_new_name(&d, "a__b", None), syntax("a__b"));
+    assert_eq!(check_new_name(&d, "x_", None), syntax("x_"));
+    assert_eq!(check_new_name(&d, "_x", None), syntax("_x"));
+    assert_eq!(check_new_name(&d, "a_c", None), Ok(()));
 }
 
 #[test]

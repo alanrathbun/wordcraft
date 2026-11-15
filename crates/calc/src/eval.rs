@@ -69,8 +69,12 @@ impl Env {
 }
 
 /// Refuse a name that is a unit (with or without an SI prefix), a built-in function, or one of
-/// the constants `π`, `pi` and `e`.
+/// the constants `π`, `pi` and `e`; and a name with an empty subscript part (`a__b`, `x_`),
+/// which would display like a different name (`a_b`, `x`).
 pub fn check_name(name: &str) -> Result<(), CalcError> {
+    if name.contains('_') && name.split('_').any(str::is_empty) {
+        return Err(CalcError::Syntax(format!("{name} has an empty subscript — write a name like a_b")));
+    }
     if lookup(name).is_some() || funcs::is_builtin(name) || is_constant(name) {
         return Err(CalcError::ReservedName(name.to_string()));
     }
