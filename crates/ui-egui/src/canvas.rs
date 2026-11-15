@@ -1381,6 +1381,13 @@ fn handle_secondary_selection(app: &mut WordApp, resp: &egui::Response, rects: &
         && let Some((page, x, y)) = page_at(rects, layout, geo.scale, p)
     {
         match layout.equation_hit(page, x, y, app.session.sel.focus.story) {
+            // A calculation isn't edited as an equation: the caret goes before it.
+            Some((at, _)) if crate::calc_ui::region_at(&app.session.doc, &at).is_some() => {
+                if app.session.math.is_some() {
+                    let _ = app.run("equation.exit", json!({}));
+                }
+                app.session.sel = wordcraft_engine::Selection::caret(at);
+            }
             Some((at, inner)) => {
                 app.session.sel = wordcraft_engine::Selection::caret(at);
                 let _ = app.run("equation.edit", json!({"pos": serde_json::to_value(&inner).unwrap_or_default()}));
@@ -1544,6 +1551,9 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
     app.canvas.auto_scroll.paint(ui, area);
     if let (Some(h), Some(v)) = (hruler, vruler) {
         rulers(app, ui, h, v, &rects, layout, geo.scale);
+    }
+    if !app.session.view.read_mode {
+        crate::calc_ui::bar(app, ui.ctx());
     }
     crate::mini_toolbar::track_dismissal(app, ui.ctx(), area);
     if let Some(sel) = app.canvas.mini_anchor

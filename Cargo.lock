@@ -7274,6 +7274,7 @@ dependencies = [
  "sys-locale",
  "toml",
  "web-time",
+ "wordcraft-calc",
  "wordcraft-doc",
  "wordcraft-engine",
  "wordcraft-fonts",

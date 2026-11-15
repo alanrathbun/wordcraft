@@ -284,6 +284,16 @@ fn handle_primary_press(
     if !mods.shift
         && let Some((at, inner)) = layout.equation_hit(page, x, y, story)
     {
+        // A calculation isn't edited as an equation (a double-click opens its source): the
+        // click puts the caret before it.
+        if crate::calc_ui::region_at(&app.session.doc, &at).is_some() {
+            if app.session.math.is_some() {
+                let _ = app.run("equation.exit", json!({}));
+            }
+            app.session.sel = wordcraft_engine::Selection::caret(at);
+            app.session.page_hint = page;
+            return true;
+        }
         app.session.sel = wordcraft_engine::Selection::caret(at);
         let _ = app.run("equation.edit", json!({"pos": serde_json::to_value(&inner).unwrap_or_default()}));
         app.session.page_hint = page;
@@ -456,6 +466,15 @@ fn skip_equation_or_outline(app: &mut WordApp, pointer: &PagePointer<'_>) -> boo
     // Inside an equation, clicks place the caret in it (and double-clicks don't select words);
     // so do clicks on the grip and options strip of its frame.
     let on_frame = app.canvas.eq_options.is_some_and(|f| f.strip.contains(*p) || f.grip.contains(*p));
+    // A double-click on a calculation opens its source box.
+    if resp.double_clicked()
+        && let Some((at, _)) = layout.equation_hit(*page, *x, *y, *story)
+        && crate::calc_ui::region_at(&app.session.doc, &at).is_some()
+    {
+        app.session.sel = wordcraft_engine::Selection::caret(at);
+        app.dialog = crate::dialogs::Dialog::open("editCalculation", app);
+        return true;
+    }
     if (resp.double_clicked() || resp.triple_clicked()) && (on_frame || layout.equation_hit(*page, *x, *y, *story).is_some()) {
         return true;
     }
@@ -494,5 +513,8 @@ fn show_hover_link(app: &WordApp, pointer: &PagePointer<'_>) {
         egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::unique("link_tip"), egui::PopupAnchor::Pointer).show(|ui| {
             ui.label(tip);
         });
+    } else if resp.hovered() && !app.canvas.dragging && !app.canvas.context_menu_open && !ui.input(|i| i.pointer.any_down()) {
+        // A calculation: its error, that it is out of date, or the edited-outside bar.
+        crate::calc_ui::hover(app, ui, layout, *page, *x, *y, *story);
     }
 }
