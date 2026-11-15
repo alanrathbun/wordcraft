@@ -617,6 +617,7 @@ fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<b
     }
     let mut env = Env::new();
     env.set_g_is_gravity(settings.g == wordcraft_doc::calc::GMeans::Gravity);
+    env.set_origin(settings.origin);
     // One budget for the whole pass: a hostile document errors instead of taking seconds.
     let pass = Pass::new(MAX_PASS_STEPS);
     // Record that region `i` failed: using its name is then an upstream error.

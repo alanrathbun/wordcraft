@@ -86,11 +86,20 @@ pub struct CalcSettings {
     pub manual: bool,
     /// What `g` stands for (see [`GMeans`]).
     pub g: GMeans,
+    /// What an array's first element is numbered: 0 (Mathcad's convention) or 1. The evaluator
+    /// reads any other value as 0. Not written when 0, so a document without arrays saves as it
+    /// did before the setting existed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub origin: u8,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Default for CalcSettings {
     fn default() -> Self {
-        CalcSettings { system: UnitSystem::UsCustomary, precision: 3, manual: false, g: GMeans::Gravity }
+        CalcSettings { system: UnitSystem::UsCustomary, precision: 3, manual: false, g: GMeans::Gravity, origin: 0 }
     }
 }
 

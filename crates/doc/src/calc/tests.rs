@@ -124,7 +124,7 @@ fn calc_equation_serde_round_trip() {
 
 #[test]
 fn settings_serde_round_trip_and_partial_load() {
-    let s = CalcSettings { system: UnitSystem::Si, precision: 6, manual: true, g: GMeans::Gram };
+    let s = CalcSettings { system: UnitSystem::Si, precision: 6, manual: true, g: GMeans::Gram, origin: 1 };
     assert_eq!(serde_json::from_str::<CalcSettings>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
     assert_eq!(serde_json::from_str::<CalcSettings>("{}").unwrap(), CalcSettings::default());
 }
@@ -134,8 +134,23 @@ fn document_calc_settings_serde() {
     let mut doc = crate::Document::new();
     let plain = serde_json::to_string(&doc).unwrap();
     assert!(!plain.contains("calc_settings"), "an untouched document stays as it was");
-    doc.calc_settings = Some(CalcSettings { system: UnitSystem::Si, precision: 5, manual: true, g: GMeans::Gram });
+    doc.calc_settings = Some(CalcSettings { system: UnitSystem::Si, precision: 5, manual: true, g: GMeans::Gram, origin: 0 });
     let back: crate::Document = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
     assert_eq!(back.calc_settings, doc.calc_settings);
     assert!(!back.same_content(&crate::Document::new()), "calc settings are part of the document's content");
+}
+
+#[test]
+fn origin_round_trips_and_defaults() {
+    assert_eq!(CalcSettings::default().origin, 0);
+    // A Stage 1 settings object has no origin: it numbers from 0.
+    let stage1: CalcSettings = serde_json::from_str(r#"{"system":"Si","precision":5,"manual":true,"g":"gram"}"#).unwrap();
+    assert_eq!(stage1.origin, 0);
+    assert_eq!((stage1.system, stage1.precision, stage1.manual, stage1.g), (UnitSystem::Si, 5, true, GMeans::Gram));
+    // The default isn't written, so a Stage 1 document saves as it did.
+    assert!(!serde_json::to_string(&CalcSettings::default()).unwrap().contains("origin"));
+    let one = CalcSettings { origin: 1, ..CalcSettings::default() };
+    let json = serde_json::to_string(&one).unwrap();
+    assert!(json.contains("\"origin\":1"), "{json}");
+    assert_eq!(serde_json::from_str::<CalcSettings>(&json).unwrap(), one);
 }

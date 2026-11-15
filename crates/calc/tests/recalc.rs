@@ -1027,3 +1027,13 @@ fn g_follows_the_document_setting() {
     assert!(matches!(region(&d, 1).0.state, CalcState::Error(_)), "kg·g is kg² as grams: no longer a force");
     assert!(region(&d, 2).1.ends_with("=0.25 \"kg\""), "gm is a gram either way");
 }
+
+#[test]
+fn indexes_follow_the_document_origin() {
+    let mut d = doc_with(&["D := [0.840, 1.050] in", "x := D[1] = ? in"]);
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 2).1.ends_with("=1.05 \"in\""), "Mathcad counts from 0 by default: {}", region(&d, 2).1);
+    d.calc_settings = Some(CalcSettings { origin: 1, ..CalcSettings::default() });
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 2).1.ends_with("=0.84 \"in\""), "{}", region(&d, 2).1);
+}

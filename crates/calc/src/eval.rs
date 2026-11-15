@@ -7,9 +7,12 @@
 //!
 //! A value is one quantity or a grid of them (a vector or matrix, see [`crate::array`]). Operators
 //! and built-in functions work on grids element by element, and every element counts as a step of
-//! the recalculation's work.
+//! the recalculation's work. A grid is written as a literal (`[1, 2; 3, 4]`), as a range
+//! (`i := 0..5`, which may only define a variable), or element by element in an indexed definition
+//! (`t[i] := 2·D[i]`); an element is read by index (`D[2]`, `M[1, 0]`), counted from the
+//! document's origin.
 
-use crate::array::{self, Data, Grid};
+use crate::array::{self, Data, Grid, MAX_ELEMENTS};
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, Op, Show, Stmt, Value};
 use craft_units::{Dim, Quantity, Scale, UnitError, lookup, parse_unit};
@@ -247,19 +250,33 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
             check_show(env, show, &v)?;
             Ok(Some(v))
         }
-        // Indexed definitions are evaluated from Task 3 of the vectors work.
-        Stmt::Define { index: Some(_), .. } => Err(CalcError::Syntax("not supported yet".to_string())),
-        Stmt::Define { name, params, body, show, index: None } => {
+        Stmt::Define { name, params, body, show, index } => {
             check_name(name)?;
             params.iter().try_for_each(|p| check_name(p))?;
-            if !params.is_empty() {
+            let is_range = matches!(body, Expr::Range { .. });
+            if is_range && (index.is_some() || !params.is_empty()) {
+                return Err(range_only_defines_a_variable());
+            }
+            if index.is_some() {
+                // The parser never gives an indexed definition parameters.
+                if !params.is_empty() {
+                    return Err(CalcError::Syntax("an indexed definition takes one range variable, like t[i] := 2·D[i]".to_string()));
+                }
+            } else if !params.is_empty() {
                 if show.is_some() {
                     return Err(CalcError::Syntax("a function has no single value to show — call it, like f(2) =".to_string()));
                 }
                 env.define_fn(name, params.clone(), body.clone());
                 return Ok(None);
             }
-            let v = eval_data(env, body, pass)?;
+            let v = match (index, body) {
+                (Some(i), _) => indexed(env, name, i, body, pass)?,
+                (None, Expr::Range { first, second, last }) => {
+                    let cx = Cx { env, steps: Cell::new(0), pass };
+                    range(&cx, first, second.as_deref(), last)?
+                }
+                (None, _) => eval_data(env, body, pass)?,
+            };
             if let Some(show) = show {
                 check_show(env, show, &v)?;
             }
@@ -330,16 +347,21 @@ impl Frame<'_> {
     }
 }
 
-fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, CalcError> {
-    if depth > MAX_EVAL_DEPTH {
-        return Err(CalcError::TooComplex);
-    }
+/// Count one expression node against the statement's and the pass's limits.
+fn tick(cx: &Cx<'_>) -> Result<(), CalcError> {
     let steps = cx.steps.get() + 1;
     if steps > MAX_STEPS {
         return Err(CalcError::TooComplex);
     }
     cx.steps.set(steps);
-    cx.pass.charge(1)?;
+    cx.pass.charge(1)
+}
+
+fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, CalcError> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(CalcError::TooComplex);
+    }
+    tick(cx)?;
     match e {
         Expr::Num(v) => finite(*v).map(|q| Data::One(Val::plain(q))),
         Expr::Name(n) => resolve(cx, fr, n),
@@ -397,9 +419,257 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
             })
         }
         Expr::Call(name, args) => call(cx, fr, name, args, depth),
-        // Literals, indexes and ranges are evaluated from Task 3 of the vectors work.
-        Expr::Matrix { .. } | Expr::Index(..) | Expr::Range { .. } => Err(CalcError::Syntax("not supported yet".to_string())),
+        Expr::Matrix { rows, cols, items } => matrix(cx, fr, *rows, *cols, items, depth),
+        Expr::Index(name, at) => index(cx, fr, name, at, depth),
+        // A range is evaluated only as the whole right side of a variable's definition.
+        Expr::Range { .. } => Err(range_only_defines_a_variable()),
     }
+}
+
+fn range_only_defines_a_variable() -> CalcError {
+    CalcError::Syntax("a range defines a variable, like i := 0..5".to_string())
+}
+
+/// How far a number may be from a whole number and still count as it (an index, a range's
+/// element count).
+const WHOLE: f64 = 1e-9;
+
+/// A literal `[…]` of `rows` × `cols` items, row by row. Each item is one value.
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn matrix(cx: &Cx<'_>, fr: &Frame<'_>, rows: usize, cols: usize, items: &[Expr], depth: usize) -> Result<Data, CalcError> {
+    array::check_size(rows, cols, items.len())?;
+    let values = items
+        .iter()
+        .map(|e| match eval(cx, fr, e, depth + 1)? {
+            Data::One(v) => Ok(v),
+            Data::Grid(_) => Err(CalcError::Syntax("a matrix element can't be a vector".to_string())),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Grid::new(rows, cols, values).map(Data::Grid)
+}
+
+/// The element `name[at]`: one index into a vector, or a row and a column. Only the element is
+/// copied, so reading one costs one step however large the grid. The name and shape are checked
+/// before the indexes are evaluated.
+// Not inlined, and the lookup and messages kept in helpers that aren't, so the recursive frames
+// (`eval` → `index` → `index_value` → `eval`) stay small: their depth is bounded by `MAX_EVAL_DEPTH`.
+#[inline(never)]
+fn index(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, at: &[Expr], depth: usize) -> Result<Data, CalcError> {
+    let g = indexed_grid(cx, fr, name, at.len())?;
+    let mut idx = [0.0; 2];
+    for (slot, e) in idx.iter_mut().zip(at) {
+        *slot = index_value(cx, fr, e, depth)?;
+    }
+    element(g, name, cx.env.origin, idx.get(..at.len()).unwrap_or_default())
+}
+
+/// The grid `name` holds, when it can be read with `count` indexes.
+#[inline(never)]
+fn indexed_grid<'a>(cx: &'a Cx<'_>, fr: &'a Frame<'_>, name: &str, count: usize) -> Result<&'a Grid, CalcError> {
+    let target = match fr.param(name) {
+        Some(d) => d,
+        None => match cx.env.entries.get(name) {
+            Some(Entry::Var(d)) => d,
+            Some(Entry::Failed) => return Err(CalcError::Upstream),
+            Some(Entry::Func { .. }) => return Err(not_a_value(name)),
+            None => {
+                // A constant or unit is a single value; anything else is undefined.
+                resolve(cx, fr, name)?;
+                return Err(not_a_vector(name));
+            }
+        },
+    };
+    let Data::Grid(g) = target else {
+        return Err(not_a_vector(name));
+    };
+    match count {
+        1 if g.rows == 1 || g.cols == 1 => Ok(g),
+        1 => Err(CalcError::IndexRange(format!("{name} is a matrix — give a row and a column, like {name}[1, 0]"))),
+        2 => Ok(g),
+        _ => Err(CalcError::Syntax("an index is one number, or a row and a column, like D[2] or M[1, 0]".to_string())),
+    }
+}
+
+/// The element of `g` (named `name`) at the whole-number indexes `at`, counted from `origin`: one
+/// index into a vector, or a row and a column.
+#[inline(never)]
+fn element(g: &Grid, name: &str, origin: u8, at: &[f64]) -> Result<Data, CalcError> {
+    let o = origin;
+    let last = |n: usize| n.saturating_sub(1).saturating_add(usize::from(o));
+    let k = match *at {
+        [i] => slot(i, o, g.items.len())
+            .ok_or_else(|| CalcError::IndexRange(format!("index {} is outside {name} ({o} to {})", index_text(i), last(g.items.len()))))?,
+        [r, c] => match (slot(r, o, g.rows), slot(c, o, g.cols)) {
+            (Some(r), Some(c)) => r.saturating_mul(g.cols).saturating_add(c),
+            _ => {
+                return Err(CalcError::IndexRange(format!(
+                    "index [{}, {}] is outside {name} (rows {o} to {}, columns {o} to {})",
+                    index_text(r),
+                    index_text(c),
+                    last(g.rows),
+                    last(g.cols)
+                )));
+            }
+        },
+        _ => return Err(CalcError::Syntax("an index is one number, or a row and a column, like D[2] or M[1, 0]".to_string())),
+    };
+    g.items.get(k).map(|v| Data::One(*v)).ok_or_else(|| CalcError::IndexRange(format!("{name} has no element {k}")))
+}
+
+fn not_a_vector(name: &str) -> CalcError {
+    CalcError::IndexRange(format!("{name} isn't a vector"))
+}
+
+/// An index: a plain number within [`WHOLE`] of a whole number, which it is rounded to.
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn index_value(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<f64, CalcError> {
+    match eval(cx, fr, e, depth + 1)? {
+        Data::One(v) if v.q.dim == Dim::ONE => whole(v.q.value),
+        _ => None,
+    }
+    .ok_or_else(not_whole)
+}
+
+#[cold]
+fn not_whole() -> CalcError {
+    CalcError::Syntax("an index is a whole number, like D[2]".to_string())
+}
+
+/// `v` rounded to the whole number it is within [`WHOLE`] of.
+fn whole(v: f64) -> Option<f64> {
+    let r = v.round();
+    (v.is_finite() && (v - r).abs() <= WHOLE).then_some(r)
+}
+
+/// Where the whole number `i`, counted from `origin`, falls among `len` places; `None` outside.
+fn slot(i: f64, origin: u8, len: usize) -> Option<usize> {
+    let k = i - f64::from(origin);
+    // `len` is at most `MAX_ELEMENTS`, so the comparison is exact and the cast can't truncate.
+    (k >= 0.0 && k < len as f64).then_some(k as usize)
+}
+
+/// A whole number as the author would write it: `3`, `-1`, and `1e300` for one too large to spell.
+fn index_text(i: f64) -> String {
+    if i.abs() < 1e15 { format!("{}", i as i64) } else { format!("{i:e}") }
+}
+
+/// The range `first..last` or `first, second..last`, both ends included: a column of the values
+/// from `first` stepping by `second − first` (by 1 towards `last` when there is no second value)
+/// for as long as they don't pass `last`.
+fn range(cx: &Cx<'_>, first: &Expr, second: Option<&Expr>, last: &Expr) -> Result<Data, CalcError> {
+    tick(cx)?;
+    let end = |e: &Expr| match eval(cx, &Frame::GLOBAL, e, 1)? {
+        Data::One(v) => Ok(v),
+        Data::Grid(_) => Err(CalcError::Syntax("a range's values are single values, like 0..5".to_string())),
+    };
+    let a = end(first)?;
+    let b = second.map(end).transpose()?;
+    let z = end(last)?;
+    let span = z.q.sub(a.q).map_err(unit)?;
+    let step = match b {
+        Some(b) => b.q.sub(a.q).map_err(unit)?,
+        None if a.q.dim == Dim::ONE && z.q.dim == Dim::ONE => Quantity::dimensionless(if span.value < 0.0 { -1.0 } else { 1.0 }),
+        // Counting by 1 in SI units (1 m from 0 in) would be a wrong number that looks right.
+        None => return Err(CalcError::Syntax("a range with units needs a step, like 0 in, 0.5 in..2 in".to_string())),
+    };
+    if step.value == 0.0 {
+        return Err(CalcError::Syntax("a range's step is zero — its second value must differ from the first, like 1, 1.5..3".to_string()));
+    }
+    let ratio = span.value / step.value;
+    if ratio.is_nan() {
+        return Err(CalcError::NonFinite);
+    }
+    if ratio + WHOLE < 0.0 {
+        return Err(CalcError::Syntax("a range's step goes away from its last value — like 1, 1.5..3 or 3, 2.5..1".to_string()));
+    }
+    // An infinite or huge count is too large; the cast below is then of a number at most 10,000.
+    let count = (ratio + WHOLE).floor() + 1.0;
+    if !count.is_finite() || count > MAX_ELEMENTS as f64 {
+        return Err(CalcError::TooLarge);
+    }
+    let n = count as usize;
+    charge_elements(cx, n)?;
+    let t = between(a.t, z.t);
+    let values =
+        (0..n).map(|k| a.q.add(Quantity::new(k as f64 * step.value, step.dim)).map(|q| Val { q, t }).map_err(unit)).collect::<Result<Vec<_>, _>>()?;
+    Grid::new(n, 1, values).map(Data::Grid)
+}
+
+/// What values between two temperatures stand for: absolute when either end is, a bare `K`
+/// temperature when both ends are, and plain otherwise.
+fn between(a: Temp, b: Temp) -> Temp {
+    match (a, b) {
+        (Temp::Plain, _) | (_, Temp::Plain) => Temp::Plain,
+        (Temp::Absolute, _) | (_, Temp::Absolute) => Temp::Absolute,
+        _ => Temp::Either,
+    }
+}
+
+/// The indexed definition `name[i] := body`: `body` evaluated once for each element of the range
+/// variable `i`, with `i` bound to that element, setting element `i` of `name`. Every element from
+/// the origin up to the largest index must be set; a body that is a vector, or an `i` that isn't
+/// a vector of whole numbers, is an error.
+fn indexed(env: &Env, name: &str, i: &str, body: &Expr, pass: &Pass) -> Result<Data, CalcError> {
+    let range = match env.entries.get(i) {
+        Some(Entry::Var(d)) => d,
+        Some(Entry::Failed) => return Err(CalcError::Upstream),
+        Some(Entry::Func { .. }) => return Err(not_a_value(i)),
+        None => return Err(CalcError::Undefined(i.to_string())),
+    };
+    let not_a_range = || CalcError::Syntax(format!("{i} must be a range of whole numbers, like {i} := 0..5"));
+    let g = match range {
+        Data::Grid(g) if g.rows == 1 || g.cols == 1 => g,
+        _ => return Err(not_a_range()),
+    };
+    let o = env.origin;
+    // Where each element of `i` puts its value, checked before anything is built.
+    let mut places = Vec::with_capacity(g.items.len());
+    let mut size = 0.0_f64;
+    for v in &g.items {
+        let w = (v.q.dim == Dim::ONE).then(|| whole(v.q.value)).flatten().ok_or_else(not_a_range)?;
+        let k = w - f64::from(o);
+        if k < 0.0 {
+            return Err(CalcError::IndexRange(format!("index {} is outside {name} — its elements start at {o}", index_text(w))));
+        }
+        size = size.max(k + 1.0);
+        places.push(k);
+    }
+    if size > MAX_ELEMENTS as f64 {
+        return Err(CalcError::TooLarge);
+    }
+    // At most `MAX_ELEMENTS`, so the casts are exact.
+    let size = size as usize;
+    let cx = Cx { env, steps: Cell::new(0), pass };
+    charge_elements(&cx, size)?;
+    let places: Vec<usize> = places.into_iter().map(|k| k as usize).collect();
+    let mut set = vec![false; size];
+    for &k in &places {
+        if let Some(s) = set.get_mut(k) {
+            *s = true;
+        }
+    }
+    let unset =
+        |k: usize| CalcError::Syntax(format!("{name}[{}] isn't set by {i} — the range must cover every element", k.saturating_add(usize::from(o))));
+    if let Some(k) = set.iter().position(|s| !s) {
+        return Err(unset(k));
+    }
+    let names = [i.to_string()];
+    let mut values: Vec<Option<Val>> = vec![None; size];
+    for (&k, v) in places.iter().zip(&g.items) {
+        let bound = [Data::One(*v)];
+        let frame = Frame { names: &names, values: &bound, calls: 0 };
+        let value = match eval(&cx, &frame, body, 0).map_err(|e| array::element_error(size, 1, k, o, e))? {
+            Data::One(v) => v,
+            Data::Grid(_) => return Err(CalcError::Syntax(format!("{name}[{i}] is one element — its right side can't be a vector"))),
+        };
+        if let Some(slot) = values.get_mut(k) {
+            *slot = Some(value);
+        }
+    }
+    let values = values.into_iter().enumerate().map(|(k, v)| v.ok_or_else(|| unset(k))).collect::<Result<Vec<_>, _>>()?;
+    Grid::new(size, 1, values).map(Data::Grid)
 }
 
 /// `f` over every element of `x`, each counted as a step of the pass's work.

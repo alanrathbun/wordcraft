@@ -632,3 +632,229 @@ fn element_operations_count_against_the_budget() {
     run_stmt_in(&mut env, &stmt("k := 2·3"), &pass).expect("runs");
     assert_eq!(pass.spent.get(), 3);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Literals, indexes, ranges and indexed definitions
+// ---------------------------------------------------------------------------------------------
+
+/// An env holding `D := [0.840, 1.050, 1.315] in` and `M := [1, 2; 3, 4]`, numbered from `origin`.
+fn pipes(origin: u8) -> Env {
+    let mut env = Env::new();
+    env.set_origin(origin);
+    run(&mut env, "D := [0.840, 1.050, 1.315] in").expect("defines D");
+    run(&mut env, "M := [1, 2; 3, 4]").expect("defines M");
+    env
+}
+
+fn index_range_msg(e: CalcError) -> String {
+    match e {
+        CalcError::IndexRange(m) => m,
+        other => panic!("expected an index range error, got {other:?}"),
+    }
+}
+
+#[test]
+fn literal_evaluates() {
+    let mut env = pipes(0);
+    let (shape, items) = grid(&mut env, "D =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[0.840 * INCH, 1.050 * INCH, 1.315 * INCH], Dim::LENGTH);
+    // Each element keeps its own unit.
+    let (shape, items) = grid(&mut env, "[2 in, 50 mm] =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[2.0 * INCH, 0.050], Dim::LENGTH);
+    // A matrix, row by row.
+    let (shape, items) = grid(&mut env, "M =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[1.0, 2.0, 3.0, 4.0], Dim::ONE);
+    // Elements are expressions.
+    close_all(&grid(&mut env, "[1 + 1, D[0]/(1 in)] =").1, &[2.0, 0.840], Dim::ONE);
+    // An element that is itself a grid is refused, whichever way it is written.
+    for src in ["[2 [1]] =", "[D, 1] =", "[1, 2·D] ="] {
+        assert_eq!(syntax_msg(run_value(&mut env, src).expect_err(src)), "a matrix element can't be a vector", "{src}");
+    }
+}
+
+#[test]
+fn index_reads_an_element() {
+    let mut env = pipes(0);
+    close(shown(&mut env, "D[0] ="), 0.840 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "D[2] ="), 1.315 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "M[1, 0] ="), 3.0, Dim::ONE);
+    close(shown(&mut env, "M[0, 1] ="), 2.0, Dim::ONE);
+    // An index is an expression, and a column vector may also be given a row and a column.
+    close(shown(&mut env, "D[3 - 2] ="), 1.050 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "D[1, 0] ="), 1.050 * INCH, Dim::LENGTH);
+    // A function's parameter may be indexed.
+    run(&mut env, "f(x) := x[1]").expect("defines f");
+    close(shown(&mut env, "f(D) ="), 1.050 * INCH, Dim::LENGTH);
+
+    let mut env = pipes(1);
+    close(shown(&mut env, "D[1] ="), 0.840 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "D[3] ="), 1.315 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "M[2, 1] ="), 3.0, Dim::ONE);
+}
+
+#[test]
+fn index_must_be_a_whole_number_in_range() {
+    let mut env = pipes(0);
+    for src in ["D[1.5] =", "D[1 in] =", "D[1 rad] =", "D[[0]] =", "M[0.5, 0] =", "M[0, 1 in] ="] {
+        assert_eq!(syntax_msg(run_value(&mut env, src).expect_err(src)), "an index is a whole number, like D[2]", "{src}");
+    }
+    // Within 1e-9 of a whole number is that number.
+    close(shown(&mut env, "D[1 + 10^-12] ="), 1.050 * INCH, Dim::LENGTH);
+    assert_eq!(index_range_msg(run_value(&mut env, "D[3] =").expect_err("past the end")), "index 3 is outside D (0 to 2)");
+    assert_eq!(index_range_msg(run_value(&mut env, "D[-1] =").expect_err("before the start")), "index -1 is outside D (0 to 2)");
+    assert_eq!(index_range_msg(run_value(&mut env, "D[10^300] =").expect_err("far past the end")).split(' ').next(), Some("index"));
+    assert_eq!(index_range_msg(run_value(&mut env, "M[1] =").expect_err("one index")), "M is a matrix — give a row and a column, like M[1, 0]");
+    assert_eq!(
+        index_range_msg(run_value(&mut env, "M[2, 0] =").expect_err("no third row")),
+        "index [2, 0] is outside M (rows 0 to 1, columns 0 to 1)"
+    );
+    run(&mut env, "x := 5").expect("defines x");
+    assert_eq!(index_range_msg(run_value(&mut env, "x[0] =").expect_err("not a vector")), "x isn't a vector");
+    assert_eq!(index_range_msg(run_value(&mut env, "π[0] =").expect_err("not a vector")), "π isn't a vector");
+    assert_eq!(run_value(&mut env, "z[0] ="), Err(CalcError::Undefined("z".into())));
+    run(&mut env, "f(x) := x").expect("defines f");
+    assert!(matches!(run_value(&mut env, "f[0] ="), Err(CalcError::Syntax(_))));
+    env.mark_failed("F");
+    assert_eq!(run_value(&mut env, "F[0] ="), Err(CalcError::Upstream));
+    // Counting from 1, 0 is outside.
+    let mut env = pipes(1);
+    assert_eq!(index_range_msg(run_value(&mut env, "D[0] =").expect_err("before the start")), "index 0 is outside D (1 to 3)");
+}
+
+#[test]
+fn ranges_evaluate() {
+    let mut env = Env::new();
+    // A range includes both ends.
+    let (shape, items) = grid(&mut env, "i := 0..5 =");
+    assert_eq!(shape, (6, 1));
+    close_all(&items, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], Dim::ONE);
+    close_all(&grid(&mut env, "x := 1, 1.5..3 =").1, &[1.0, 1.5, 2.0, 2.5, 3.0], Dim::ONE);
+    close_all(&grid(&mut env, "len := 0 in, 0.5 in..1 in =").1, &[0.0, 0.5 * INCH, INCH], Dim::LENGTH);
+    // With no step, a range counts down as well as up.
+    close_all(&grid(&mut env, "c := 5..0 =").1, &[5.0, 4.0, 3.0, 2.0, 1.0, 0.0], Dim::ONE);
+    // The ends are expressions; a range of one element is a vector.
+    run(&mut env, "n := 3").expect("defines n");
+    close_all(&grid(&mut env, "k := 0..n-1 =").1, &[0.0, 1.0, 2.0], Dim::ONE);
+    assert_eq!(grid(&mut env, "o := 2..2 =").0, (1, 1));
+    // A step that doesn't land on the last value stops short of it.
+    close_all(&grid(&mut env, "ev := 0, 2..5 =").1, &[0.0, 2.0, 4.0], Dim::ONE);
+    // 10,000 elements is allowed.
+    assert_eq!(grid(&mut env, "big := 1..10000 =").0, (10_000, 1));
+}
+
+#[test]
+fn bad_ranges_are_errors() {
+    let mut env = Env::new();
+    column(&mut env, "D", &[1.0, 2.0], "in");
+    let zero = run(&mut env, "x := 1, 1..3").expect_err("zero step");
+    assert!(matches!(zero, CalcError::Syntax(_)), "{zero:?}");
+    let away = run(&mut env, "x := 1, 0..3").expect_err("wrong direction");
+    assert!(matches!(away, CalcError::Syntax(_)), "{away:?}");
+    assert!(matches!(run(&mut env, "x := 0..5 in"), Err(CalcError::Unit(UnitError::Mismatch { .. }))));
+    assert!(matches!(run(&mut env, "x := 0 in, 1..5 in"), Err(CalcError::Unit(UnitError::Mismatch { .. }))));
+    assert_eq!(run(&mut env, "x := 0..20000"), Err(CalcError::TooLarge));
+    // A count too large for any integer is too large too, not a panic or a wrap.
+    assert_eq!(run(&mut env, "x := 0, 10^-300..1"), Err(CalcError::TooLarge));
+    assert_eq!(run(&mut env, "x := 0, 10^-300..10^300"), Err(CalcError::TooLarge));
+    // A range with units needs a step: counting by 1 in SI units would be a wrong-looking answer.
+    assert!(matches!(run(&mut env, "x := 0 in..1 in"), Err(CalcError::Syntax(_))));
+    // The ends are single values.
+    assert!(matches!(run(&mut env, "x := D..5"), Err(CalcError::Syntax(_))));
+    // A range defines a plain variable only.
+    for src in ["f(x) := 0..x", "t[i] := 0..5"] {
+        assert_eq!(syntax_msg(run(&mut env, src).expect_err(src)), "a range defines a variable, like i := 0..5", "{src}");
+    }
+    let built = Expr::Binary(
+        Op::Add,
+        Box::new(Expr::Range { first: Box::new(Expr::Num(0.0)), second: None, last: Box::new(Expr::Num(2.0)) }),
+        Box::new(Expr::Num(1.0)),
+    );
+    assert_eq!(syntax_msg(eval_expr(&env, &built).expect_err("a range inside an expression")), "a range defines a variable, like i := 0..5");
+    // Nothing failed defined anything.
+    assert_eq!(env.names(), vec!["D".to_string()]);
+    // The range's elements are charged before they are built.
+    let pass = Pass::new(u64::MAX);
+    run_stmt_in(&mut env, &parse("r := 0..9999").expect("parses"), &pass).expect("runs");
+    assert_eq!(pass.spent.get(), 3 + 10_000);
+    assert_eq!(run_stmt_in(&mut env, &parse("r := 0..9999").expect("parses"), &Pass::new(5_000)), Err(CalcError::TooMuchWork));
+}
+
+#[test]
+fn indexed_definition_fills_a_vector() {
+    let mut env = pipes(0);
+    run(&mut env, "i := 0..2").expect("defines i");
+    assert_eq!(run(&mut env, "t[i] := 2·D[i]"), Ok(None));
+    let (shape, items) = grid(&mut env, "t =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[1.68 * INCH, 2.1 * INCH, 2.63 * INCH], Dim::LENGTH);
+    // Shown as it is defined; `i` is each element in turn.
+    close_all(&grid(&mut env, "sq[i] := i^2 =").1, &[0.0, 1.0, 4.0], Dim::ONE);
+    // Counting from 1.
+    let mut env = pipes(1);
+    run(&mut env, "i := 1..3").expect("defines i");
+    run(&mut env, "t[i] := 2·D[i]").expect("defines t");
+    close_all(&grid(&mut env, "t =").1, &[1.68 * INCH, 2.1 * INCH, 2.63 * INCH], Dim::LENGTH);
+    // 10,000 elements fit in one recalculation's budget: reading D[i] doesn't copy D.
+    let mut env = Env::new();
+    column(&mut env, "D", &vec![1.0; 10_000], "in");
+    run(&mut env, "i := 0..9999").expect("defines i");
+    let pass = Pass::new(super::MAX_PASS_STEPS);
+    run_stmt_in(&mut env, &parse("t[i] := 2·D[i]").expect("parses"), &pass).expect("fits the budget");
+    assert_eq!(grid(&mut env, "t =").0, (10_000, 1));
+}
+
+#[test]
+fn indexed_definition_is_strict() {
+    let mut env = pipes(0);
+    run(&mut env, "i := 1..2").expect("defines i");
+    assert_eq!(syntax_msg(run(&mut env, "t[i] := 2·D[i]").expect_err("t[0] unset")), "t[0] isn't set by i — the range must cover every element");
+    // The body giving a grid for an element is an error.
+    run(&mut env, "j := 0..2").expect("defines j");
+    assert!(matches!(run(&mut env, "u[j] := D"), Err(CalcError::Syntax(_))));
+    // The range variable must be a vector of whole, plain numbers.
+    run(&mut env, "hf := 0, 0.5..2").expect("defines hf");
+    run(&mut env, "q := 0 in, 1 in..2 in").expect("defines q");
+    run(&mut env, "k := 1").expect("defines k");
+    for src in ["v[hf] := 1", "v[q] := 1", "v[k] := 1", "v[M] := 1"] {
+        assert!(matches!(run(&mut env, src), Err(CalcError::Syntax(_))), "{src}");
+    }
+    // An index before the origin, or one making the vector too large, is refused before any work.
+    run(&mut env, "n := -1..2").expect("defines n");
+    assert!(matches!(run(&mut env, "v[n] := 1"), Err(CalcError::IndexRange(_))));
+    run(&mut env, "w := [0, 20000]").expect("defines w");
+    assert_eq!(run(&mut env, "v[w] := 1"), Err(CalcError::TooLarge));
+    assert_eq!(run(&mut env, "v[z] := 1"), Err(CalcError::Undefined("z".into())));
+    // An element's error names the element.
+    let e = run(&mut env, "v[j] := 1/(j - 1)").expect_err("1/0");
+    assert_eq!(e, CalcError::Element { at: "1".into(), error: Box::new(CalcError::NonFinite) });
+    // Nothing failed defined anything.
+    for name in ["t", "u", "v"] {
+        assert!(!env.names().contains(&name.to_string()), "{name}");
+    }
+}
+
+#[test]
+fn nested_indexes_are_bounded_not_a_stack_overflow() {
+    let mut env = Env::new();
+    run(&mut env, "Z := [0]").expect("defines Z");
+    // As deep as the parser allows.
+    let src = format!("{}0{} =", "Z[".repeat(60), "]".repeat(60));
+    close(shown(&mut env, &src), 0.0, Dim::ONE);
+    // Hand-built: just inside the evaluator's depth limit evaluates, far past it is refused. An
+    // index or literal level costs less stack than a user-function call level (eval → call →
+    // call_user → eval), which already needs about 2.7 MB at the depth limit; 4 MB covers both.
+    let deep = move || {
+        let nest = |n: usize| (0..n).fold(Expr::Num(0.0), |e, _| Expr::Index("Z".into(), vec![e]));
+        assert_eq!(eval_expr(&env, &nest(2000)), Ok(Value::One(Quantity::dimensionless(0.0))));
+        assert_eq!(eval_expr(&env, &nest(3000)), Err(CalcError::TooComplex));
+        let literals =
+            |n: usize| (0..n).fold(Expr::Num(0.0), |e, _| Expr::Index("Z".into(), vec![Expr::Matrix { rows: 1, cols: 1, items: vec![e] }]));
+        assert!(eval_expr(&env, &literals(3000)).is_err());
+        let matrices = |n: usize| (0..n).fold(Expr::Num(0.0), |e, _| Expr::Matrix { rows: 1, cols: 1, items: vec![e] });
+        assert_eq!(eval_expr(&env, &matrices(3000)), Err(CalcError::TooComplex));
+    };
+    std::thread::Builder::new().stack_size(4 << 20).spawn(deep).expect("spawns").join().expect("no panic");
+}
