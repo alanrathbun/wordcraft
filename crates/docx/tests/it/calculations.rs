@@ -407,3 +407,16 @@ fn a_store_renamed_by_word_is_found() {
     let stores = again.values().filter(|d| d.windows(17).any(|w| w == b"wordcraft-calc-v1")).count();
     assert_eq!(stores, 1, "{:?}", again.keys().collect::<Vec<_>>());
 }
+
+#[test]
+fn word_reserializing_an_untouched_equation_is_no_edit() {
+    // Word splits and rewrites runs as it saves; the equation's text and structure are the same.
+    let bytes = edit_document(&save(&report()), |xml| {
+        let run = r#"<m:t xml:space="preserve">P≔1500</m:t></m:r>"#;
+        assert!(xml.contains(run));
+        let split = r#"<m:t>P≔</m:t></m:r><m:r><w:rPr><w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math"/></w:rPr><m:t>1500</m:t></m:r>"#;
+        xml.replace(run, split)
+    });
+    let back = open(&bytes);
+    assert_eq!(region(&back, 1).0.state, CalcState::Fresh);
+}
