@@ -975,3 +975,23 @@ fn calculation_commands_have_keys() {
     copy_object(&mut s, 0);
     assert_eq!(run(&mut s, "calc.edit", json!({}))["id"], json!(p));
 }
+
+#[test]
+fn a_numbered_calculation_is_cross_referenced_like_a_plain_equation() {
+    // Equation cross-references go to Equation captions, for a plain equation and a calculation
+    // alike; the `#` number marks neither as a target on its own.
+    let targets = |s: &mut Session| crate::cmd::citations::ref_targets(s, "equation").into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+    let mut plain = session();
+    run(&mut plain, "insert.equation", json!({"linear": "x=1", "edit": false}));
+    run(&mut plain, "equation.number", json!({}));
+    let mut s = session();
+    let (_, _, sigma) = sample(&mut s);
+    caret_after(&mut s, sigma);
+    run(&mut s, "equation.number", json!({}));
+    assert_eq!(targets(&mut s), targets(&mut plain));
+    run(&mut s, "caret.docEnd", json!({}));
+    run(&mut s, "references.caption", json!({"label": "Equation", "text": "Bolt stress"}));
+    let listed = targets(&mut s);
+    assert!(listed.iter().any(|t| t.contains("Bolt stress")), "{listed:?}");
+    assert!(region(&s, sigma).0.numbered, "the caption leaves the calculation as it was");
+}
