@@ -15,6 +15,7 @@ use wordcraft_doc::math::Arg;
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph};
 
+use crate::array::Data;
 use crate::eval::{MAX_PASS_STEPS, Pass, check_unit_for, run_stmt_in};
 use crate::render::{self, Rendered, rendered, shown_result, shows_value};
 use crate::{CalcError, Env, Stmt, check_name, defined_name, free_names, parse};
@@ -82,10 +83,11 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
         let stmt = index.parsed.get(i);
         let outcome = outcomes.get(i).cloned().unwrap_or(Err(CalcError::Upstream));
         let shown = match outcome {
-            Ok(Some(q)) => {
+            Ok(Some(Data::One(v))) => {
                 let unit = stmt.and_then(|s| s.as_ref().ok()).and_then(show_unit);
-                format_value(q, unit.as_deref(), sys, precision(r.precision, &settings)).map(Some)
+                format_value(v.q, unit.as_deref(), sys, precision(r.precision, &settings)).map(Some)
             }
+            Ok(Some(Data::Grid(_))) => Err(grid_not_shown()),
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         };
@@ -163,10 +165,16 @@ pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), Ca
     let settings = doc.calc_settings.clone().unwrap_or_default();
     let (env, _, _) = evaluate(&index, &settings);
     env.check_display_unit(unit)?;
-    match env.value(name) {
-        Some(v) => check_unit_for(v, unit),
+    match env.data(name) {
+        Some(Data::One(v)) => check_unit_for(*v, unit),
+        Some(Data::Grid(_)) => Err(grid_not_shown()),
         None => Ok(()),
     }
+}
+
+/// Grid results aren't displayed or quoted yet: an error rather than a wrong number.
+fn grid_not_shown() -> CalcError {
+    CalcError::Syntax("vector results can't be shown yet".to_string())
 }
 
 /// Whether `name` may be given to a new calculation, or to the region `editing` (whose own
@@ -566,7 +574,7 @@ impl Index {
     }
 }
 
-type Outcome = Result<Option<Quantity>, CalcError>;
+type Outcome = Result<Option<Data>, CalcError>;
 
 /// A region in the dependency graph. Indexes are positions in the region list; the graph's own
 /// lists are read with `get`, so a wrong index is a skipped edge rather than a panic.
@@ -811,7 +819,8 @@ fn field_result(f: &FoundField, index: &Index, env: &Env, failed: &[bool], setti
     if !valid {
         return "?".to_string();
     }
-    let Some(v) = env.value(&f.name) else { return "?".to_string() };
+    // A grid isn't quoted yet.
+    let Some(&Data::One(v)) = env.data(&f.name) else { return "?".to_string() };
     // A difference shown in °C or °F would be a wrong number.
     if f.unit.as_deref().is_some_and(|u| env.check_display_unit(u).is_err() || check_unit_for(v, u).is_err()) {
         return "?".to_string();

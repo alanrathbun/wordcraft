@@ -1,10 +1,23 @@
-use super::{Env, check_name, eval_expr, run_stmt};
-use crate::{CalcError, Expr, Op, parse};
+use super::{Env, Pass, check_name, eval_expr, run_stmt, run_stmt_in};
+use crate::array::{Grid, element_name};
+use crate::{CalcError, Expr, Op, Value, parse};
 use craft_units::{Dim, Precision, Quantity, UnitError, UnitSystem, format};
 
 fn run(env: &mut Env, src: &str) -> Result<Option<Quantity>, CalcError> {
+    run_value(env, src).map(|v| v.map(one))
+}
+
+fn run_value(env: &mut Env, src: &str) -> Result<Option<Value>, CalcError> {
     let stmt = parse(src).unwrap_or_else(|e| panic!("{src:?} did not parse: {e}"));
     run_stmt(env, &stmt)
+}
+
+/// The single value of `v`.
+fn one(v: Value) -> Quantity {
+    match v {
+        Value::One(q) => q,
+        other => panic!("expected a single value, got {other:?}"),
+    }
 }
 
 /// Run `src` in a fresh env and return its shown value.
@@ -187,7 +200,7 @@ fn offset_units_only_as_a_lone_literal() {
     // A plain temperature unit is fine: 10 K, and a rankine.
     close(val("10 K ="), 10.0, Dim::TEMPERATURE);
     // Hand-built quantity literals take the same path.
-    let q = eval_expr(&Env::new(), &Expr::Quantity(32.0, "°F".into())).expect("evaluates");
+    let q = eval_expr(&Env::new(), &Expr::Quantity(32.0, "°F".into())).map(one).expect("evaluates");
     close(q, 273.15, Dim::TEMPERATURE);
 }
 
@@ -437,4 +450,185 @@ fn g_is_gravity_when_the_document_says_so() {
     assert!(run(&mut env, "m_4 := 5 kg = ? gm").is_ok());
     // Off (SI): g is the gram again.
     close(val("m_5 := 5 g ="), 0.005, Dim::MASS);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Grids (vectors and matrices)
+// ---------------------------------------------------------------------------------------------
+
+/// `values` in `unit`, as SI quantities.
+fn quantities(values: &[f64], unit: &str) -> Vec<Quantity> {
+    let scale = craft_units::parse_unit(unit).expect("a unit");
+    values.iter().map(|&v| Quantity::new(v * scale.factor, scale.dim)).collect()
+}
+
+/// Define the column vector `name` of `values` in `unit`.
+fn column(env: &mut Env, name: &str, values: &[f64], unit: &str) {
+    env.define_array(name, values.len(), 1, quantities(values, unit)).expect("defines");
+}
+
+/// The grid `src` shows: its shape and its elements.
+fn grid(env: &mut Env, src: &str) -> ((usize, usize), Vec<Quantity>) {
+    match run_value(env, src) {
+        Ok(Some(Value::Grid { rows, cols, items })) => ((rows, cols), items),
+        other => panic!("{src:?} did not show a grid: {other:?}"),
+    }
+}
+
+/// Every element of `items` is close to the matching `want` (SI) and has dimension `dim`.
+fn close_all(items: &[Quantity], want: &[f64], dim: Dim) {
+    assert_eq!(items.len(), want.len(), "{items:?}");
+    for (q, w) in items.iter().zip(want) {
+        close(*q, *w, dim);
+    }
+}
+
+const INCH: f64 = 0.0254;
+
+#[test]
+fn vectors_add_element_wise() {
+    let mut env = Env::new();
+    column(&mut env, "D", &[1.0, 2.0, 3.0], "in");
+    column(&mut env, "t", &[0.1, 0.2, 0.3], "in");
+    let (shape, items) = grid(&mut env, "D + t =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[1.1 * INCH, 2.2 * INCH, 3.3 * INCH], Dim::LENGTH);
+    // A name holding a grid evaluates as that grid.
+    assert_eq!(run(&mut env, "D_t := D + t").ok(), Some(None));
+    let (shape, items) = grid(&mut env, "D_t - t =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[INCH, 2.0 * INCH, 3.0 * INCH], Dim::LENGTH);
+    // A shown unit must fit every element; one that doesn't names the element and defines nothing.
+    assert!(run_value(&mut env, "D = ? mm").is_ok());
+    let e = run_value(&mut env, "u := D = ? lbf").expect_err("inches aren't force");
+    assert!(e.to_string().starts_with("element 0: "), "{e}");
+    assert_eq!(run(&mut env, "u ="), Err(CalcError::Undefined("u".into())));
+}
+
+#[test]
+fn single_value_broadcasts() {
+    let mut env = Env::new();
+    column(&mut env, "D", &[1.0, 2.0, 3.0], "in");
+    let (shape, items) = grid(&mut env, "2·D =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[2.0 * INCH, 4.0 * INCH, 6.0 * INCH], Dim::LENGTH);
+    close_all(&grid(&mut env, "D/2 =").1, &[0.5 * INCH, INCH, 1.5 * INCH], Dim::LENGTH);
+    close_all(&grid(&mut env, "D^2 =").1, &[INCH * INCH, 4.0 * INCH * INCH, 9.0 * INCH * INCH], AREA);
+    close_all(&grid(&mut env, "1 in - D =").1, &[0.0, -INCH, -2.0 * INCH], Dim::LENGTH);
+    close_all(&grid(&mut env, "-D =").1, &[-INCH, -2.0 * INCH, -3.0 * INCH], Dim::LENGTH);
+    close_all(&grid(&mut env, "|1 in - D| =").1, &[0.0, INCH, 2.0 * INCH], Dim::LENGTH);
+    // A single value's unit rules still hold for every element.
+    let e = run_value(&mut env, "D + 1 lbf =").expect_err("can't add force to length");
+    assert!(e.to_string().starts_with("element 0: "), "{e}");
+    // Single values are unchanged: their errors aren't about an element.
+    assert!(matches!(err("x := 1 in + 1 lbf ="), CalcError::Unit(UnitError::Mismatch { .. })));
+}
+
+#[test]
+fn shape_mismatch_is_named() {
+    let mut env = Env::new();
+    column(&mut env, "D", &[1.0, 2.0, 3.0], "in");
+    column(&mut env, "E", &[1.0, 2.0, 3.0, 4.0], "in");
+    let e = run_value(&mut env, "D + E =").expect_err("shapes differ");
+    assert_eq!(e, CalcError::Shape { left: (3, 1), right: (4, 1) });
+    assert_eq!(e.to_string(), "shapes don't match: 3 rows × 1 vs 4 rows × 1");
+    // A row isn't a column.
+    env.define_array("R", 1, 3, quantities(&[1.0, 2.0, 3.0], "in")).expect("defines");
+    assert_eq!(run_value(&mut env, "D·R ="), Err(CalcError::Shape { left: (3, 1), right: (1, 3) }));
+}
+
+#[test]
+fn element_error_names_the_element() {
+    let mixed = vec![quantities(&[1.0], "in")[0], quantities(&[2.0], "lbf")[0]];
+    for (origin, at) in [(0, "element 1: "), (1, "element 2: ")] {
+        let mut env = Env::new();
+        env.set_origin(origin);
+        env.define_array("P", 2, 1, mixed.clone()).expect("defines");
+        column(&mut env, "Q", &[1.0, 1.0], "in");
+        let e = run_value(&mut env, "P + Q =").expect_err("lbf + in");
+        assert!(e.to_string().starts_with(at), "origin {origin}: {e}");
+        assert!(matches!(e, CalcError::Element { ref error, .. } if matches!(**error, CalcError::Unit(UnitError::Mismatch { .. }))), "{e:?}");
+    }
+    // A vector element has one index (a row vector counts along its columns); a matrix element two.
+    assert_eq!(element_name(3, 1, 2, 0), "2");
+    assert_eq!(element_name(1, 3, 2, 1), "3");
+    assert_eq!(element_name(2, 3, 4, 0), "[1, 1]");
+    assert_eq!(element_name(2, 3, 5, 1), "[2, 3]");
+    // An origin other than 0 or 1 is 0.
+    let mut env = Env::new();
+    env.set_origin(7);
+    env.define_array("P", 2, 1, mixed).expect("defines");
+    column(&mut env, "Q", &[1.0, 1.0], "in");
+    assert!(run_value(&mut env, "P + Q =").expect_err("lbf + in").to_string().starts_with("element 1: "));
+}
+
+#[test]
+fn builtins_apply_element_wise() {
+    let mut env = Env::new();
+    column(&mut env, "v", &[4.0, 9.0], "1");
+    column(&mut env, "r", &[1.26, 2.34], "1");
+    let (shape, items) = grid(&mut env, "sqrt(v) =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[2.0, 3.0], Dim::ONE);
+    close_all(&grid(&mut env, "round(r, 1) =").1, &[1.3, 2.3], Dim::ONE);
+    close_all(&grid(&mut env, "mod(v, 4) =").1, &[0.0, 1.0], Dim::ONE);
+    close_all(&grid(&mut env, "log(100, v) =").1, &[100f64.ln() / 4f64.ln(), 100f64.ln() / 9f64.ln()], Dim::ONE);
+    // Arity is checked before any element is.
+    assert_eq!(run_value(&mut env, "sqrt(v, v) ="), Err(CalcError::Arity("sqrt".into(), 1)));
+    // A per-element error names the element.
+    column(&mut env, "w", &[1.0, -1.0], "1");
+    assert!(run_value(&mut env, "sqrt(w) =").expect_err("sqrt(-1)").to_string().starts_with("element 1: "));
+    // min and max take single values for now: an array is an error, never a number.
+    assert!(matches!(run_value(&mut env, "max(v) ="), Err(CalcError::Syntax(_))));
+    assert!(matches!(run_value(&mut env, "min(v, 1) ="), Err(CalcError::Syntax(_))));
+}
+
+#[test]
+fn user_functions_apply_element_wise() {
+    let mut env = Env::new();
+    column(&mut env, "v", &[1.0, 2.0], "1");
+    run(&mut env, "f(x) := x^2 + 1").expect("defines");
+    let (shape, items) = grid(&mut env, "f(v) =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[2.0, 5.0], Dim::ONE);
+}
+
+#[test]
+fn arrays_are_bounded() {
+    let mut env = Env::new();
+    let e = env.define_array("big", 10_001, 1, vec![Quantity::dimensionless(1.0); 10_001]).expect_err("too large");
+    assert_eq!(e, CalcError::TooLarge);
+    assert_eq!(e.to_string(), "more than 10,000 elements");
+    assert!(env.define_array("big", 100, 101, Vec::new()).is_err_and(|e| e == CalcError::TooLarge));
+    // The cap is checked before the size, and an overflowing shape is too large rather than a panic.
+    assert_eq!(Grid::new(101, 100, Vec::new()), Err(CalcError::TooLarge));
+    assert_eq!(Grid::new(usize::MAX, 2, Vec::new()), Err(CalcError::TooLarge));
+    // A size that doesn't match the shape, or no elements at all, is refused.
+    assert!(Grid::new(2, 2, Vec::new()).is_err());
+    assert!(Grid::new(0, 1, Vec::new()).is_err());
+    // 10,000 is allowed, and so is arithmetic on it.
+    column(&mut env, "D", &vec![1.0; 10_000], "in");
+    assert_eq!(grid(&mut env, "D + D =").0, (10_000, 1));
+}
+
+#[test]
+fn element_operations_count_against_the_budget() {
+    let stmt = |src: &str| parse(src).expect("parses");
+    let mut env = Env::new();
+    column(&mut env, "D", &vec![1.0; 10_000], "in");
+    column(&mut env, "N", &vec![4.0; 10_000], "1");
+    // Each costs one step per node, 10,000 for reading the grid and 10,000 for the element-wise
+    // operation (an operator, a negation, a built-in).
+    for (src, nodes) in [("x := 2·D", 3), ("y := -D", 2), ("z := sqrt(N)", 2)] {
+        let pass = Pass::new(u64::MAX);
+        run_stmt_in(&mut env, &stmt(src), &pass).expect("runs");
+        assert_eq!(pass.spent.get(), nodes + 20_000, "{src}");
+        // The read fits in this budget; the operation doesn't.
+        assert_eq!(run_stmt_in(&mut env, &stmt(src), &Pass::new(15_000)), Err(CalcError::TooMuchWork), "{src}");
+    }
+    assert_eq!(run_stmt_in(&mut env, &stmt("w := 2·D"), &Pass::new(5_000)), Err(CalcError::TooMuchWork));
+    // Single values cost what they did: one step per node.
+    let pass = Pass::new(u64::MAX);
+    run_stmt_in(&mut env, &stmt("k := 2·3"), &pass).expect("runs");
+    assert_eq!(pass.spent.get(), 3);
 }

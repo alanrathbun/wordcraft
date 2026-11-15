@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod array;
 mod ast;
 pub mod docx;
 mod eval;
@@ -27,6 +28,22 @@ pub use recalc::{
     NOT_CALCULATED_HERE, RecalcReport, body_regions, calc_unchanged, check_new_name, check_quote_unit, defined_names, freeze_outside_body,
     is_calc_object, mark_stale, recalc,
 };
+
+/// What a calculation evaluates to: one value, or a grid of values (a vector or matrix).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    /// A single value.
+    One(craft_units::Quantity),
+    /// `rows` × `cols` values, row by row. A column vector has one column.
+    Grid {
+        /// How many rows.
+        rows: usize,
+        /// How many columns.
+        cols: usize,
+        /// The `rows · cols` elements, row-major.
+        items: Vec<craft_units::Quantity>,
+    },
+}
 
 /// An error from parsing or evaluating a calculation. The message is shown to the author next to
 /// the calculation, so it is written for them rather than for a programmer.
@@ -82,4 +99,29 @@ pub enum CalcError {
     /// Calculations that depend on each other in a cycle. Holds the names joined with `, `.
     #[error("{0} depend on each other")]
     Circular(String),
+    /// Two grids combined element by element have different shapes (rows, columns).
+    #[error("shapes don't match: {} rows × {} vs {} rows × {}", .left.0, .left.1, .right.0, .right.1)]
+    Shape {
+        /// The left operand's shape.
+        left: (usize, usize),
+        /// The right operand's shape.
+        right: (usize, usize),
+    },
+    /// One element of a grid operation failed: names the element (`2`, or `[1, 2]` in a matrix).
+    #[error("element {at}: {error}")]
+    Element {
+        /// The element, counted from the document's origin.
+        at: String,
+        /// What went wrong with it.
+        error: Box<CalcError>,
+    },
+    /// A grid would hold more elements than allowed.
+    #[error("more than 10,000 elements")]
+    TooLarge,
+    /// An index outside a grid: the message names the valid range.
+    #[error("{0}")]
+    IndexRange(String),
+    /// A data table this calculation depends on has an error.
+    #[error("depends on table data with an error")]
+    UpstreamTable,
 }

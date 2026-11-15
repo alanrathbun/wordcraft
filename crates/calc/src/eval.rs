@@ -4,9 +4,14 @@
 //! across user-function calls, so a deep body inside deep calls can't overflow the stack), the
 //! depth of user-function calls, and the total number of expression nodes evaluated (so a chain of
 //! functions that each call the previous twice can't run for hours).
+//!
+//! A value is one quantity or a grid of them (a vector or matrix, see [`crate::array`]). Operators
+//! and built-in functions work on grids element by element, and every element counts as a step of
+//! the recalculation's work.
 
+use crate::array::{self, Data, Grid};
 use crate::funcs::{self, unit};
-use crate::{CalcError, Expr, Op, Show, Stmt};
+use crate::{CalcError, Expr, Op, Show, Stmt, Value};
 use craft_units::{Dim, Quantity, Scale, UnitError, lookup, parse_unit};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -64,7 +69,7 @@ impl Val {
 /// What a name means in an [`Env`].
 #[derive(Debug, Clone, PartialEq)]
 enum Entry {
-    Var(Quantity, Temp),
+    Var(Data),
     Func {
         params: Vec<String>,
         body: Expr,
@@ -82,6 +87,8 @@ pub struct Env {
     entries: BTreeMap<String, Entry>,
     /// `g` is standard gravity (Mathcad's convention) rather than the gram; the gram is then `gm`.
     g_is_gravity: bool,
+    /// What an array's first element is numbered: 0 (Mathcad's convention) or 1.
+    origin: u8,
 }
 
 impl Env {
@@ -110,15 +117,31 @@ impl Env {
         Ok(())
     }
 
-    /// Define a variable (not an absolute temperature: see [`Temp`]).
-    pub fn define_var(&mut self, name: &str, q: Quantity) {
-        self.entries.insert(name.to_string(), Entry::Var(q, Temp::Plain));
+    /// Number array elements from `origin`: 0 (Mathcad's convention, the default) or 1; anything
+    /// else is 0.
+    pub fn set_origin(&mut self, origin: u8) {
+        self.origin = if origin == 1 { 1 } else { 0 };
     }
 
-    /// The value of the variable `name`, with what it stands for as a temperature.
-    pub(crate) fn value(&self, name: &str) -> Option<Val> {
+    /// Define a variable (not an absolute temperature: see [`Temp`]).
+    pub fn define_var(&mut self, name: &str, q: Quantity) {
+        self.entries.insert(name.to_string(), Entry::Var(Data::One(Val::plain(q))));
+    }
+
+    /// Define an array variable of `rows` × `cols` values given row by row (none of them an
+    /// absolute temperature: see [`Temp`]). [`CalcError::TooLarge`] beyond 10,000 elements, and an
+    /// error when `items` doesn't fill the shape; nothing is defined then.
+    pub fn define_array(&mut self, name: &str, rows: usize, cols: usize, items: Vec<Quantity>) -> Result<(), CalcError> {
+        array::check_size(rows, cols, items.len())?;
+        let grid = Grid::new(rows, cols, items.into_iter().map(Val::plain).collect())?;
+        self.entries.insert(name.to_string(), Entry::Var(Data::Grid(grid)));
+        Ok(())
+    }
+
+    /// The value of the variable `name`, with what each value stands for as a temperature.
+    pub(crate) fn data(&self, name: &str) -> Option<&Data> {
         match self.entries.get(name) {
-            Some(Entry::Var(q, t)) => Some(Val { q: *q, t: *t }),
+            Some(Entry::Var(d)) => Some(d),
             _ => None,
         }
     }
@@ -173,9 +196,9 @@ fn is_constant(name: &str) -> bool {
 }
 
 /// Evaluate an expression against the defined names.
-pub fn eval_expr(env: &Env, e: &Expr) -> Result<Quantity, CalcError> {
+pub fn eval_expr(env: &Env, e: &Expr) -> Result<Value, CalcError> {
     let pass = Pass::new(u64::MAX);
-    eval_in(env, e, &pass)
+    eval_data(env, e, &pass).map(|d| d.value())
 }
 
 /// The work a whole recalculation may do, shared by every statement it runs.
@@ -188,13 +211,20 @@ impl Pass {
     pub(crate) fn new(limit: u64) -> Pass {
         Pass { spent: Cell::new(0), limit }
     }
+
+    /// Count `n` steps of work: [`CalcError::TooMuchWork`], with nothing counted, once that would
+    /// pass the limit.
+    pub(crate) fn charge(&self, n: u64) -> Result<(), CalcError> {
+        let spent = self.spent.get().saturating_add(n);
+        if spent > self.limit {
+            return Err(CalcError::TooMuchWork);
+        }
+        self.spent.set(spent);
+        Ok(())
+    }
 }
 
-fn eval_in(env: &Env, e: &Expr, pass: &Pass) -> Result<Quantity, CalcError> {
-    eval_val(env, e, pass).map(|v| v.q)
-}
-
-fn eval_val(env: &Env, e: &Expr, pass: &Pass) -> Result<Val, CalcError> {
+fn eval_data(env: &Env, e: &Expr, pass: &Pass) -> Result<Data, CalcError> {
     let cx = Cx { env, steps: Cell::new(0), pass };
     eval(&cx, &Frame::GLOBAL, e, 0)
 }
@@ -204,18 +234,18 @@ fn eval_val(env: &Env, e: &Expr, pass: &Pass) -> Result<Val, CalcError> {
 ///
 /// Nothing is defined unless the whole statement succeeds, including a `= ? unit` that does not
 /// match the value's dimension. The unit itself is applied by whoever formats the value.
-pub fn run_stmt(env: &mut Env, s: &Stmt) -> Result<Option<Quantity>, CalcError> {
-    run_stmt_in(env, s, &Pass::new(u64::MAX))
+pub fn run_stmt(env: &mut Env, s: &Stmt) -> Result<Option<Value>, CalcError> {
+    Ok(run_stmt_in(env, s, &Pass::new(u64::MAX))?.map(|d| d.value()))
 }
 
 /// [`run_stmt`], counting its work against `pass`: once the pass has done its limit, every
 /// statement is [`CalcError::TooMuchWork`].
-pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option<Quantity>, CalcError> {
+pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option<Data>, CalcError> {
     match s {
         Stmt::Eval { expr, show } => {
-            let v = eval_val(env, expr, pass)?;
-            check_show(env, show, v)?;
-            Ok(Some(v.q))
+            let v = eval_data(env, expr, pass)?;
+            check_show(env, show, &v)?;
+            Ok(Some(v))
         }
         Stmt::Define { name, params, body, show } => {
             check_name(name)?;
@@ -227,29 +257,44 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
                 env.define_fn(name, params.clone(), body.clone());
                 return Ok(None);
             }
-            let v = eval_val(env, body, pass)?;
+            let v = eval_data(env, body, pass)?;
             if let Some(show) = show {
-                check_show(env, show, v)?;
+                check_show(env, show, &v)?;
             }
-            env.entries.insert(name.to_string(), Entry::Var(v.q, v.t));
-            Ok(show.as_ref().map(|_| v.q))
+            let shown = show.as_ref().map(|_| v.clone());
+            env.entries.insert(name.to_string(), Entry::Var(v));
+            Ok(shown)
         }
     }
 }
 
-/// A `= ? unit` must be a unit of the value's dimension.
-fn check_show(env: &Env, show: &Show, v: Val) -> Result<(), CalcError> {
+/// A `= ? unit` must be a unit of the value's dimension (of every element's, for a grid).
+fn check_show(env: &Env, show: &Show, v: &Data) -> Result<(), CalcError> {
     let Some(text) = &show.unit else {
         return Ok(());
     };
     env.check_display_unit(text)?;
-    check_unit_for(v, text)
+    match v {
+        Data::One(v) => check_unit_for(*v, text),
+        Data::Grid(g) => {
+            let scale = parse_unit(text).map_err(unit)?;
+            g.items
+                .iter()
+                .enumerate()
+                .try_for_each(|(k, v)| fits(*v, &scale, text).map_err(|e| array::element_error(g.rows, g.cols, k, env.origin, e)))
+        }
+    }
 }
 
 /// Whether `v` can be shown in the unit `text`: one of its dimension and, for an offset scale
 /// (`°C`, `°F`), an absolute temperature ([`Temp`]).
 pub(crate) fn check_unit_for(v: Val, text: &str) -> Result<(), CalcError> {
     let scale = parse_unit(text).map_err(unit)?;
+    fits(v, &scale, text)
+}
+
+/// [`check_unit_for`] with the unit `text` already parsed as `scale`.
+fn fits(v: Val, scale: &Scale, text: &str) -> Result<(), CalcError> {
     if !v.q.dim.same_ignoring_angle(scale.dim) {
         return Err(CalcError::Unit(UnitError::Mismatch { left: v.q.dim, right: scale.dim }));
     }
@@ -271,19 +316,19 @@ struct Cx<'a> {
 /// The parameters in scope, and how many user functions deep we are.
 struct Frame<'a> {
     names: &'a [String],
-    values: &'a [Val],
+    values: &'a [Data],
     calls: usize,
 }
 
 impl Frame<'_> {
     const GLOBAL: Frame<'static> = Frame { names: &[], values: &[], calls: 0 };
 
-    fn param(&self, name: &str) -> Option<Val> {
-        self.names.iter().position(|n| n == name).and_then(|i| self.values.get(i).copied())
+    fn param(&self, name: &str) -> Option<&Data> {
+        self.names.iter().position(|n| n == name).and_then(|i| self.values.get(i))
     }
 }
 
-fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Val, CalcError> {
+fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, CalcError> {
     if depth > MAX_EVAL_DEPTH {
         return Err(CalcError::TooComplex);
     }
@@ -292,33 +337,30 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Val, Calc
         return Err(CalcError::TooComplex);
     }
     cx.steps.set(steps);
-    let spent = cx.pass.spent.get().saturating_add(1);
-    if spent > cx.pass.limit {
-        return Err(CalcError::TooMuchWork);
-    }
-    cx.pass.spent.set(spent);
+    cx.pass.charge(1)?;
     match e {
-        Expr::Num(v) => finite(*v).map(Val::plain),
+        Expr::Num(v) => finite(*v).map(|q| Data::One(Val::plain(q))),
         Expr::Name(n) => resolve(cx, fr, n),
         Expr::Quantity(v, text) => {
             let scale = parse_unit(text).map_err(unit)?;
             let t = literal_temp(text, &scale);
-            from_scale(*v, &scale).map(|q| Val { q, t })
+            from_scale(*v, &scale).map(|q| Data::One(Val { q, t }))
         }
         Expr::Unary(Op::Neg, a) => {
             refuse_offset_operand(cx, fr, &[a])?;
-            eval(cx, fr, a, depth + 1)?.q.neg().map(Val::plain).map_err(unit)
+            let x = eval(cx, fr, a, depth + 1)?;
+            each(cx, &x, |v| v.q.neg().map(Val::plain).map_err(unit))
         }
         Expr::Unary(..) => Err(CalcError::Syntax("unsupported operator".to_string())),
         Expr::Abs(a) => {
-            let q = eval(cx, fr, a, depth + 1)?.q;
-            finite_q(Quantity::new(q.value.abs(), q.dim)).map(Val::plain)
+            let x = eval(cx, fr, a, depth + 1)?;
+            each(cx, &x, |v| finite_q(Quantity::new(v.q.value.abs(), v.q.dim)).map(Val::plain))
         }
         Expr::Binary(op, a, b) => {
             if *op == Op::Mul
                 && let Some(q) = offset_literal(cx, fr, a, b)
             {
-                return q.map(|q| Val { q, t: Temp::Absolute });
+                return q.map(|q| Data::One(Val { q, t: Temp::Absolute }));
             }
             // Offset literals may be combined with an interval but not scaled (`5 °F/s` would be a
             // wrong number that looks right) or combined with each other.
@@ -337,16 +379,49 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Val, Calc
             }
             let x = eval(cx, fr, a, depth + 1)?;
             let y = eval(cx, fr, b, depth + 1)?;
-            let q = apply(*op, x.q, y.q)?;
-            let t = match op {
-                Op::Add | Op::Sub => sum_temp(*op, x.t, y.t),
+            // `5 K` is a temperature literal: what it stands for comes from its syntax.
+            let literal = match op {
                 Op::Mul => unit_literal(cx, fr, a, b).map_or(Temp::Plain, |(_, scale, name)| literal_temp(name, &scale)),
                 _ => Temp::Plain,
             };
-            Ok(Val { q, t })
+            pair(cx, &x, &y, |x, y| {
+                let q = apply(*op, x.q, y.q)?;
+                let t = match op {
+                    Op::Add | Op::Sub => sum_temp(*op, x.t, y.t),
+                    Op::Mul => literal,
+                    _ => Temp::Plain,
+                };
+                Ok(Val { q, t })
+            })
         }
         Expr::Call(name, args) => call(cx, fr, name, args, depth),
     }
+}
+
+/// `f` over every element of `x`, each counted as a step of the pass's work.
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn each(cx: &Cx<'_>, x: &Data, f: impl FnMut(Val) -> Result<Val, CalcError>) -> Result<Data, CalcError> {
+    if let Some((rows, cols)) = x.shape() {
+        charge_elements(cx, rows.saturating_mul(cols))?;
+    }
+    array::map(x, cx.env.origin, f)
+}
+
+/// `f` over `x` and `y` element by element (a single value broadcast over a grid), each element
+/// counted as a step of the pass's work.
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn pair(cx: &Cx<'_>, x: &Data, y: &Data, f: impl FnMut(Val, Val) -> Result<Val, CalcError>) -> Result<Data, CalcError> {
+    if let Some((rows, cols)) = array::result_shape(x, y)? {
+        charge_elements(cx, rows.saturating_mul(cols))?;
+    }
+    array::zip(x, y, cx.env.origin, f)
+}
+
+/// Count `n` elements' work against the pass.
+fn charge_elements(cx: &Cx<'_>, n: usize) -> Result<(), CalcError> {
+    cx.pass.charge(u64::try_from(n).unwrap_or(u64::MAX))
 }
 
 /// What a literal in the unit `name` stands for as a temperature: absolute on an offset scale,
@@ -444,25 +519,25 @@ fn not_a_value(name: &str) -> CalcError {
 }
 
 /// A name as a value: parameter, variable, constant, unit.
-fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Val, CalcError> {
+fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Data, CalcError> {
     if let Some(v) = fr.param(name) {
-        return Ok(v);
+        return copy(cx, v);
     }
     match cx.env.entries.get(name) {
-        Some(Entry::Var(q, t)) => return Ok(Val { q: *q, t: *t }),
+        Some(Entry::Var(v)) => return copy(cx, v),
         Some(Entry::Failed) => return Err(CalcError::Upstream),
         Some(Entry::Func { .. }) => return Err(not_a_value(name)),
         None => {}
     }
     if let Some(q) = cx.env.constant(name) {
-        return Ok(Val::plain(q));
+        return Ok(Data::One(Val::plain(q)));
     }
     // A unit wins over a built-in of the same spelling: `5 min` is minutes, `min(1, 2)` a call.
     if let Some(scale) = lookup(name) {
         if scale.offset != 0.0 {
             return Err(CalcError::Unit(UnitError::AffineTemperature));
         }
-        return finite_q(Quantity::new(scale.factor, scale.dim)).map(Val::plain);
+        return finite_q(Quantity::new(scale.factor, scale.dim)).map(|q| Data::One(Val::plain(q)));
     }
     if funcs::is_builtin(name) {
         return Err(not_a_value(name));
@@ -470,9 +545,18 @@ fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Val, CalcError> {
     Err(CalcError::Undefined(name.to_string()))
 }
 
+/// A copy of a name's value. Copying a grid is work: each element counts as a step, so a hostile
+/// calculation can't copy large grids for free.
+fn copy(cx: &Cx<'_>, v: &Data) -> Result<Data, CalcError> {
+    if let Some((rows, cols)) = v.shape() {
+        charge_elements(cx, rows.saturating_mul(cols))?;
+    }
+    Ok(v.clone())
+}
+
 // Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
-fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) -> Result<Val, CalcError> {
+fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) -> Result<Data, CalcError> {
     // Resolve what is being called before evaluating the arguments, so a missing name is reported
     // as missing rather than after unrelated errors in its arguments.
     let user = if fr.param(name).is_some() { None } else { cx.env.entries.get(name) };
@@ -488,7 +572,11 @@ fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) ->
     if !funcs::is_builtin(name) {
         return if is_constant(name) || lookup(name).is_some() { Err(not_callable(name)) } else { Err(CalcError::Undefined(name.to_string())) };
     }
-    let values = eval_args(cx, fr, args, depth)?;
+    let args = eval_args(cx, fr, args, depth)?;
+    let values: Vec<Val> = args.iter().filter_map(|a| if let Data::One(v) = a { Some(*v) } else { None }).collect();
+    if values.len() < args.len() {
+        return call_each(cx, name, &args);
+    }
     let quantities: Vec<Quantity> = values.iter().map(|v| v.q).collect();
     let q = funcs::call(name, &quantities).unwrap_or_else(|| Err(CalcError::Undefined(name.to_string())))?;
     // The smaller or larger of absolute temperatures is one of them; any other result is plain.
@@ -500,19 +588,48 @@ fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) ->
     } else {
         Temp::Either
     };
-    Ok(Val { q, t })
+    Ok(Data::One(Val { q, t }))
+}
+
+/// A built-in called with a grid among its arguments: applied element by element over every
+/// argument, a single value broadcast. The result of each is not an absolute temperature.
+fn call_each(cx: &Cx<'_>, name: &str, args: &[Data]) -> Result<Data, CalcError> {
+    if matches!(name, "min" | "max") {
+        return Err(CalcError::Syntax(format!("{name} takes single values, not arrays")));
+    }
+    let builtin = |qs: &[Quantity]| funcs::call(name, qs).unwrap_or_else(|| Err(CalcError::Undefined(name.to_string()))).map(Val::plain);
+    // The number of arguments is checked once, before any element: not "element 0: sqrt expects 1".
+    let firsts: Vec<Quantity> = args.iter().filter_map(first).map(|v| v.q).collect();
+    if let Err(e @ CalcError::Arity(..)) = builtin(&firsts) {
+        return Err(e);
+    }
+    match args {
+        [x] => each(cx, x, |x| builtin(&[x.q])),
+        [x, y] => pair(cx, x, y, |x, y| builtin(&[x.q, y.q])),
+        // Every built-in but `min` and `max` takes one or two arguments, so the check above
+        // reported any other count.
+        _ => Err(CalcError::Arity(name.to_string(), 2)),
+    }
+}
+
+/// A single value, or a grid's first element.
+fn first(d: &Data) -> Option<Val> {
+    match d {
+        Data::One(v) => Some(*v),
+        Data::Grid(g) => g.items.first().copied(),
+    }
 }
 
 fn not_callable(name: &str) -> CalcError {
     CalcError::Syntax(format!("{name} isn't a function — it can't be called with ( )"))
 }
 
-fn eval_args(cx: &Cx<'_>, fr: &Frame<'_>, args: &[Expr], depth: usize) -> Result<Vec<Val>, CalcError> {
+fn eval_args(cx: &Cx<'_>, fr: &Frame<'_>, args: &[Expr], depth: usize) -> Result<Vec<Data>, CalcError> {
     args.iter().map(|a| eval(cx, fr, a, depth + 1)).collect()
 }
 
 /// Call a user function in a scope holding only its own parameters (and the global names).
-fn call_user(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, params: &[String], body: &Expr, args: &[Expr], depth: usize) -> Result<Val, CalcError> {
+fn call_user(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, params: &[String], body: &Expr, args: &[Expr], depth: usize) -> Result<Data, CalcError> {
     if args.len() != params.len() {
         return Err(CalcError::Arity(name.to_string(), params.len()));
     }
