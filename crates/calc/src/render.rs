@@ -180,6 +180,26 @@ fn linear_number(number: &str) -> String {
     }
 }
 
+/// The digits 0–9 raised.
+const SUPERSCRIPT_DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+
+/// A formatted number as plain text, for a quoted value in a sentence: the exponent of
+/// `m×10^e` in superscript characters (`2.9×10⁷`, `1.5×10⁻⁵`), so no markup reaches the text.
+pub(crate) fn text_number(number: &str) -> String {
+    let Some((mantissa, exp)) = number.split_once("×10^") else { return number.to_string() };
+    let raised: Option<String> = exp
+        .chars()
+        .map(|c| match c {
+            '-' => Some('⁻'),
+            _ => c.to_digit(10).and_then(|d| SUPERSCRIPT_DIGITS.get(usize::try_from(d).ok()?).copied()),
+        })
+        .collect();
+    match raised {
+        Some(raised) if !raised.is_empty() => format!("{mantissa}×10{raised}"),
+        _ => number.to_string(),
+    }
+}
+
 /// An upright run of unit text.
 fn unit_run(text: String) -> MRun {
     MRun { text, sty: Some(MSty::Plain), ..MRun::default() }

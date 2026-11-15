@@ -763,8 +763,8 @@ fn field_result(f: &FoundField, index: &Index, env: &Env, failed: &[bool], setti
     }
     let Ok(q) = eval_expr(env, &Expr::Name(f.name.clone())) else { return "?".to_string() };
     match format_value(q, f.unit.as_deref(), unit_system(settings), precision(f.precision, settings)) {
-        Ok(shown) if shown.unit.is_empty() => shown.number,
-        Ok(shown) => format!("{} {}", shown.number, shown.unit),
+        Ok(shown) if shown.unit.is_empty() => render::text_number(&shown.number),
+        Ok(shown) => format!("{} {}", render::text_number(&shown.number), shown.unit),
         Err(_) => "?".to_string(),
     }
 }

@@ -849,3 +849,24 @@ fn unchanged_calculations_need_no_pass() {
     stale.calc_settings = Some(CalcSettings { manual: true, ..CalcSettings::default() });
     assert!(calc_unchanged(&stale, &stale.clone()));
 }
+
+#[test]
+fn quoted_values_in_exponential_form_use_superscripts() {
+    let mut d = doc_with(&["E := 29000000 psi", "α := 0.0000065", "n := -2.5e9"]);
+    if let Block::Para(p) = Arc::make_mut(&mut d.body[0]) {
+        for instr in [calc_field_instr("E", None, None), calc_field_instr("α", None, None), calc_field_instr("n", None, None)] {
+            let end = p.text.len();
+            p.insert_object(end, field(&instr), &CharProps::default()).unwrap();
+        }
+    }
+    recalc(&mut d, &no_page);
+    let quoted: Vec<String> = objects(&d)
+        .into_iter()
+        .filter_map(|o| match o {
+            InlineObject::Field { result, .. } => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(quoted, ["2.9×10⁷ psi", "6.5×10⁻⁶", "-2.5×10⁹"]);
+    assert!(quoted.iter().all(|q| !q.contains('^')), "no markup in a sentence");
+}
