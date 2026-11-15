@@ -29,6 +29,11 @@ const MAX_SHOWN_SOURCE: usize = 2000;
 const SENTINEL_BASE: u32 = 0xE000;
 /// How many distinct units and names one display can stand in for (the private-use area's size).
 const MAX_SENTINELS: usize = 6400;
+/// UnicodeMath's invisible brackets: a group that shows no brackets.
+const INVISIBLE_OPEN: &str = "〖";
+const INVISIBLE_CLOSE: &str = "〗";
+/// The base of an exponential number, grouped so its power is on both digits.
+const TEN: &str = "〖10〗";
 /// Separates a number from the unit after it in the math tree (spaces in linear text are dropped).
 const THIN_SPACE: char = '\u{2009}';
 
@@ -82,7 +87,7 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
         let number = shown.map_or_else(|| "?".to_string(), |f| linear_number(&f.number));
         let unit = shown.map_or("", |f| f.unit.as_str());
         let mut result: Arg = vec![MNode::Run(MRun::new(rel))];
-        result.extend(parse_linear(&number));
+        result.extend(restore_pieces(parse_linear(&number), &[]));
         linear.push_str(rel);
         linear.push_str(&number);
         if !unit.is_empty() {
@@ -101,6 +106,8 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
 /// linear text; `None` when the text doesn't end in a result.
 pub(crate) fn shown_result(linear: &str) -> Option<Formatted> {
     let (_, tail) = linear.rsplit_once('=')?;
+    let tail = tail.replace(TEN, "10");
+    let tail = tail.as_str();
     let (number, unit) = match tail.strip_suffix('"') {
         Some(rest) => {
             let (number, unit) = rest.rsplit_once(" \"")?;
@@ -113,12 +120,14 @@ pub(crate) fn shown_result(linear: &str) -> Option<Formatted> {
     (numeric && number.chars().any(|c| c.is_ascii_digit())).then_some(Formatted { number, unit })
 }
 
-/// A formatted number as linear text: a negative exponent is parenthesised (`10^(-5)`), so the
-/// whole exponent is raised.
+/// A formatted number as linear text: the base `10` is in invisible brackets (`〖10〗^6`) so the
+/// power is on all of it, and a negative exponent is parenthesised (`^(-5)`), so the whole
+/// exponent is raised.
 fn linear_number(number: &str) -> String {
+    let number = number.replace("×10^", &format!("×{TEN}^"));
     match number.split_once("^-") {
         Some((mantissa, exp)) => format!("{mantissa}^(-{exp})"),
-        None => number.to_string(),
+        None => number,
     }
 }
 
@@ -216,25 +225,36 @@ impl Out {
 
     /// A name with its subscripts: `σ_allow` is σ with subscript allow; each further `_`
     /// lowers the rest again, in parentheses (`a_(b_(c))`) so all of it is lowered.
+    ///
+    /// An empty part (`a__b`, `x_`) shows as nothing: no `_` is left without a subscript after
+    /// it, which UnicodeMath would hang on whatever follows (`x_≔3` lowering `≔3`).
     fn name(&mut self, name: &str) {
         let mut parts = name.split('_');
         let base = parts.next().unwrap_or_default();
         self.name_piece(base, Kind::Name);
-        let mut open = 0usize;
-        for (i, sub) in parts.enumerate() {
-            if i == 0 {
+        let subs: Vec<&str> = parts.filter(|p| !p.is_empty()).collect();
+        match subs.as_slice() {
+            [] => {}
+            [sub] => {
                 self.text("_");
-            } else {
-                self.text("_(");
-                open += 1;
+                self.name_piece(sub, sub_kind(sub));
             }
-            let kind = if sub.chars().count() >= 2 { Kind::Upright } else { Kind::Name };
-            self.name_piece(sub, kind);
-        }
-        for _ in 0..open {
-            self.text(")");
+            _ => {
+                for sub in &subs {
+                    self.text("_(");
+                    self.name_piece(sub, sub_kind(sub));
+                }
+                for _ in &subs {
+                    self.text(")");
+                }
+            }
         }
     }
+}
+
+/// A subscript of two or more characters is upright (`σ_max`); a one-letter one is a symbol.
+fn sub_kind(sub: &str) -> Kind {
+    if sub.chars().count() >= 2 { Kind::Upright } else { Kind::Name }
 }
 
 /// One step of writing an expression, so deep trees are written without recursion.
@@ -431,7 +451,15 @@ fn write_expr(root: &Expr, out: &mut Out) {
                 Op::Pow => {
                     wrap(&mut todo, b, !exponent_simple(b));
                     todo.push(Step::Text("^"));
-                    wrap(&mut todo, a, !base_simple(a));
+                    if base_simple(a) && matches!(&**a, Expr::Num(_)) && num_text_len(a) > 1 {
+                        // UnicodeMath raises only a number's last digit (`25^2` is 2·5²); invisible
+                        // brackets make the whole number the base.
+                        todo.push(Step::Text(INVISIBLE_CLOSE));
+                        todo.push(Step::Expr(a));
+                        todo.push(Step::Text(INVISIBLE_OPEN));
+                    } else {
+                        wrap(&mut todo, a, !base_simple(a));
+                    }
                 }
             },
         }
@@ -452,9 +480,17 @@ fn num_text(v: f64) -> String {
     }
     let repr = format!("{v:e}");
     match repr.split_once('e') {
-        Some((mantissa, exp)) if exp.starts_with('-') => format!("{mantissa}×10^({exp})"),
-        Some((mantissa, exp)) => format!("{mantissa}×10^{exp}"),
+        Some((mantissa, exp)) if exp.starts_with('-') => format!("{mantissa}×{TEN}^({exp})"),
+        Some((mantissa, exp)) => format!("{mantissa}×{TEN}^{exp}"),
         None => repr,
+    }
+}
+
+/// Characters in a number's text.
+fn num_text_len(e: &Expr) -> usize {
+    match e {
+        Expr::Num(v) => num_text(*v).chars().count(),
+        _ => 0,
     }
 }
 
@@ -488,12 +524,10 @@ fn piece_run(piece: &Piece, prev: Option<char>, pieces: &[Piece], template: &MRu
     }
 }
 
-/// Replace each sentinel in the tree with a run of its text. The tree comes from
+/// Replace each sentinel in the tree with a run of its text, and take a script's base out of the
+/// invisible brackets that kept it whole. The tree comes from
 /// [`parse_linear`], which caps its depth, so recursing over it is bounded.
 fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
-    if pieces.is_empty() {
-        return arg;
-    }
     let mut out: Arg = Vec::with_capacity(arg.len());
     for node in arg {
         match node {
@@ -524,6 +558,13 @@ fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
                     _ => None,
                 };
                 let mut base = restore_pieces(base, pieces);
+                // A base in invisible brackets (`〖25〗^2`) is the bracketed content itself.
+                if let [MNode::Delim { beg: None, end: None, elems, .. }] = base.as_mut_slice()
+                    && elems.len() == 1
+                    && let Some(inner) = elems.pop()
+                {
+                    base = inner;
+                }
                 if unit_base
                     && needs_space(prev, pieces)
                     && let Some(MNode::Run(r)) = base.first_mut()

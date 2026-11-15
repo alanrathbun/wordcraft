@@ -491,7 +491,7 @@ fn mark_stale_greys_results_with_approx() {
     assert!(matches!(region(&d, 4).0.state, CalcState::Error(_)));
     // Exponential results survive the round trip through the display.
     let (_, big, _) = region(&d, 5);
-    assert!(big.contains('≈') && big.contains("6×10^6") && !big.contains('='), "{big}");
+    assert!(big.contains('≈') && big.contains("6×〖10〗^6") && !big.contains('='), "{big}");
     // Recalculating makes them current again.
     recalc(&mut d, &no_page);
     assert_eq!(region(&d, 3).0.state, CalcState::Fresh);
@@ -558,9 +558,12 @@ fn display_renders_from_the_syntax_tree() {
     assert_eq!(render::display("z := x^0.5", None, &CalcState::Fresh), "z≔x^(0.5)");
     assert_eq!(render::display("z := |a - b|", None, &CalcState::Fresh), "z≔|a-b|");
     assert_eq!(render::display("z := sin(θ) + max(a, b)", None, &CalcState::Fresh), "z≔sin(θ)+max((a,b))");
-    assert_eq!(render::display("z := 1e300", None, &CalcState::Fresh), "z≔1×10^300");
-    assert_eq!(render::display("z := 1.5e-7 m", None, &CalcState::Fresh), "z≔1.5×10^(-7) \"m\"");
-    assert_eq!(render::display("z := 1.5×10^-5 m =", Some(&f("1.5×10^-5", "m")), &CalcState::Fresh).rsplit('=').next(), Some("1.5×10^(-5) \"m\""));
+    assert_eq!(render::display("z := 1e300", None, &CalcState::Fresh), "z≔1×〖10〗^300");
+    assert_eq!(render::display("z := 1.5e-7 m", None, &CalcState::Fresh), "z≔1.5×〖10〗^(-7) \"m\"");
+    assert_eq!(
+        render::display("z := 1.5×10^-5 m =", Some(&f("1.5×10^-5", "m")), &CalcState::Fresh).rsplit('=').next(),
+        Some("1.5×〖10〗^(-5) \"m\"")
+    );
 }
 
 #[test]
@@ -637,6 +640,37 @@ fn function_calls_show_the_structure_that_was_evaluated() {
     assert_eq!(text_of(&tree("xmax(t) + 1")), "xmax(t)+1");
     assert_eq!(text_of(&tree("f_max(t)")), "{f}_{max}^{}(t)");
     assert_eq!(text_of(&tree("σ_max + len")), "{σ}_{max}^{}+len");
+}
+
+#[test]
+fn a_number_base_is_raised_whole() {
+    assert_eq!(text_of(&tree("25^2")), "{25}_{}^{2}");
+    assert_eq!(text_of(&tree("1.5^2")), "{1.5}_{}^{2}");
+    assert_eq!(text_of(&tree("2^3")), "{2}_{}^{3}");
+    assert_eq!(text_of(&tree("1e300")), "1×{10}_{}^{300}");
+    // A result shown in exponential form.
+    let mut d = doc_with(&["big := 6000000 ="]);
+    recalc(&mut d, &no_page);
+    let (_, linear, math) = region(&d, 1);
+    assert_eq!(linear, "big≔6000000=6×〖10〗^6");
+    let shown: String = text_of(&math.nodes);
+    assert!(shown.ends_with("=6×{10}_{}^{6}"), "{shown}");
+    // It reads back for the stale display.
+    mark_stale(&mut d);
+    assert_eq!(region(&d, 1).1, "big≔6000000≈6×〖10〗^6");
+}
+
+#[test]
+fn names_with_several_or_empty_subscripts() {
+    assert_eq!(text_of(&tree("a_b_c")), "{a}_{{b}_{c}^{}}^{}");
+    assert_eq!(render::display("z := a_b_c", None, &CalcState::Fresh), "z≔a_(b_(c))");
+    // Empty parts show as nothing, never a dangling `_`.
+    assert_eq!(text_of(&tree("a__b + 1")), "{a}_{b}^{}+1");
+    assert_eq!(render::display("x_ := 3", None, &CalcState::Fresh), "x≔3");
+    let mut d = doc_with(&["x_ := 3 ="]);
+    recalc(&mut d, &no_page);
+    let (_, _, math) = region(&d, 1);
+    assert_eq!(text_of(&math.nodes), "x≔3=3");
 }
 
 #[test]
