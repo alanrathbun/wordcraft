@@ -223,16 +223,23 @@ pub(crate) struct Found {
 /// The calculation regions and quoted values of the body, in document order.
 pub(crate) fn collect(body: &Blocks) -> Found {
     let mut found = Found::default();
-    for (i, b) in body.iter().enumerate() {
+    walk_paras(body, &mut |path, p| visit(path, p, &mut found));
+    found
+}
+
+/// Every paragraph of `blocks` in document order (table cells row by row, to any depth), with its
+/// path: block index, then row, cell and block index for each table level.
+fn walk_paras<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&[u32], &'a Paragraph)) {
+    for (i, b) in blocks.iter().enumerate() {
         let top = u32::try_from(i).unwrap_or(u32::MAX);
         match &**b {
-            Block::Para(p) => visit(&[top], p, &mut found),
+            Block::Para(p) => f(&[top], p),
             Block::Table(_) => {
                 // An explicit stack, last first, so cells come off it row by row.
                 let mut todo: Vec<(&Block, Vec<u32>)> = vec![(&**b, vec![top])];
                 while let Some((b, path)) = todo.pop() {
                     match b {
-                        Block::Para(p) => visit(&path, p, &mut found),
+                        Block::Para(p) => f(&path, p),
                         Block::Table(t) => {
                             for (r, row) in t.rows.iter().enumerate().rev() {
                                 for (c, cell) in row.cells.iter().enumerate().rev() {
@@ -249,18 +256,87 @@ pub(crate) fn collect(body: &Blocks) -> Found {
             }
         }
     }
-    found
+}
+
+/// Whether `o` is a calculation region or a quoted value (`WCCALC` field; the field type is the
+/// whole first word of its code).
+pub fn is_calc_object(o: &InlineObject) -> bool {
+    match o {
+        InlineObject::Equation { calc, .. } => calc.is_some(),
+        InlineObject::Field { instr, .. } => {
+            let code = instr.trim_start();
+            code.get(..calc::CALC_FIELD.len()).is_some_and(|w| w.eq_ignore_ascii_case(calc::CALC_FIELD))
+                && code.get(calc::CALC_FIELD.len()..).is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace))
+        }
+        _ => false,
+    }
+}
+
+/// What a calculation outside the main text says instead of a result.
+pub const NOT_CALCULATED_HERE: &str = "not calculated here";
+
+/// Calculations live in the main text and its tables only. One that lands anywhere else — pasted
+/// into a text box, header, footer, note or comment, or read from a file that has it there — is
+/// never recalculated, so it must not look current:
+///
+/// - a calculation region becomes a plain equation showing its calculation with no result, then
+///   a red `⚠` and "not calculated here";
+/// - a quoted value (`WCCALC` field) shows `?`.
+///
+/// Returns how many objects it changed. Paragraphs with nothing to change are not copied.
+pub fn freeze_outside_body(doc: &mut Document) -> usize {
+    let mut todo: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (&id, part) in &doc.parts {
+        walk_paras(&part.blocks, &mut |path, p| {
+            if p.objects.iter().any(|o| needs_freezing(o)) {
+                todo.push((id, path.to_vec()));
+            }
+        });
+    }
+    let mut changed = 0;
+    for (id, path) in todo {
+        let Some(part) = doc.parts.get_mut(&id) else { continue };
+        let Some(p) = para_mut(&mut part.blocks, &path) else { continue };
+        for o in &mut p.objects {
+            if needs_freezing(o) {
+                freeze(o);
+                changed += 1;
+            }
+        }
+        p.touch();
+    }
+    changed
+}
+
+/// Whether [`freeze_outside_body`] has anything to do to `o`.
+fn needs_freezing(o: &InlineObject) -> bool {
+    match o {
+        InlineObject::Equation { calc, .. } => calc.is_some(),
+        InlineObject::Field { result, dirty, .. } => is_calc_object(o) && (result != "?" || *dirty),
+        _ => false,
+    }
+}
+
+fn freeze(o: &mut InlineObject) {
+    match o {
+        InlineObject::Equation { linear, math, calc, .. } => {
+            let Some(region) = calc.take() else { return };
+            let state = CalcState::Error(NOT_CALCULATED_HERE.to_string());
+            let mut display = rendered(&parse(&region.source), &region.source, None, &state);
+            render::push_note(&mut display, NOT_CALCULATED_HERE);
+            *linear = display.linear;
+            set_nodes(math, display.math);
+        }
+        InlineObject::Field { result, dirty, .. } => {
+            *result = "?".to_string();
+            *dirty = false;
+        }
+        _ => {}
+    }
 }
 
 fn visit(path: &[u32], p: &Paragraph, found: &mut Found) {
-    let relevant = |o: &InlineObject| match o {
-        InlineObject::Equation { calc, .. } => calc.is_some(),
-        InlineObject::Field { instr, .. } => {
-            instr.trim_start().get(..calc::CALC_FIELD.len()).is_some_and(|w| w.eq_ignore_ascii_case(calc::CALC_FIELD))
-        }
-        _ => false,
-    };
-    if !p.objects.iter().any(relevant) {
+    if !p.objects.iter().any(is_calc_object) {
         return;
     }
     // Object k sits at the k-th object character; one past them is shown nowhere.

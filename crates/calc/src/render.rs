@@ -106,6 +106,12 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
     Rendered { linear, math }
 }
 
+/// A short red note after a display, upright (`⚠ not calculated here`).
+pub(crate) fn push_note(display: &mut Rendered, note: &str) {
+    display.linear.push_str(&format!(" \"{note}\""));
+    display.math.push(MNode::Run(MRun { text: format!("{THIN_SPACE}{note}"), sty: Some(MSty::Plain), color: Some(ERROR_RED), ..MRun::default() }));
+}
+
 /// The mark run after an equation edited outside WordCraft.
 fn edited_run() -> MNode {
     MNode::Run(MRun { text: EDITED_MARK.to_string(), sty: Some(MSty::Plain), color: Some(EDITED_AMBER), ..MRun::default() })

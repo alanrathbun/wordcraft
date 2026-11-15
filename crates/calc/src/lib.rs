@@ -23,7 +23,7 @@ pub mod render;
 pub use ast::{Expr, Op, Show, Stmt, defined_name, free_names};
 pub use eval::{Env, check_name, eval_expr, run_stmt};
 pub use parse::parse;
-pub use recalc::{RecalcReport, check_new_name, defined_names, mark_stale, recalc};
+pub use recalc::{NOT_CALCULATED_HERE, RecalcReport, check_new_name, defined_names, freeze_outside_body, is_calc_object, mark_stale, recalc};
 
 /// An error from parsing or evaluating a calculation. The message is shown to the author next to
 /// the calculation, so it is written for them rather than for a programmer.

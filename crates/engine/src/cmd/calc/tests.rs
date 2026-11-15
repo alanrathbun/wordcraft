@@ -699,3 +699,110 @@ fn keeping_words_equation_drops_the_mark() {
     assert_eq!(plain, ["P≔2000 \"lbf\""]);
     assert_eq!(region(&s, sigma).0.state, CalcState::Error("P isn't defined".into()));
 }
+
+/// Every equation and field in the stories other than the body.
+fn objects_outside_body(doc: &Document) -> Vec<InlineObject> {
+    let mut out = Vec::new();
+    for k in doc.parts.keys() {
+        let story = wordcraft_doc::StoryRef::Part(*k);
+        for path in doc.para_paths(story) {
+            if let Some(p) = doc.para(story, &path) {
+                out.extend(p.objects.iter().cloned());
+            }
+        }
+    }
+    out
+}
+
+/// Copies the one object of body paragraph `block` (a calculation or a quoted value).
+fn copy_object(s: &mut Session, block: usize) {
+    run(s, "select.range", json!({"anchor": {"block": block, "off": 0}, "focus": {"block": block, "off": 3}}));
+    run(s, "edit.copy", json!({}));
+}
+
+/// Nothing outside the body shows a number: no calculation, and every quoted value `?`.
+fn assert_nothing_live_outside_body(s: &Session, what: &str) {
+    let outside = objects_outside_body(&s.doc);
+    let mut seen = 0;
+    for o in &outside {
+        match o {
+            InlineObject::Equation { calc, linear, .. } => {
+                assert!(calc.is_none(), "{what}: a calculation outside the body: {linear}");
+                if linear.contains("not calculated here") {
+                    assert!(!linear.contains("psi") && !linear.contains('='), "{what}: {linear}");
+                    seen += 1;
+                }
+            }
+            InlineObject::Field { result, instr, .. } if instr.starts_with("WCCALC") => {
+                assert_eq!(result, "?", "{what}");
+                seen += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(seen >= 2, "{what}: the pasted calculation and value are there: {outside:?}");
+}
+
+#[test]
+fn calculations_pasted_outside_the_body_never_look_live() {
+    for target in ["textBox", "footnote"] {
+        let mut s = session();
+        let p = calc(&mut s, "P := 1500 lbf");
+        let sigma = calc(&mut s, "σ := P/(2 in^2) =");
+        run(&mut s, "insert.calcValue", json!({"name": "σ"}));
+        assert_eq!(field_results(&s), ["750 psi"]);
+        // The σ region, then the quoted value, into a text box or a footnote.
+        copy_object(&mut s, 1);
+        run(&mut s, "caret.docEnd", json!({}));
+        match target {
+            "textBox" => {
+                run(&mut s, "insert.textBox", json!({}));
+            }
+            _ => {
+                run(&mut s, "references.footnote", json!({}));
+            }
+        }
+        run(&mut s, "edit.paste", json!({}));
+        assert!(s.sel.focus.story != wordcraft_doc::StoryRef::Body, "{target}: pasting outside the body");
+        let story = s.sel.focus.story;
+        // Back to the body to copy the quoted value, then into the same story again.
+        let field_block = s.doc.body.len() - 1;
+        let at_story = s.sel.focus.clone();
+        copy_object(&mut s, field_block);
+        run(&mut s, "caret.set", json!({"pos": at_story}));
+        assert_eq!(s.sel.focus.story, story);
+        run(&mut s, "edit.paste", json!({}));
+        assert_nothing_live_outside_body(&s, target);
+        // The input changes: the body follows, the copies outside still show no number.
+        run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
+        assert!(region(&s, sigma).1.ends_with("=1500 \"psi\""), "{}", region(&s, sigma).1);
+        assert_eq!(field_results(&s), ["1500 psi"]);
+        assert_nothing_live_outside_body(&s, target);
+    }
+}
+
+#[test]
+fn calculations_outside_the_body_are_frozen_on_open() {
+    let mut s = session();
+    sample(&mut s);
+    run(&mut s, "insert.textBox", json!({}));
+    let part = match s.sel.focus.story {
+        wordcraft_doc::StoryRef::Part(k) => k,
+        other => panic!("not in a text box: {other:?}"),
+    };
+    // A hostile native file: a live-looking calculation and quoted value in a text box.
+    let path = s.doc.para_paths(wordcraft_doc::StoryRef::Part(part))[0].clone();
+    let para = s.doc.para_mut(wordcraft_doc::StoryRef::Part(part), &path).unwrap();
+    let eq = InlineObject::Equation {
+        linear: "y≔2=2".into(),
+        display: false,
+        math: Math::default(),
+        calc: Some(Box::new(CalcRegion { id: 99, source: "y := 2 =".into(), unit: None, precision: None, state: CalcState::Fresh })),
+    };
+    let field =
+        InlineObject::Field { instr: "WCCALC σ".into(), result: "600 psi".into(), locked: true, dirty: false, code: false, form: String::new() };
+    para.insert_object(0, eq, &Default::default()).unwrap();
+    para.insert_object(0, field, &Default::default()).unwrap();
+    let back = reopen(&s, "report.json");
+    assert_nothing_live_outside_body(&back, "opened");
+}

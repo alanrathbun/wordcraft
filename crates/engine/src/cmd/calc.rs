@@ -9,8 +9,10 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
-use wordcraft_calc::{CalcError, RecalcReport, check_new_name, defined_name, defined_names, mark_stale, parse, recalc};
-use wordcraft_doc::calc::{CALC_FIELD, CalcRegion, CalcState, UnitSystem, calc_field_instr, parse_calc_field};
+use wordcraft_calc::{
+    CalcError, RecalcReport, check_new_name, defined_name, defined_names, freeze_outside_body, is_calc_object, mark_stale, parse, recalc,
+};
+use wordcraft_doc::calc::{CalcRegion, CalcState, UnitSystem, calc_field_instr, parse_calc_field};
 use wordcraft_doc::math::Math;
 use wordcraft_doc::{Block, Document, InlineObject, Paragraph, Pos, StoryRef};
 
@@ -72,17 +74,24 @@ pub(crate) fn has_calc(doc: &Document) -> bool {
     false
 }
 
-fn is_calc_object(o: &InlineObject) -> bool {
-    match o {
-        InlineObject::Equation { calc, .. } => calc.is_some(),
-        InlineObject::Field { instr, .. } => {
-            // The field type is the whole first word: `WCCALC σ`, not `WCCALCX`.
-            let code = instr.trim_start();
-            code.get(..CALC_FIELD.len()).is_some_and(|w| w.eq_ignore_ascii_case(CALC_FIELD))
-                && code.get(CALC_FIELD.len()..).is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace))
+/// Whether a story other than the body (a header, footer, note, comment or text box) holds a
+/// calculation region or a quoted value: they are never calculated there, so the pass freezes
+/// them ([`wordcraft_calc::freeze_outside_body`]).
+pub(crate) fn parts_have_calc(doc: &Document) -> bool {
+    doc.parts.values().any(|part| {
+        let mut todo: Vec<&Block> = part.blocks.iter().map(|b| &**b).collect();
+        while let Some(b) = todo.pop() {
+            match b {
+                Block::Para(p) => {
+                    if p.objects.iter().any(is_calc_object) {
+                        return true;
+                    }
+                }
+                Block::Table(t) => todo.extend(t.rows.iter().flat_map(|r| r.cells.iter()).flat_map(|c| c.blocks.iter()).map(|b| &**b)),
+            }
         }
-        _ => false,
-    }
+        false
+    })
 }
 
 /// After a successful mutating command, inside its undo step: recalculate, or in manual mode mark
@@ -94,7 +103,11 @@ fn is_calc_object(o: &InlineObject) -> bool {
 /// (if even that works, so no result looks current) and says so in the status line. The edit
 /// itself stands.
 pub(crate) fn after_command(s: &mut Session, id: &str, before: &Document) {
-    if NO_AUTO_PASS.contains(&id) || !has_calc(&s.doc) || s.doc.same_content(before) {
+    if NO_AUTO_PASS.contains(&id) || s.doc.same_content(before) {
+        return;
+    }
+    let (body, outside) = (has_calc(&s.doc), parts_have_calc(&s.doc));
+    if !body && !outside {
         return;
     }
     let manual = s.doc.calc_settings.as_ref().is_some_and(|c| c.manual);
@@ -102,9 +115,12 @@ pub(crate) fn after_command(s: &mut Session, id: &str, before: &Document) {
     let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         tests::maybe_inject_panic();
-        if manual {
+        if outside {
+            freeze_outside_body(&mut s.doc);
+        }
+        if body && manual {
             mark_stale(&mut s.doc);
-        } else {
+        } else if body {
             recalc_now(s);
         }
     }));
@@ -138,7 +154,7 @@ pub(crate) fn take_open_notice() -> Option<String> {
 /// message for the status line ([`take_open_notice`]).
 pub(crate) fn after_open(doc: &mut Document) {
     let store = doc.calc_store.take();
-    if store.is_none() && !has_calc(doc) && !wordcraft_calc::docx::has_calc_controls(doc) {
+    if store.is_none() && !has_calc(doc) && !wordcraft_calc::docx::has_calc_controls(doc) && !parts_have_calc(doc) {
         return;
     }
     let had_store = store.is_some();
@@ -146,6 +162,7 @@ pub(crate) fn after_open(doc: &mut Document) {
     let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         tests::maybe_inject_panic();
+        freeze_outside_body(doc);
         wordcraft_calc::docx::import(doc, store)
     }));
     let panic = match pass {
