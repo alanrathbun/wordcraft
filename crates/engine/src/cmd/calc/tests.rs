@@ -5,6 +5,18 @@ use wordcraft_doc::{Block, Document, InlineObject, Pos};
 
 use crate::{Session, catalog};
 
+thread_local! {
+    /// Makes the automatic pass panic, to test that the panic is contained.
+    static INJECT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Called at the start of the automatic pass in test builds.
+pub(super) fn maybe_inject_panic() {
+    if INJECT_PANIC.with(std::cell::Cell::get) {
+        std::panic::resume_unwind(Box::new("injected failure"));
+    }
+}
+
 fn session() -> Session {
     let mut s = Session::new(Document::new());
     s.run("document.setText", &json!({"text": ""})).unwrap();
@@ -347,4 +359,143 @@ fn catalog_has_calc_commands() {
     for id in ["calc.setSource", "calc.names", "calc.checkName", "calc.resolveEdited"] {
         assert!(reg.get(id).is_some(), "{id} registered");
     }
+}
+
+/// The region `id`'s equation in the body, to change behind the calculator's back.
+fn edit_outside(s: &mut Session, id: u64, shown: &str) {
+    for path in s.doc.para_paths(wordcraft_doc::StoryRef::Body) {
+        let para = s.doc.para_mut(wordcraft_doc::StoryRef::Body, &path).unwrap();
+        for o in para.objects.iter_mut() {
+            if let InlineObject::Equation { linear, calc: Some(c), .. } = o
+                && c.id == id
+            {
+                *linear = shown.into();
+                c.state = CalcState::EditedOutside;
+            }
+        }
+    }
+}
+
+#[test]
+fn calculation_outside_the_body_is_refused() {
+    let mut s = session();
+    sample(&mut s);
+    run(&mut s, "insert.editHeader", json!({}));
+    let before = s.doc.clone();
+    let e = s.run("insert.calculation", &json!({"source": "h := 1 in"})).unwrap_err();
+    assert!(e.to_string().contains("body"), "{e}");
+    assert!(s.doc.same_content(&before));
+}
+
+#[test]
+fn a_panic_in_the_pass_is_contained() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    INJECT_PANIC.with(|c| c.set(true));
+    let r = s.run("calc.setSource", &json!({"id": p, "source": "P := 3000 lbf"}));
+    INJECT_PANIC.with(|c| c.set(false));
+    // The edit stands, no result looks current, and the status line says why.
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(region(&s, p).0.source, "P := 3000 lbf");
+    let (r, linear) = region(&s, sigma);
+    assert_eq!(r.state, CalcState::Stale);
+    assert!(linear.contains('≈'), "{linear}");
+    assert!(s.status.contains("injected failure"), "{}", s.status);
+    // The next edit recalculates.
+    run(&mut s, "text.insert", json!({"text": "x"}));
+    assert!(region(&s, sigma).1.ends_with("=1200 \"psi\""), "{}", region(&s, sigma).1);
+}
+
+#[test]
+fn set_source_drops_a_result_typed_outside() {
+    let mut s = session();
+    let (_, _, sigma) = sample(&mut s);
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    edit_outside(&mut s, sigma, "σ=999 \"psi\"");
+    run(&mut s, "calc.setSource", json!({"id": sigma, "source": "σ := P/A_b = ? ksi"}));
+    let (r, linear) = region(&s, sigma);
+    assert_eq!(r.state, CalcState::Stale);
+    assert!(!linear.contains("999"), "{linear}");
+}
+
+#[test]
+fn check_name_wants_one_plain_name() {
+    let mut s = session();
+    sample(&mut s);
+    for name in ["f(x)", "a b", "", "  ", "x := 2"] {
+        let r = run(&mut s, "calc.checkName", json!({"name": name}));
+        assert_eq!(r["ok"], json!(false), "{name}: {r}");
+        assert_eq!(r["reason"], json!("reserved"), "{name}: {r}");
+    }
+    assert_eq!(run(&mut s, "calc.checkName", json!({"name": " q "})), json!({"ok": true}));
+}
+
+#[test]
+fn a_pasted_copy_is_found_by_its_recalculated_id_in_manual_mode() {
+    let mut s = session();
+    let (_, _, sigma) = sample(&mut s);
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    // A pasted copy of σ's equation, renamed, keeping σ's id (manual mode doesn't renumber it).
+    let end = s.doc.end_of(wordcraft_doc::StoryRef::Body);
+    let copy = InlineObject::Equation {
+        linear: String::new(),
+        display: true,
+        math: Math::default(),
+        calc: Some(Box::new(CalcRegion { id: sigma, source: "τ := 2*P/A_b =".into(), unit: None, precision: None, state: CalcState::Fresh })),
+    };
+    s.doc.insert_object(&end, copy, &Default::default()).unwrap();
+    run(&mut s, "text.insert", json!({"text": "x"}));
+    let names = run(&mut s, "calc.names", json!({}));
+    let tau = names["names"].as_array().unwrap().iter().find(|n| n["name"] == "τ").unwrap()["id"].as_u64().unwrap();
+    assert_ne!(tau, sigma);
+    run(&mut s, "calc.setSource", json!({"id": tau, "source": "τ := 3*P/A_b ="}));
+    let sources: Vec<String> = regions(&s).into_iter().map(|(r, _)| r.source).collect();
+    assert!(sources.contains(&"σ := P/A_b =".to_string()), "{sources:?}");
+    assert!(sources.contains(&"τ := 3*P/A_b =".to_string()), "{sources:?}");
+    // The copy's own name is its own; σ's isn't.
+    assert_eq!(run(&mut s, "calc.checkName", json!({"name": "τ", "id": tau})), json!({"ok": true}));
+    assert!(s.run("calc.setSource", &json!({"id": tau, "source": "σ := 1"})).is_err());
+    // A new region's id is no region's id now.
+    let next = calc(&mut s, "z := 1");
+    assert!(next > tau, "{next} {tau}");
+}
+
+#[test]
+fn a_tracked_deletion_is_no_region() {
+    let mut s = session();
+    let (p, _, _) = sample(&mut s);
+    run(&mut s, "review.trackChanges", json!({"value": true}));
+    run(&mut s, "caret.docStart", json!({}));
+    run(&mut s, "select.paragraph", json!({}));
+    run(&mut s, "text.delete", json!({}));
+    assert!(s.run("calc.setSource", &json!({"id": p, "source": "P := 1 lbf"})).is_err(), "P is deleted");
+}
+
+#[test]
+fn wrong_typed_optional_parameters_are_refused() {
+    let mut s = session();
+    sample(&mut s);
+    assert!(s.run("insert.calculation", &json!({"source": "q := 1", "display": "yes"})).is_err());
+    assert!(s.run("insert.calcValue", &json!({"name": "P", "unit": 5})).is_err());
+    assert!(s.run("insert.calcValue", &json!({"name": "P", "precision": "2"})).is_err());
+    assert!(s.run("calc.checkName", &json!({"name": "P", "id": "x"})).is_err());
+}
+
+#[test]
+fn only_a_wccalc_field_counts() {
+    let mut s = session();
+    let field = |instr: &str| InlineObject::Field {
+        instr: instr.into(),
+        result: String::new(),
+        locked: true,
+        dirty: false,
+        code: false,
+        form: String::new(),
+    };
+    let at = s.doc.end_of(wordcraft_doc::StoryRef::Body);
+    s.doc.insert_object(&at, field("WCCALCX y"), &Default::default()).unwrap();
+    assert!(!super::has_calc(&s.doc));
+    let at = s.doc.end_of(wordcraft_doc::StoryRef::Body);
+    s.doc.insert_object(&at, field(" wccalc y"), &Default::default()).unwrap();
+    assert!(super::has_calc(&s.doc));
 }

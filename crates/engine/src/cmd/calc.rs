@@ -75,7 +75,12 @@ pub(crate) fn has_calc(doc: &Document) -> bool {
 fn is_calc_object(o: &InlineObject) -> bool {
     match o {
         InlineObject::Equation { calc, .. } => calc.is_some(),
-        InlineObject::Field { instr, .. } => instr.trim_start().get(..CALC_FIELD.len()).is_some_and(|w| w.eq_ignore_ascii_case(CALC_FIELD)),
+        InlineObject::Field { instr, .. } => {
+            // The field type is the whole first word: `WCCALC σ`, not `WCCALCX`.
+            let code = instr.trim_start();
+            code.get(..CALC_FIELD.len()).is_some_and(|w| w.eq_ignore_ascii_case(CALC_FIELD))
+                && code.get(CALC_FIELD.len()..).is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace))
+        }
         _ => false,
     }
 }
@@ -83,15 +88,33 @@ fn is_calc_object(o: &InlineObject) -> bool {
 /// After a successful mutating command, inside its undo step: recalculate, or in manual mode mark
 /// the results stale. Skipped when the command changed nothing (it stays a no-op) and when the
 /// document has no calculations.
+///
+/// The pass reads file content, so it runs inside its own `catch_unwind` (the command's has
+/// already returned): a panic puts the document back as the command left it, greys every result
+/// (if even that works, so no result looks current) and says so in the status line. The edit
+/// itself stands.
 pub(crate) fn after_command(s: &mut Session, id: &str, before: &Document) {
     if NO_AUTO_PASS.contains(&id) || !has_calc(&s.doc) || s.doc.same_content(before) {
         return;
     }
-    if s.doc.calc_settings.as_ref().is_some_and(|c| c.manual) {
-        mark_stale(&mut s.doc);
-    } else {
-        recalc_now(s);
+    let manual = s.doc.calc_settings.as_ref().is_some_and(|c| c.manual);
+    let saved = s.doc.clone();
+    let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        tests::maybe_inject_panic();
+        if manual {
+            mark_stale(&mut s.doc);
+        } else {
+            recalc_now(s);
+        }
+    }));
+    let Err(panic) = pass else { return };
+    let message = panic.downcast_ref::<&str>().map(ToString::to_string).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
+    s.doc = saved.clone();
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mark_stale(&mut s.doc))).is_err() {
+        s.doc = saved;
     }
+    s.status = format!("Calculations couldn't be updated: {message}");
 }
 
 /// Recalculate the document. A duplicate-name message names the page of the first definition,
@@ -105,7 +128,7 @@ pub(crate) fn recalc_now(s: &mut Session) -> RecalcReport {
     recalc(&mut s.doc, &|id| pages.get(&id).copied())
 }
 
-/// Whether two body regions define the same name.
+/// Whether two (live) body regions define the same name.
 fn repeats_a_name(doc: &Document) -> bool {
     let mut seen = HashSet::new();
     body_regions(doc).iter().any(|(_, c)| parse(&c.source).ok().is_some_and(|stmt| defined_name(&stmt).is_some_and(|n| !seen.insert(n.to_string()))))
@@ -130,22 +153,58 @@ fn region_pages(s: &mut Session) -> HashMap<u64, u32> {
 // Finding regions
 // ---------------------------------------------------------------------------------------------
 
-/// Every calculation region in the body (table cells included), in document order, with where
-/// its equation sits.
+/// Every live calculation region in the body (table cells included, tracked deletions left out),
+/// in document order, with where its equation sits, and with the id recalculation gives it: the
+/// first region with an id keeps it, a later one with the same id (a pasted copy not yet
+/// recalculated, as in manual mode) gets the next id above every id in the body, deleted ones
+/// included — the same ids as `wordcraft_calc::defined_names` and `check_new_name` use.
 fn body_regions(doc: &Document) -> Vec<(Pos, CalcRegion)> {
-    let mut out = Vec::new();
+    let mut live = Vec::new();
+    let mut used: HashSet<u64> = HashSet::new();
     for path in doc.para_paths(StoryRef::Body) {
         let Some(para) = doc.para(StoryRef::Body, &path) else { continue };
+        if !para.objects.iter().any(|o| matches!(o, InlineObject::Equation { calc: Some(_), .. })) {
+            continue;
+        }
+        let deleted = para.deleted_ranges();
         for (off, o) in para.objects_with_offsets() {
             if let InlineObject::Equation { calc: Some(c), .. } = o {
-                out.push((Pos { story: StoryRef::Body, path: path.clone(), off }, (**c).clone()));
+                used.insert(c.id);
+                if !deleted.iter().any(|r| r.contains(&off)) {
+                    live.push((Pos { story: StoryRef::Body, path: path.clone(), off }, (**c).clone()));
+                }
             }
         }
     }
-    out
+    let mut next = used.iter().max().and_then(|m| m.checked_add(1));
+    let mut probe: u64 = 0;
+    let mut seen: HashSet<u64> = HashSet::new();
+    for (_, c) in &mut live {
+        if seen.insert(c.id) {
+            continue;
+        }
+        let id = match next {
+            Some(n) => {
+                next = n.checked_add(1);
+                n
+            }
+            // The top of the range is taken: the lowest free id (there are far fewer regions
+            // than ids, so one is found).
+            None => {
+                while used.contains(&probe) {
+                    probe = probe.saturating_add(1);
+                }
+                probe
+            }
+        };
+        used.insert(id);
+        seen.insert(id);
+        c.id = id;
+    }
+    live
 }
 
-/// Where the region `id` sits: the first in document order with that id.
+/// Where the region `id` (as recalculation numbers it) sits.
 fn find_region(doc: &Document, id: u64) -> Result<Pos, CmdError> {
     body_regions(doc).into_iter().find(|(_, c)| c.id == id).map(|(at, _)| at).ok_or_else(|| CmdError::Failed(format!("there's no calculation {id}")))
 }
@@ -159,11 +218,11 @@ fn region_mut<'a>(s: &'a mut Session, at: &Pos) -> Result<(&'a mut Paragraph, us
     Ok((para, at.off))
 }
 
-/// A new region's id: one more than any id in the document (every story, deleted ones too), so
-/// no id is ever reused.
+/// A new region's id: one more than any id in the document (every story, deleted ones too) and
+/// than any id a pasted copy is known by, so it is no region's id now.
 fn fresh_id(doc: &Document) -> Result<u64, CmdError> {
     let stories = std::iter::once(StoryRef::Body).chain(doc.parts.keys().map(|k| StoryRef::Part(*k)));
-    let mut max: Option<u64> = None;
+    let mut max: Option<u64> = body_regions(doc).iter().map(|(_, c)| c.id).max();
     for story in stories {
         for path in doc.para_paths(story) {
             let Some(para) = doc.para(story, &path) else { continue };
@@ -194,6 +253,31 @@ fn opt_u64(v: &Value, k: &str) -> Result<Option<u64>, CmdError> {
         None | Some(Value::Null) => Ok(None),
         Some(x) => x.as_u64().map(Some).ok_or_else(|| CmdError::Params(format!("`{k}` must be a whole number"))),
     }
+}
+
+/// An optional string parameter: absent or null is `None`, anything else must be a string.
+fn opt_str<'a>(v: &'a Value, k: &str) -> Result<Option<&'a str>, CmdError> {
+    match v.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => x.as_str().map(Some).ok_or_else(|| CmdError::Params(format!("`{k}` must be a string"))),
+    }
+}
+
+/// An optional true/false parameter: absent or null is `None`, anything else must be a bool.
+fn opt_bool(v: &Value, k: &str) -> Result<Option<bool>, CmdError> {
+    match v.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => x.as_bool().map(Some).ok_or_else(|| CmdError::Params(format!("`{k}` is true or false"))),
+    }
+}
+
+/// Stage 1 recalculates the main text and its tables only: calculations and quoted values go
+/// nowhere else (headers, footers, notes, comments and text boxes are other stories).
+fn require_body(s: &Session, id: &str) -> Result<(), CmdError> {
+    if s.sel.focus.story != StoryRef::Body || s.sel.anchor.story != StoryRef::Body {
+        return Err(CmdError::Disabled(format!("{id}: calculations go in the document body (its text or a table in it)")));
+    }
+    Ok(())
 }
 
 fn precision_param(v: &Value) -> Result<Option<u8>, CmdError> {
@@ -240,6 +324,8 @@ fn check_source_name(doc: &Document, source: &str, editing: Option<u64>) -> Resu
 /// automatic pass that follows.
 fn insert_calculation(s: &mut Session, v: &Value) -> CmdResult {
     let source = source_param(v)?.to_string();
+    let display = opt_bool(v, "display")?;
+    require_body(s, "insert.calculation")?;
     check_source_name(&s.doc, &source, None)?;
     let id = fresh_id(&s.doc)?;
     s.math = None;
@@ -247,7 +333,7 @@ fn insert_calculation(s: &mut Session, v: &Value) -> CmdResult {
     let at = delete_selection(s)?;
     // On an empty line it's a display equation, in text an inline one.
     let empty_line = s.doc.para_at(&at).is_none_or(|p| p.text.trim().is_empty());
-    let display = p::bool(v, "display").unwrap_or(empty_line);
+    let display = display.unwrap_or(empty_line);
     let region = CalcRegion { id, source, unit: None, precision: None, state: CalcState::Fresh };
     let obj = InlineObject::Equation { linear: String::new(), display, math: Math::default(), calc: Some(Box::new(region)) };
     let end = s.doc.insert_object(&at, obj, &props)?;
@@ -264,7 +350,14 @@ fn set_source(s: &mut Session, v: &Value) -> CmdResult {
     let at = find_region(&s.doc, id)?;
     check_source_name(&s.doc, &source, Some(id))?;
     let (para, off) = region_mut(s, &at)?;
-    if let Some(InlineObject::Equation { calc: Some(c), .. }) = para.object_at_mut(off) {
+    if let Some(InlineObject::Equation { linear, math, calc: Some(c), .. }) = para.object_at_mut(off) {
+        // What was typed outside the calculator goes with it: no copy of it can show (stale) in
+        // manual mode.
+        if c.state == CalcState::EditedOutside {
+            linear.clear();
+            math.nodes.clear();
+            math.omml.clear();
+        }
         c.source = source;
         c.state = CalcState::Fresh;
     }
@@ -276,11 +369,9 @@ fn set_source(s: &mut Session, v: &Value) -> CmdResult {
 /// date in the main text and its tables only, so it is refused anywhere else.
 fn insert_value(s: &mut Session, v: &Value) -> CmdResult {
     let name = name_param(v)?.to_string();
-    let unit = p::str(v, "unit").map(str::trim).filter(|u| !u.is_empty()).map(str::to_string);
+    let unit = opt_str(v, "unit")?.map(str::trim).filter(|u| !u.is_empty()).map(str::to_string);
     let precision = precision_param(v)?;
-    if s.sel.focus.story != StoryRef::Body || s.sel.anchor.story != StoryRef::Body {
-        return Err(CmdError::Disabled("insert.calcValue: a calculated value goes in the document body (its text or a table in it)".into()));
-    }
+    require_body(s, "insert.calcValue")?;
     if !defined_names(&s.doc).iter().any(|(n, _)| *n == name) {
         return Err(CmdError::Failed(format!("{name} isn't a defined variable")));
     }
@@ -310,8 +401,10 @@ fn check(s: &mut Session, v: &Value) -> CmdResult {
     let name = name_param(v)?;
     let editing = opt_u64(v, "id")?;
     // The name as the parser reads it: anything that isn't a single name is refused.
+    let name = name.trim();
     let parsed = parse(&format!("{name} := 0")).ok().and_then(|stmt| defined_name(&stmt).map(str::to_string));
-    let Some(parsed) = parsed.filter(|_| !name.trim().is_empty()) else {
+    // Exactly one plain name: `f(x)` defines `f` and is no name.
+    let Some(parsed) = parsed.filter(|n| !name.is_empty() && n == name) else {
         let message = wordcraft_calc::check_name(name).err().map_or_else(|| format!("{name} isn't a valid name"), |e| e.to_string());
         return Ok(json!({"ok": false, "reason": "reserved", "message": message}));
     };
