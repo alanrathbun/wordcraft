@@ -15,7 +15,7 @@ use wordcraft_doc::math::Arg;
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph};
 
-use crate::render::{Rendered, rendered, shown_result, shows_value};
+use crate::render::{self, Rendered, rendered, shown_result, shows_value};
 use crate::{CalcError, Env, Expr, Stmt, check_name, defined_name, eval_expr, free_names, parse, run_stmt};
 
 /// What a [`recalc`] pass did.
@@ -27,6 +27,8 @@ pub struct RecalcReport {
     pub errors: usize,
     /// Regions given a new id because an earlier region already had theirs (a copy and paste).
     pub reassigned_ids: usize,
+    /// Regions edited outside WordCraft ([`CalcState::EditedOutside`]) waiting to be resolved.
+    pub edited: usize,
 }
 
 /// Most names a circular-definition message lists.
@@ -42,7 +44,10 @@ const MAX_CYCLE_NAMES: usize = 5;
 ///    constant name is a reserved-name error. Neither defines anything.
 /// 4. Evaluates in dependency order. Regions on a cycle are circular errors and every region that
 ///    depends on a failed name is an upstream error.
-/// 5. Rewrites each region's displayed result (regions edited outside the calculator keep theirs).
+/// 5. Rewrites each region's displayed result. A region edited outside the calculator keeps what
+///    it shows, with the edited mark after it ([`render::mark_edited`]); it defines nothing, so
+///    every region that uses its name is an error ("depends on a calculation edited in Word")
+///    and every quoted value of it shows `?`.
 /// 6. Rewrites the result of every `WCCALC` field quoting a value; one with no valid value
 ///    shows `?`.
 ///
@@ -66,12 +71,19 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
 
     let sys = unit_system(&settings);
     let mut errors = 0;
+    let mut edited = 0;
     let mut edits: Vec<Edit> = Vec::new();
     for (i, r) in regions.iter().enumerate() {
         let id = ids.get(i).copied().unwrap_or(r.id);
         if r.state == CalcState::EditedOutside {
-            if id != r.id {
-                edits.push(Edit { at: r.at.clone(), change: Change::Region { id, state: r.state.clone(), display: None } });
+            edited += 1;
+            // Word's equation stays as it is, with the mark after it so it never looks current.
+            let display = object(&doc.body, &r.at).and_then(|o| match o {
+                InlineObject::Equation { linear, math, .. } => render::mark_edited(linear, math),
+                _ => None,
+            });
+            if id != r.id || display.is_some() {
+                edits.push(Edit { at: r.at.clone(), change: Change::Region { id, state: r.state.clone(), display } });
             }
             continue;
         }
@@ -101,7 +113,7 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
         edits.push(Edit { at: f.at.clone(), change: Change::Field { result } });
     }
     apply(&mut doc.body, edits);
-    RecalcReport { regions: regions.len(), errors, reassigned_ids }
+    RecalcReport { regions: regions.len(), errors, reassigned_ids, edited }
 }
 
 /// Every variable owned by a definition, with its region's id, sorted by name: what a quoted
@@ -333,6 +345,8 @@ struct Index {
     early: Vec<Option<CalcError>>,
     /// Name → index of the region that owns it.
     owners: HashMap<String, usize>,
+    /// Regions edited outside the calculator: they keep owning their name but define nothing.
+    edited: Vec<bool>,
 }
 
 impl Index {
@@ -359,7 +373,8 @@ impl Index {
                 None
             })
             .collect();
-        Index { parsed, early, owners }
+        let edited = regions.iter().map(|r| r.state == CalcState::EditedOutside).collect();
+        Index { parsed, early, owners, edited }
     }
 }
 
@@ -371,6 +386,8 @@ type Outcome = Result<Option<Quantity>, CalcError>;
 struct Node {
     outcome: Option<Outcome>,
     failed: bool,
+    /// Failed because it, or a region it depends on (at any distance), was edited outside.
+    edited: bool,
     /// Regions owning a name this one uses (itself, for `x := x + 1`).
     deps: Vec<usize>,
     /// Regions using the name this one owns.
@@ -387,7 +404,8 @@ fn evaluate(index: &Index) -> (Env, Vec<Outcome>, Vec<bool>) {
     // anything else (a unit, constant, built-in, or nothing) is left for the evaluator.
     for (i, stmt) in index.parsed.iter().enumerate() {
         let Ok(stmt) = stmt else { continue };
-        if nodes.get(i).is_none_or(|n| n.outcome.is_some()) {
+        // An edited region uses nothing: it fails on its own, whatever its source says.
+        if nodes.get(i).is_none_or(|n| n.outcome.is_some()) || index.edited.get(i).copied().unwrap_or(false) {
             continue;
         }
         for name in free_names(stmt) {
@@ -415,8 +433,13 @@ fn evaluate(index: &Index) -> (Env, Vec<Outcome>, Vec<bool>) {
     // Kahn's algorithm, in document order among the ready regions.
     let mut ready: VecDeque<usize> = nodes.iter().enumerate().filter(|(_, n)| n.outcome.is_none() && n.pending == 0).map(|(i, _)| i).collect();
     while let Some(i) = ready.pop_front() {
-        let upstream = nodes.get(i).is_some_and(|n| n.deps.iter().any(|&d| nodes.get(d).is_some_and(|dn| dn.failed)));
+        let failed_dep =
+            |edited: bool| nodes.get(i).is_some_and(|n| n.deps.iter().any(|&d| nodes.get(d).is_some_and(|dn| dn.failed && (dn.edited || !edited))));
+        let (upstream, upstream_edited) = (failed_dep(false), failed_dep(true));
+        let own_edit = index.edited.get(i).copied().unwrap_or(false);
         let outcome = match index.parsed.get(i) {
+            _ if own_edit => Err(CalcError::EditedOutside),
+            _ if upstream_edited => Err(CalcError::UpstreamEdited),
             _ if upstream => Err(CalcError::Upstream),
             Some(Ok(stmt)) => run_stmt(&mut env, stmt),
             Some(Err(e)) => Err(e.clone()),
@@ -424,6 +447,7 @@ fn evaluate(index: &Index) -> (Env, Vec<Outcome>, Vec<bool>) {
         };
         let Some(node) = nodes.get_mut(i) else { continue };
         if outcome.is_err() {
+            node.edited = own_edit || upstream_edited;
             fail(&mut env, node, i);
         }
         node.outcome = Some(outcome);

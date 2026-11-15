@@ -146,9 +146,17 @@ pub(crate) fn after_open(doc: &mut Document) {
     let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         tests::maybe_inject_panic();
-        wordcraft_calc::docx::import(doc, store);
+        wordcraft_calc::docx::import(doc, store)
     }));
-    let Err(panic) = pass else { return };
+    let panic = match pass {
+        Ok(report) => {
+            if let Some(notice) = edited_notice(report.edited) {
+                OPEN_NOTICE.with(|n| *n.borrow_mut() = Some(notice));
+            }
+            return;
+        }
+        Err(panic) => panic,
+    };
     let message = panic.downcast_ref::<&str>().map(ToString::to_string).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
     *doc = saved.clone();
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mark_stale(doc))).is_err() {
@@ -160,6 +168,17 @@ pub(crate) fn after_open(doc: &mut Document) {
         format!("Calculations couldn't be updated ({message}): their results are shown out of date.")
     };
     OPEN_NOTICE.with(|n| *n.borrow_mut() = Some(notice));
+}
+
+/// What opening tells about calculations edited in Word, when there are any.
+fn edited_notice(edited: usize) -> Option<String> {
+    match edited {
+        0 => None,
+        1 => Some("1 calculation was edited in Word: it is marked ⚠, and calculations that use it show an error until you resolve it.".to_string()),
+        n => Some(format!(
+            "{n} calculations were edited in Word: they are marked ⚠, and calculations that use them show an error until you resolve them."
+        )),
+    }
 }
 
 /// Recalculate the document. A duplicate-name message names the page of the first definition,
@@ -533,6 +552,7 @@ fn resolve_edited(s: &mut Session, v: &Value) -> CmdResult {
     if let Some(InlineObject::Equation { linear, math, calc, .. }) = para.object_at_mut(off) {
         if keep == "word" {
             *calc = None;
+            wordcraft_calc::render::strip_edited_mark(linear, math);
         } else if let Some(c) = calc {
             c.state = CalcState::Fresh;
             linear.clear();

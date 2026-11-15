@@ -87,6 +87,10 @@ pub fn export(doc: &Document) -> (Document, CalcStore) {
             let (Some(&off), Some(&id)) = (anchors.get(k), ids.get(i)) else { continue };
             let Some(InlineObject::Equation { linear, math, calc, .. }) = p.objects.get_mut(k) else { continue };
             let Some(region) = calc.take() else { continue };
+            // The edited mark is WordCraft's, not part of the equation Word gets back.
+            if region.state == CalcState::EditedOutside {
+                crate::render::strip_edited_mark(linear, math);
+            }
             let text = canonical(linear, math);
             let fingerprint =
                 if region.state == CalcState::EditedOutside { fnv1a64(&[EDITED_SALT, text.as_bytes()]) } else { fnv1a64(&[text.as_bytes()]) };
@@ -166,9 +170,9 @@ pub fn has_calc_controls(doc: &Document) -> bool {
 ///
 /// The store is untrusted: one over [`MAX_STORED_REGIONS`] counts as none, and an id stored twice
 /// counts as not stored. The store's settings become the document's. Finally the document is
-/// recalculated (regions edited outside keep their display). A document with no calculations
-/// and no calculation controls is left exactly as it is.
-pub fn import(doc: &mut Document, store: Option<CalcStore>) {
+/// recalculated (regions edited outside keep their display, marked) and the pass's report
+/// returned. A document with no calculations and no calculation controls is left exactly as it is.
+pub fn import(doc: &mut Document, store: Option<CalcStore>) -> crate::RecalcReport {
     doc.calc_store = None;
     let mut by_id: HashMap<u64, StoredRegion> = HashMap::new();
     if let Some(store) = store.filter(|s| s.regions.len() <= MAX_STORED_REGIONS) {
@@ -220,7 +224,7 @@ pub fn import(doc: &mut Document, store: Option<CalcStore>) {
             }
         }
     }
-    crate::recalc(doc, &|_| None);
+    crate::recalc(doc, &|_| None)
 }
 
 #[cfg(test)]

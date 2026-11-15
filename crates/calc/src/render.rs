@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use craft_units::{Formatted, lookup};
 use wordcraft_doc::Rgb;
 use wordcraft_doc::calc::CalcState;
-use wordcraft_doc::math::{Arg, FUNCTION_NAMES, MNode, MRun, MSty, parse_linear};
+use wordcraft_doc::math::{Arg, FUNCTION_NAMES, MNode, MRun, MSty, Math, parse_linear};
 use wordcraft_doc::math_linear::map_args;
 
 use crate::{CalcError, Expr, Op, Stmt, funcs, parse};
@@ -21,8 +21,12 @@ use crate::{CalcError, Expr, Op, Stmt, funcs, parse};
 pub const ERROR_RED: Rgb = Rgb(0xC0, 0x00, 0x00);
 /// Colour of a stale result.
 pub const STALE_GREY: Rgb = Rgb(0x80, 0x80, 0x80);
+/// Colour of the mark after a calculation edited outside WordCraft.
+pub const EDITED_AMBER: Rgb = Rgb(0xC0, 0x60, 0x00);
 /// The marker shown after a calculation with an error, in place of its result.
 const ERROR_MARK: &str = "⚠";
+/// The mark after a calculation edited outside WordCraft (amber, where an error's is red).
+const EDITED_MARK: &str = "⚠";
 /// Longest source text shown for a calculation that doesn't parse, in characters.
 const MAX_SHOWN_SOURCE: usize = 2000;
 /// First private-use character standing for a unit while the linear text is parsed into a tree.
@@ -100,6 +104,45 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
         math.extend(result);
     }
     Rendered { linear, math }
+}
+
+/// The mark run after an equation edited outside WordCraft.
+fn edited_run() -> MNode {
+    MNode::Run(MRun { text: EDITED_MARK.to_string(), sty: Some(MSty::Plain), color: Some(EDITED_AMBER), ..MRun::default() })
+}
+
+fn is_edited_run(n: &MNode) -> bool {
+    matches!(n, MNode::Run(r) if r.text == EDITED_MARK && r.color == Some(EDITED_AMBER))
+}
+
+/// Whether the equation's nodes end in the edited mark.
+pub fn has_edited_mark(math: &Math) -> bool {
+    math.nodes.last().is_some_and(is_edited_run)
+}
+
+/// The display of an equation edited outside WordCraft (`linear`, `math` as Word left them) with
+/// the edited mark after it; `None` when it has the mark already. Nothing of Word's equation is
+/// changed: its tree (read from its linear text when it has none yet) gains one run.
+pub(crate) fn mark_edited(linear: &str, math: &Math) -> Option<Rendered> {
+    if has_edited_mark(math) {
+        return None;
+    }
+    let mut nodes = if math.nodes.is_empty() { parse_linear(linear) } else { math.nodes.clone() };
+    nodes.push(edited_run());
+    Some(Rendered { linear: format!("{linear} {EDITED_MARK}"), math: nodes })
+}
+
+/// Takes the edited mark ([`mark_edited`]) off an equation again: before it is saved for Word,
+/// and when the author keeps Word's equation. An equation without it is left as it is.
+pub fn strip_edited_mark(linear: &mut String, math: &mut Math) {
+    if !has_edited_mark(math) {
+        return;
+    }
+    math.nodes.pop();
+    if let Some(rest) = linear.strip_suffix(&format!(" {EDITED_MARK}")) {
+        *linear = rest.to_string();
+    }
+    math.omml.clear();
 }
 
 /// The result shown in a display made by [`rendered`] (`…=600 "psi"`), read back from its

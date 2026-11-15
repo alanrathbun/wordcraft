@@ -630,3 +630,72 @@ fn a_tracked_deleted_calculation_survives_docx_and_comes_back_on_reject() {
         .1
     );
 }
+
+/// `bytes` (a `.docx`) with `word/document.xml` rewritten by `f`: an edit made in Word.
+fn edit_in_word(bytes: &[u8], f: impl Fn(String) -> String) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for i in 0..z.len() {
+        let mut part = z.by_index(i).unwrap();
+        let name = part.name().to_string();
+        let mut data = Vec::new();
+        part.read_to_end(&mut data).unwrap();
+        if name == "word/document.xml" {
+            data = f(String::from_utf8(data).unwrap()).into_bytes();
+        }
+        w.start_file(name.as_str(), zip::write::SimpleFileOptions::default()).unwrap();
+        w.write_all(&data).unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}
+
+#[test]
+fn a_calculation_edited_in_word_stops_its_dependents_and_says_so() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    run(&mut s, "insert.calcValue", json!({"name": "σ"}));
+    assert_eq!(field_results(&s), ["600 psi"]);
+    let bytes = crate::io::save_bytes("report.docx", &s.doc).unwrap();
+    let edited = edit_in_word(&bytes, |xml| {
+        assert!(xml.contains(">P≔1500<"), "the saved equation shows P≔1500");
+        xml.replace(">P≔1500<", ">P≔2000<")
+    });
+    let mut back = Session::new(Document::new());
+    run(&mut back, "file.open", json!({"path": "report.docx", "data": crate::cmd::insert::base64_encode(&edited)}));
+    // P keeps Word's equation, marked; nothing shows a number from either version of P.
+    let (r, linear) = region(&back, p);
+    assert_eq!(r.state, CalcState::EditedOutside);
+    assert!(linear.contains("2000") && linear.ends_with(" ⚠"), "{linear}");
+    let (r, linear) = region(&back, sigma);
+    assert_eq!(r.state, CalcState::Error("depends on a calculation edited in Word — resolve it".into()));
+    assert!(!linear.contains("psi") && !linear.contains("600") && !linear.contains("800"), "{linear}");
+    assert_eq!(field_results(&back), ["?"]);
+    assert!(back.status.contains("1 calculation was edited in Word"), "{}", back.status);
+    // Resolving it from the calculation brings everything back.
+    run(&mut back, "calc.resolveEdited", json!({"id": p, "keep": "source"}));
+    assert_eq!(region(&back, sigma).0.state, CalcState::Fresh);
+    assert_eq!(field_results(&back), ["600 psi"]);
+}
+
+#[test]
+fn keeping_words_equation_drops_the_mark() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    edit_outside(&mut s, p, "P≔2000 \"lbf\"");
+    run(&mut s, "calc.recalculate", json!({}));
+    assert!(region(&s, p).1.ends_with(" ⚠"));
+    run(&mut s, "calc.resolveEdited", json!({"id": p, "keep": "word"}));
+    let plain: Vec<String> = objects(&s.doc)
+        .into_iter()
+        .filter_map(|o| match o {
+            InlineObject::Equation { linear, calc: None, math, .. } => {
+                assert!(!wordcraft_calc::render::has_edited_mark(&math));
+                Some(linear)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plain, ["P≔2000 \"lbf\""]);
+    assert_eq!(region(&s, sigma).0.state, CalcState::Error("P isn't defined".into()));
+}

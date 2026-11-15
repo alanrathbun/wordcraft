@@ -403,16 +403,45 @@ fn unchanged_paragraphs_are_not_copied() {
 }
 
 #[test]
-fn edited_outside_region_keeps_its_display_but_still_defines() {
-    let mut d = doc_with(&["x := 5", "x ="]);
+fn edited_outside_region_keeps_its_display_marked_and_defines_nothing() {
+    let mut d = doc_with(&["x := 5", "y := x + 1 =", "y + 1 =", "x := 7", "z := 2 ="]);
     edit_region(&mut d, 1, |c, linear| {
         *linear = "x≔6".into();
         c.state = CalcState::EditedOutside;
     });
+    if let Block::Para(p) = Arc::make_mut(&mut d.body[4]) {
+        let end = p.text.len();
+        p.insert_object(end, field(&calc_field_instr("x", None, None)), &CharProps::default()).unwrap();
+        let end = p.text.len();
+        p.insert_object(end, field(&calc_field_instr("y", None, None)), &CharProps::default()).unwrap();
+    }
+    let report = recalc(&mut d, &no_page);
+    assert_eq!(report.edited, 1);
+    let (r, linear, math) = region(&d, 1);
+    assert_eq!((r.state, linear.as_str()), (CalcState::EditedOutside, "x≔6 ⚠"));
+    assert!(runs(&math.nodes).iter().any(|r| r.text == "⚠" && r.color == Some(render::EDITED_AMBER)), "marked in amber");
+    assert!(runs(&math.nodes).iter().any(|r| r.text.contains('6')), "Word's equation is kept");
+    // Its dependents, near and far, show no number.
+    let upstream = err(CalcError::UpstreamEdited);
+    assert_eq!(region(&d, 2).0.state, upstream);
+    assert_eq!(region(&d, 3).0.state, upstream);
+    assert!(!region(&d, 2).1.contains('6') && region(&d, 2).1.ends_with('⚠'), "{}", region(&d, 2).1);
+    // It still owns x: a later definition is a duplicate, not a silent replacement.
+    assert!(matches!(region(&d, 4).0.state, CalcState::Error(m) if m.contains("already defined")));
+    assert_eq!(region(&d, 5).0.state, CalcState::Fresh);
+    let quoted: Vec<String> = objects(&d)
+        .into_iter()
+        .filter_map(|o| match o {
+            InlineObject::Field { result, .. } => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(quoted, vec!["?", "?"]);
+    // A second pass marks it once.
+    let snapshot = d.body.clone();
     recalc(&mut d, &no_page);
-    let (r, linear, _) = region(&d, 1);
-    assert_eq!((r.state, linear.as_str()), (CalcState::EditedOutside, "x≔6"));
-    assert_eq!(region(&d, 2).1, "x=5");
+    assert_eq!(region(&d, 1).1, "x≔6 ⚠");
+    assert!(snapshot.iter().zip(&d.body).all(|(a, b)| Arc::ptr_eq(a, b)), "nothing changes the second time");
 }
 
 #[test]

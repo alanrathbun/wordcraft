@@ -50,6 +50,13 @@ pub enum CalcError {
     /// A calculation this one depends on has an error.
     #[error("depends on a calculation with an error")]
     Upstream,
+    /// The calculation was edited outside WordCraft (in Word): what it shows is no longer what its
+    /// source says, so nothing may use either.
+    #[error("edited in Word — restore it from the calculation or keep Word's equation")]
+    EditedOutside,
+    /// A calculation this one depends on (directly or through others) was edited in Word.
+    #[error("depends on a calculation edited in Word — resolve it")]
+    UpstreamEdited,
     /// Two calculations define the same name.
     #[error("{name} is already defined {} — choose a unique name", .page.map_or("elsewhere in the document".to_string(), |p| format!("on page {p}")))]
     Duplicate {

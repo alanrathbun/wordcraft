@@ -263,9 +263,30 @@ fn edited_in_word_is_flagged() {
     assert_eq!(p.state, CalcState::EditedOutside);
     assert_eq!(p.source, "P := 1500 lbf", "the source is kept for the author to resolve");
     assert!(linear.contains("1600"), "Word's version is shown: {linear}");
-    for (r, linear) in regions(&back).into_iter().filter(|(r, _)| r.id != 1) {
+    assert!(linear.ends_with(" ⚠"), "the edited region is marked: {linear}");
+    // σ uses P: neither Word's 1600 nor the stored 1500 may give it a number.
+    let (sigma, linear) = region(&back, 3);
+    assert_eq!(sigma.state, CalcState::Error("depends on a calculation edited in Word — resolve it".into()), "{linear}");
+    assert!(!linear.contains("ksi") && linear.contains('⚠'), "{linear}");
+    assert_eq!(field_result(&back), "?", "a quoted value of a dependent shows no number");
+    // Everything that doesn't use P is current.
+    for (r, linear) in regions(&back).into_iter().filter(|(r, _)| ![1, 3].contains(&r.id)) {
         assert_eq!(r.state, CalcState::Fresh, "{} → {linear}", r.source);
     }
+}
+
+#[test]
+fn the_edited_mark_never_reaches_word() {
+    let bytes = edit_document(&save(&report()), |xml| xml.replace(">P≔1500<", ">P≔1600<"));
+    let once = open(&bytes);
+    assert!(region(&once, 1).1.ends_with(" ⚠"));
+    let xml = document_xml(&save(&once));
+    let sdt = sdt_of(&xml, 1);
+    assert!(sdt.contains("1600") && !sdt.contains('⚠'), "Word gets its own equation back, unmarked: {sdt}");
+    // Reopened, it is marked once, not twice.
+    let twice = open(&save(&once));
+    let (_, linear) = region(&twice, 1);
+    assert_eq!(linear.matches('⚠').count(), 1, "{linear}");
 }
 
 #[test]
