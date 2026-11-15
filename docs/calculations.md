@@ -41,7 +41,7 @@ instead: `A_b`, `L_1`. A subscript can't be empty (`a__b` and `x_` are refused).
 | `c_0` | speed of light, 299 792 458 m/s |
 | `R_u` | molar gas constant, 8.314462618 J/(mol·K) |
 
-The constants carry their units, so `W_t := 10 kg·g_0 = ? N` shows 98.067 N and `1 lbm·g_0 = ? lbf`
+The constants carry their units, so `W_t := 5 kg·g_0 = ? N` shows 49.033 N and `1 lbm·g_0 = ? lbf`
 shows 1 lbf.
 
 ## Symbols
