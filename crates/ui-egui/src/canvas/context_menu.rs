@@ -72,6 +72,13 @@ pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
             ui.close();
         }
     };
+    let calc_items = crate::calc_ui::menu_items(app);
+    if !calc_items.is_empty() {
+        for (label, id, params) in calc_items {
+            item(ui, app, label, id, params);
+        }
+        ui.separator();
+    }
     if let Some(issue) = app.canvas.context_issue.clone() {
         let sugg: Vec<String> = issue
             .get("suggestions")

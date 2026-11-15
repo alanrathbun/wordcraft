@@ -57,8 +57,8 @@ to a force is an error rather than a number.
   below 0.0001.)
 - The default unit system is US customary. Choose SI in References › Calculation Options.
 - `= ? unit` overrides the unit for one result.
-- A calculation can be numbered like any display equation (Equation › Equation Number); the number
-  stays as the result changes and is saved to Word.
+- To number a calculation, right-click it and choose Add Equation Number (Remove Equation Number
+  takes it off). The number stays as the result changes and is saved to Word.
 
 ## Quoted values
 

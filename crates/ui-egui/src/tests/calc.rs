@@ -474,3 +474,40 @@ fn calc_keyboard_opens_the_source_box() {
     h.run_steps(3);
     assert_eq!(h.state().dialog.as_ref().map(dialogs::Dialog::name), Some("calculation"));
 }
+
+#[test]
+fn right_click_menu_numbers_a_calculation() {
+    let mut a = app();
+    let _ = a.session.run("insert.calculation", &serde_json::json!({"source": "P := 1500 lbf =", "display": true}));
+    let (at, _) = regions(&a).remove(0);
+    a.session.sel = wordcraft_engine::Selection { anchor: at.clone(), focus: at.clone() };
+    let items = calc_ui::menu_items(&a);
+    let labels: Vec<&str> = items.iter().map(|(l, _, _)| *l).collect();
+    assert_eq!(labels, ["Edit Calculation", "Add Equation Number", "Recalculate"]);
+    let (_, id, params) = items[1].clone();
+    a.session.run(id, &params).expect("numbering a calculation from the menu works");
+    assert!(regions(&a)[0].1.numbered, "the calculation is numbered");
+    a.session.sel = wordcraft_engine::Selection { anchor: at.clone(), focus: at };
+    assert_eq!(calc_ui::menu_items(&a)[1].0, "Remove Equation Number");
+    // Away from a calculation the menu adds nothing.
+    assert!(calc_ui::menu_items(&app()).is_empty());
+}
+
+#[test]
+fn right_clicking_a_calculation_offers_its_number() {
+    let mut a = app();
+    let _ = a.session.run("insert.calculation", &serde_json::json!({"source": "P := 1500 lbf =", "display": true}));
+    let mut h = timed(a);
+    let (at, _) = regions(h.state()).remove(0);
+    let point = on_screen(&mut h, &at);
+    h.event(Event::PointerMoved(point));
+    h.step();
+    for pressed in [true, false] {
+        h.event(Event::PointerButton { pos: point, button: PointerButton::Secondary, pressed, modifiers: Default::default() });
+        h.step();
+    }
+    h.run_steps(3);
+    h.get_by_label_contains("Add Equation Number").click();
+    h.run_steps(3);
+    assert!(regions(h.state())[0].1.numbered, "the menu numbered the calculation");
+}

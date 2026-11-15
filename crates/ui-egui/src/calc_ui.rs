@@ -200,6 +200,19 @@ fn calc_at_caret(app: &WordApp) -> Option<(Pos, CalcRegion)> {
     std::iter::once(focus.clone()).chain(before).find_map(|at| region_at(&app.session.doc, &at).map(|c| (at.clone(), c.clone())))
 }
 
+/// What the right-click menu adds when the caret is at a calculation: editing its source, its
+/// equation number (numbering a calculation works like numbering a plain equation) and
+/// recalculating. Empty anywhere else.
+pub fn menu_items(app: &WordApp) -> Vec<(&'static str, &'static str, Value)> {
+    let Some((_, c)) = calc_at_caret(app) else { return Vec::new() };
+    let number = if c.numbered { "Remove Equation Number" } else { "Add Equation Number" };
+    vec![
+        ("Edit Calculation", "calc.edit", json!({})),
+        (number, "equation.number", json!({"value": !c.numbered})),
+        ("Recalculate", "calc.recalculate", json!({})),
+    ]
+}
+
 /// Whether the selection is exactly one calculation (its object character, either way round).
 pub fn selected_calc(app: &WordApp) -> bool {
     let sel = &app.session.sel;
