@@ -806,3 +806,22 @@ fn calculations_outside_the_body_are_frozen_on_open() {
     let back = reopen(&s, "report.json");
     assert_nothing_live_outside_body(&back, "opened");
 }
+
+#[test]
+fn editing_a_pasted_copy_in_manual_mode_leaves_the_original() {
+    let mut s = session();
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    let a = calc(&mut s, "a := 1 =");
+    copy_object(&mut s, 0);
+    run(&mut s, "caret.docEnd", json!({}));
+    run(&mut s, "edit.paste", json!({}));
+    // Every stored id is unique once the paste is done, in manual mode too.
+    let ids: Vec<u64> = regions(&s).into_iter().map(|(r, _)| r.id).collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1], "the copy has its own id");
+    assert_eq!(ids[0], a);
+    // The interface edits the copy by the id stored on it.
+    run(&mut s, "calc.setSource", json!({"id": ids[1], "source": "b := 2 ="}));
+    let sources: Vec<String> = regions(&s).into_iter().map(|(r, _)| r.source).collect();
+    assert_eq!(sources, ["a := 1 =", "b := 2 ="]);
+}
