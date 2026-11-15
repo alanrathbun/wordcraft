@@ -201,14 +201,25 @@ fn edited_notice(edited: usize) -> Option<String> {
 }
 
 /// Recalculate the document. A duplicate-name message names the page of the first definition,
-/// so when two regions define the same name the document is laid out (print view) to find it;
-/// otherwise no layout is made.
+/// so in Print Layout, when two regions define the same name, the document's pages are looked up
+/// (once per revision: see [`RegionPages`]). In the other views, which have no pages, and when no
+/// name repeats, no layout is made and the message says "elsewhere in the document".
 pub(crate) fn recalc_now(s: &mut Session) -> RecalcReport {
-    if !repeats_a_name(&s.doc) {
+    if s.view.read_mode || s.view.mode != wordcraft_layout::ViewMode::Print || !repeats_a_name(&s.doc) {
         return recalc(&mut s.doc, &|_| None);
     }
     let pages = region_pages(s);
     recalc(&mut s.doc, &|id| pages.get(&id).copied())
+}
+
+/// The page of each region (see [`region_pages`]), with what it was found for: the document,
+/// its revision and its body's blocks (compared by pointer, so an equal revision reached by a
+/// different edit after an undo never passes for the same document).
+pub(crate) struct RegionPages {
+    document_id: u64,
+    rev: u64,
+    body: Vec<std::sync::Arc<Block>>,
+    pages: std::sync::Arc<HashMap<u64, u32>>,
 }
 
 /// Whether two (live) body regions define the same name.
@@ -218,7 +229,17 @@ fn repeats_a_name(doc: &Document) -> bool {
 }
 
 /// The page number (as shown) of each body region, by id; the first region with an id wins.
-fn region_pages(s: &mut Session) -> HashMap<u64, u32> {
+/// Reused from [`Session::calc_pages`] while the document is the one it was found for.
+fn region_pages(s: &mut Session) -> std::sync::Arc<HashMap<u64, u32>> {
+    let (document_id, rev) = (s.document_id(), s.rev());
+    if let Some(c) = &s.calc_pages
+        && c.document_id == document_id
+        && c.rev == rev
+        && c.body.len() == s.doc.body.len()
+        && c.body.iter().zip(&s.doc.body).all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+    {
+        return c.pages.clone();
+    }
     let layout = s.print_layout_now();
     let mut pages = HashMap::new();
     for (at, c) in body_regions(&s.doc) {
@@ -229,6 +250,8 @@ fn region_pages(s: &mut Session) -> HashMap<u64, u32> {
             pages.insert(c.id, number);
         }
     }
+    let pages = std::sync::Arc::new(pages);
+    s.calc_pages = Some(RegionPages { document_id, rev, body: s.doc.body.clone(), pages: pages.clone() });
     pages
 }
 

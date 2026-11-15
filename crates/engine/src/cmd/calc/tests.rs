@@ -928,3 +928,33 @@ fn a_calculation_can_be_numbered() {
     assert!(!region(&s, sigma).0.numbered && !numbered_eq(&s.doc, sigma));
     assert!(!region(&s, sigma).1.ends_with('#'));
 }
+
+/// A pasted copy of P's definition at the end of the body.
+fn paste_copy_of_p(s: &mut Session) -> CalcRegion {
+    copy_object(s, 0);
+    run(s, "caret.docEnd", json!({}));
+    run(s, "edit.paste", json!({}));
+    regions(s).pop().unwrap().0
+}
+
+#[test]
+fn duplicate_pages_are_looked_up_only_in_print_layout_and_once_per_revision() {
+    let mut s = session();
+    sample(&mut s);
+    s.view.mode = wordcraft_layout::ViewMode::Draft;
+    let copy = paste_copy_of_p(&mut s);
+    // Draft view has no pages: no layout, and the message says so plainly.
+    assert_eq!(copy.state, CalcState::Error("P is already defined elsewhere in the document — choose a unique name".into()));
+    assert!(s.calc_pages.is_none(), "no page lookup outside Print Layout");
+    s.view.mode = wordcraft_layout::ViewMode::Print;
+    run(&mut s, "calc.recalculate", json!({}));
+    assert!(matches!(regions(&s).pop().unwrap().0.state, CalcState::Error(m) if m.contains("on page 1")));
+    // The same document at the same revision reuses the pages found.
+    let first = super::region_pages(&mut s);
+    let again = super::region_pages(&mut s);
+    assert!(std::sync::Arc::ptr_eq(&first, &again));
+    // Any edit looks again.
+    run(&mut s, "text.insert", json!({"text": "x"}));
+    let after = super::region_pages(&mut s);
+    assert!(!std::sync::Arc::ptr_eq(&first, &after));
+}
