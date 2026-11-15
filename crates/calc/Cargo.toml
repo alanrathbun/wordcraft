@@ -9,7 +9,7 @@ description = "WordCraft calculation language: parser and syntax tree for Mathca
 workspace = true
 
 [dependencies]
-craft-units = { path = "../../../craft-libs/crates/units" }
+craft-units = { workspace = true }
 wordcraft-doc = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

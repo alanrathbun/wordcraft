@@ -111,7 +111,7 @@ Changing `F_i` to `18 kip` updates both results and the sentence (40.744 ksi, 14
 
 ## Building
 
-The calculation engine uses the `craft-units` crate from the craft-libs repository. For now it is a
-path dependency (`../../../craft-libs/crates/units` from `crates/calc`), so craft-libs must be
-checked out beside the wordcraft directory, on the `feature/craft-units` branch. It will move to a
-pinned git revision once that branch is published.
+The calculation engine uses the `craft-units` crate from craft-libs. It is pinned in the workspace
+`Cargo.toml` to a commit on `alanrathbun/craft-libs` (branch `feature/craft-units`), so a plain
+`cargo build` fetches it; no separate checkout is needed. Move the pin to `storytold/craft-libs`
+if the crate is accepted there.
