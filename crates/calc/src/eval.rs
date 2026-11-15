@@ -22,10 +22,49 @@ const MAX_STEPS: u32 = 1_000_000;
 /// hostile document from costing seconds on every edit.
 pub(crate) const MAX_PASS_STEPS: u64 = 5_000_000;
 
+/// What a value stands for as a temperature, so that it is shown on an offset scale (`°C`, `°F`)
+/// only when that means something: `20 Δ°C` or `T_2 - T_1` shown in `°C` would be a wrong number
+/// that looks right (−253.15 °C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Temp {
+    /// Not known to be an absolute temperature: a difference, a scaled temperature, a computed
+    /// one, or not a temperature at all.
+    #[default]
+    Plain,
+    /// An absolute temperature: a `°C` or `°F` literal, or one plus or minus a difference.
+    Absolute,
+    /// A bare `K` or `°R` literal (`300 K`): an absolute temperature or a difference, as it is used.
+    Either,
+}
+
+/// What an absolute temperature combined with another by `+` or `-` stands for: plus or minus a
+/// difference it stays absolute; two absolute temperatures differ by a difference (plain) and
+/// have no meaningful sum. Anything else is plain.
+fn sum_temp(op: Op, a: Temp, b: Temp) -> Temp {
+    match (op, a, b) {
+        (_, Temp::Absolute, Temp::Absolute) => Temp::Plain,
+        (Op::Add, Temp::Absolute, _) | (Op::Add, _, Temp::Absolute) | (Op::Sub, Temp::Absolute, _) => Temp::Absolute,
+        _ => Temp::Plain,
+    }
+}
+
+/// An evaluated value with what it stands for as a temperature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Val {
+    pub(crate) q: Quantity,
+    pub(crate) t: Temp,
+}
+
+impl Val {
+    fn plain(q: Quantity) -> Val {
+        Val { q, t: Temp::Plain }
+    }
+}
+
 /// What a name means in an [`Env`].
 #[derive(Debug, Clone, PartialEq)]
 enum Entry {
-    Var(Quantity),
+    Var(Quantity, Temp),
     Func {
         params: Vec<String>,
         body: Expr,
@@ -49,9 +88,17 @@ impl Env {
         Env::default()
     }
 
-    /// Define a variable.
+    /// Define a variable (not an absolute temperature: see [`Temp`]).
     pub fn define_var(&mut self, name: &str, q: Quantity) {
-        self.entries.insert(name.to_string(), Entry::Var(q));
+        self.entries.insert(name.to_string(), Entry::Var(q, Temp::Plain));
+    }
+
+    /// The value of the variable `name`, with what it stands for as a temperature.
+    pub(crate) fn value(&self, name: &str) -> Option<Val> {
+        match self.entries.get(name) {
+            Some(Entry::Var(q, t)) => Some(Val { q: *q, t: *t }),
+            _ => None,
+        }
     }
 
     /// Define a function of `params`.
@@ -115,6 +162,10 @@ impl Pass {
 }
 
 fn eval_in(env: &Env, e: &Expr, pass: &Pass) -> Result<Quantity, CalcError> {
+    eval_val(env, e, pass).map(|v| v.q)
+}
+
+fn eval_val(env: &Env, e: &Expr, pass: &Pass) -> Result<Val, CalcError> {
     let cx = Cx { env, steps: Cell::new(0), pass };
     eval(&cx, &Frame::GLOBAL, e, 0)
 }
@@ -133,9 +184,9 @@ pub fn run_stmt(env: &mut Env, s: &Stmt) -> Result<Option<Quantity>, CalcError> 
 pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option<Quantity>, CalcError> {
     match s {
         Stmt::Eval { expr, show } => {
-            let q = eval_in(env, expr, pass)?;
-            check_show(show, q)?;
-            Ok(Some(q))
+            let v = eval_val(env, expr, pass)?;
+            check_show(show, v)?;
+            Ok(Some(v.q))
         }
         Stmt::Define { name, params, body, show } => {
             check_name(name)?;
@@ -147,23 +198,35 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
                 env.define_fn(name, params.clone(), body.clone());
                 return Ok(None);
             }
-            let q = eval_in(env, body, pass)?;
+            let v = eval_val(env, body, pass)?;
             if let Some(show) = show {
-                check_show(show, q)?;
+                check_show(show, v)?;
             }
-            env.define_var(name, q);
-            Ok(show.as_ref().map(|_| q))
+            env.entries.insert(name.to_string(), Entry::Var(v.q, v.t));
+            Ok(show.as_ref().map(|_| v.q))
         }
     }
 }
 
 /// A `= ? unit` must be a unit of the value's dimension.
-fn check_show(show: &Show, q: Quantity) -> Result<(), CalcError> {
+fn check_show(show: &Show, v: Val) -> Result<(), CalcError> {
     let Some(text) = &show.unit else {
         return Ok(());
     };
+    check_unit_for(v, text)
+}
+
+/// Whether `v` can be shown in the unit `text`: one of its dimension and, for an offset scale
+/// (`°C`, `°F`), an absolute temperature ([`Temp`]).
+pub(crate) fn check_unit_for(v: Val, text: &str) -> Result<(), CalcError> {
     let scale = parse_unit(text).map_err(unit)?;
-    if q.dim.same_ignoring_angle(scale.dim) { Ok(()) } else { Err(CalcError::Unit(UnitError::Mismatch { left: q.dim, right: scale.dim })) }
+    if !v.q.dim.same_ignoring_angle(scale.dim) {
+        return Err(CalcError::Unit(UnitError::Mismatch { left: v.q.dim, right: scale.dim }));
+    }
+    if scale.offset != 0.0 && v.t == Temp::Plain {
+        return Err(CalcError::NotAbsolute(text.trim().to_string()));
+    }
+    Ok(())
 }
 
 /// Shared state of one evaluation.
@@ -178,19 +241,19 @@ struct Cx<'a> {
 /// The parameters in scope, and how many user functions deep we are.
 struct Frame<'a> {
     names: &'a [String],
-    values: &'a [Quantity],
+    values: &'a [Val],
     calls: usize,
 }
 
 impl Frame<'_> {
     const GLOBAL: Frame<'static> = Frame { names: &[], values: &[], calls: 0 };
 
-    fn param(&self, name: &str) -> Option<Quantity> {
+    fn param(&self, name: &str) -> Option<Val> {
         self.names.iter().position(|n| n == name).and_then(|i| self.values.get(i).copied())
     }
 }
 
-fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Quantity, CalcError> {
+fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Val, CalcError> {
     if depth > MAX_EVAL_DEPTH {
         return Err(CalcError::TooComplex);
     }
@@ -205,26 +268,27 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Quantity,
     }
     cx.pass.spent.set(spent);
     match e {
-        Expr::Num(v) => finite(*v),
+        Expr::Num(v) => finite(*v).map(Val::plain),
         Expr::Name(n) => resolve(cx, fr, n),
         Expr::Quantity(v, text) => {
             let scale = parse_unit(text).map_err(unit)?;
-            from_scale(*v, &scale)
+            let t = literal_temp(text, &scale);
+            from_scale(*v, &scale).map(|q| Val { q, t })
         }
         Expr::Unary(Op::Neg, a) => {
             refuse_offset_operand(cx, fr, &[a])?;
-            eval(cx, fr, a, depth + 1)?.neg().map_err(unit)
+            eval(cx, fr, a, depth + 1)?.q.neg().map(Val::plain).map_err(unit)
         }
         Expr::Unary(..) => Err(CalcError::Syntax("unsupported operator".to_string())),
         Expr::Abs(a) => {
-            let q = eval(cx, fr, a, depth + 1)?;
-            finite_q(Quantity::new(q.value.abs(), q.dim))
+            let q = eval(cx, fr, a, depth + 1)?.q;
+            finite_q(Quantity::new(q.value.abs(), q.dim)).map(Val::plain)
         }
         Expr::Binary(op, a, b) => {
             if *op == Op::Mul
                 && let Some(q) = offset_literal(cx, fr, a, b)
             {
-                return q;
+                return q.map(|q| Val { q, t: Temp::Absolute });
             }
             // Offset literals may be combined with an interval but not scaled (`5 °F/s` would be a
             // wrong number that looks right) or combined with each other.
@@ -243,9 +307,29 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Quantity,
             }
             let x = eval(cx, fr, a, depth + 1)?;
             let y = eval(cx, fr, b, depth + 1)?;
-            apply(*op, x, y)
+            let q = apply(*op, x.q, y.q)?;
+            let t = match op {
+                Op::Add | Op::Sub => sum_temp(*op, x.t, y.t),
+                Op::Mul => unit_literal(cx, fr, a, b).map_or(Temp::Plain, |(_, scale, name)| literal_temp(name, &scale)),
+                _ => Temp::Plain,
+            };
+            Ok(Val { q, t })
         }
         Expr::Call(name, args) => call(cx, fr, name, args, depth),
+    }
+}
+
+/// What a literal in the unit `name` stands for as a temperature: absolute on an offset scale,
+/// either in a plain temperature unit (`K`, `°R`), a difference in `Δ°C`/`Δ°F`.
+fn literal_temp(name: &str, scale: &Scale) -> Temp {
+    if scale.dim != Dim::TEMPERATURE {
+        Temp::Plain
+    } else if scale.offset != 0.0 {
+        Temp::Absolute
+    } else if name.trim_start().starts_with(['Δ', '∆']) {
+        Temp::Plain
+    } else {
+        Temp::Either
     }
 }
 
@@ -282,8 +366,8 @@ fn apply(op: Op, x: Quantity, y: Quantity) -> Result<Quantity, CalcError> {
 }
 
 /// `number unit` where the unit name is not shadowed by a parameter, variable or constant: the
-/// number and the unit's scale.
-fn unit_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> Option<(f64, Scale)> {
+/// number, the unit's scale and its name.
+fn unit_literal<'e>(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &'e Expr) -> Option<(f64, Scale, &'e str)> {
     let v = match num {
         Expr::Num(v) => *v,
         Expr::Unary(Op::Neg, inner) => match &**inner {
@@ -298,13 +382,13 @@ fn unit_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> Op
     if fr.param(n).is_some() || cx.env.entries.contains_key(n.as_str()) || is_constant(n) {
         return None;
     }
-    Some((v, lookup(n)?))
+    Some((v, lookup(n)?, n))
 }
 
 /// `5 °F`: a number times an offset unit that no variable or constant shadows is an absolute
 /// temperature. Anything else involving an offset unit is refused in [`resolve`].
 fn offset_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> Option<Result<Quantity, CalcError>> {
-    let (v, scale) = unit_literal(cx, fr, num, unit_name)?;
+    let (v, scale, _) = unit_literal(cx, fr, num, unit_name)?;
     (scale.offset != 0.0).then(|| from_scale(v, &scale))
 }
 
@@ -312,7 +396,7 @@ fn offset_literal(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &Expr) -> 
 /// a temperature interval.
 fn is_non_offset_temperature_literal(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr) -> bool {
     matches!(e, Expr::Binary(Op::Mul, a, b)
-        if unit_literal(cx, fr, a, b).is_some_and(|(_, s)| s.offset == 0.0 && s.dim == Dim::TEMPERATURE))
+        if unit_literal(cx, fr, a, b).is_some_and(|(_, s, _)| s.offset == 0.0 && s.dim == Dim::TEMPERATURE))
 }
 
 /// Whether `e` is exactly a `number offset-unit` literal.
@@ -330,25 +414,25 @@ fn not_a_value(name: &str) -> CalcError {
 }
 
 /// A name as a value: parameter, variable, constant, unit.
-fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Quantity, CalcError> {
-    if let Some(q) = fr.param(name) {
-        return Ok(q);
+fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Val, CalcError> {
+    if let Some(v) = fr.param(name) {
+        return Ok(v);
     }
     match cx.env.entries.get(name) {
-        Some(Entry::Var(q)) => return Ok(*q),
+        Some(Entry::Var(q, t)) => return Ok(Val { q: *q, t: *t }),
         Some(Entry::Failed) => return Err(CalcError::Upstream),
         Some(Entry::Func { .. }) => return Err(not_a_value(name)),
         None => {}
     }
     if let Some(v) = constant(name) {
-        return Ok(Quantity::dimensionless(v));
+        return Ok(Val::plain(Quantity::dimensionless(v)));
     }
     // A unit wins over a built-in of the same spelling: `5 min` is minutes, `min(1, 2)` a call.
     if let Some(scale) = lookup(name) {
         if scale.offset != 0.0 {
             return Err(CalcError::Unit(UnitError::AffineTemperature));
         }
-        return finite_q(Quantity::new(scale.factor, scale.dim));
+        return finite_q(Quantity::new(scale.factor, scale.dim)).map(Val::plain);
     }
     if funcs::is_builtin(name) {
         return Err(not_a_value(name));
@@ -358,13 +442,13 @@ fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Quantity, CalcErro
 
 // Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
-fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) -> Result<Quantity, CalcError> {
+fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) -> Result<Val, CalcError> {
     // Resolve what is being called before evaluating the arguments, so a missing name is reported
     // as missing rather than after unrelated errors in its arguments.
     let user = if fr.param(name).is_some() { None } else { cx.env.entries.get(name) };
     match user {
         Some(Entry::Failed) => return Err(CalcError::Upstream),
-        Some(Entry::Var(_)) => return Err(not_callable(name)),
+        Some(Entry::Var(..)) => return Err(not_callable(name)),
         Some(Entry::Func { params, body }) => return call_user(cx, fr, name, params, body, args, depth),
         None => {}
     }
@@ -375,19 +459,30 @@ fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) ->
         return if is_constant(name) || lookup(name).is_some() { Err(not_callable(name)) } else { Err(CalcError::Undefined(name.to_string())) };
     }
     let values = eval_args(cx, fr, args, depth)?;
-    funcs::call(name, &values).unwrap_or_else(|| Err(CalcError::Undefined(name.to_string())))
+    let quantities: Vec<Quantity> = values.iter().map(|v| v.q).collect();
+    let q = funcs::call(name, &quantities).unwrap_or_else(|| Err(CalcError::Undefined(name.to_string())))?;
+    // The smaller or larger of absolute temperatures is one of them; any other result is plain.
+    let picks = matches!(name, "min" | "max") && !values.is_empty() && values.iter().all(|v| v.t != Temp::Plain);
+    let t = if !picks {
+        Temp::Plain
+    } else if values.iter().any(|v| v.t == Temp::Absolute) {
+        Temp::Absolute
+    } else {
+        Temp::Either
+    };
+    Ok(Val { q, t })
 }
 
 fn not_callable(name: &str) -> CalcError {
     CalcError::Syntax(format!("{name} isn't a function — it can't be called with ( )"))
 }
 
-fn eval_args(cx: &Cx<'_>, fr: &Frame<'_>, args: &[Expr], depth: usize) -> Result<Vec<Quantity>, CalcError> {
+fn eval_args(cx: &Cx<'_>, fr: &Frame<'_>, args: &[Expr], depth: usize) -> Result<Vec<Val>, CalcError> {
     args.iter().map(|a| eval(cx, fr, a, depth + 1)).collect()
 }
 
 /// Call a user function in a scope holding only its own parameters (and the global names).
-fn call_user(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, params: &[String], body: &Expr, args: &[Expr], depth: usize) -> Result<Quantity, CalcError> {
+fn call_user(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, params: &[String], body: &Expr, args: &[Expr], depth: usize) -> Result<Val, CalcError> {
     if args.len() != params.len() {
         return Err(CalcError::Arity(name.to_string(), params.len()));
     }

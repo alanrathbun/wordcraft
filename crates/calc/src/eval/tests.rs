@@ -166,7 +166,8 @@ fn offset_units_only_as_a_lone_literal() {
     }
     close(val("5 Δ°F + 100 °C ="), 373.15 + 5.0 * 5.0 / 9.0, Dim::TEMPERATURE);
     close(val("100 °C + 5 °R ="), 373.15 + 5.0 * 5.0 / 9.0, Dim::TEMPERATURE);
-    // An absolute literal beside a variable is refused; variables alone are not tracked.
+    // An absolute literal beside a variable is refused; variables carry whether they are absolute
+    // (see `offset_display_needs_an_absolute_temperature`).
     let mut env = Env::new();
     run(&mut env, "T_1 := 100 °C").expect("defines");
     run(&mut env, "T_2 := 20 °C").expect("defines");
@@ -363,4 +364,40 @@ fn redefinition_replaces_the_previous_entry() {
     env.mark_failed("a");
     assert_eq!(run(&mut env, "a(4) ="), Err(CalcError::Upstream));
     assert_eq!(env.names(), vec!["a".to_string()]);
+}
+
+#[test]
+fn offset_display_needs_an_absolute_temperature() {
+    let not_absolute = |u: &str| CalcError::NotAbsolute(u.to_string());
+    // A difference shown on an offset scale would be −253.15 °C: refused.
+    assert_eq!(err("dT := 20 Δ°C = ? °C"), not_absolute("°C"));
+    let mut env = Env::new();
+    run(&mut env, "T_1 := 70 °F").expect("defines");
+    run(&mut env, "T_2 := 100 °F").expect("defines");
+    assert_eq!(run(&mut env, "T_2 - T_1 = ? °F"), Err(not_absolute("°F")));
+    assert_eq!(run(&mut env, "T_2 - T_1 = ? °C"), Err(not_absolute("°C")));
+    // The difference itself is fine in a difference unit, or a plain one.
+    close(shown(&mut env, "T_2 - T_1 = ? Δ°F"), 30.0 * 5.0 / 9.0, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_2 - T_1 = ? K"), 30.0 * 5.0 / 9.0, Dim::TEMPERATURE);
+    // Absolute temperatures, and an absolute temperature plus or minus a difference, show.
+    close(shown(&mut env, "T := 70 °F = ? °C"), 294.261_111_111_111_1, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_1 + 5 K = ? °C"), 294.261_111_111_111_1 + 5.0, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_1 + (T_2 - T_1)/2 = ? °F"), (85.0 - 32.0) * 5.0 / 9.0 + 273.15, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_3 := T_2 - 10 Δ°F = ? °F"), (90.0 - 32.0) * 5.0 / 9.0 + 273.15, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_3 = ? °C"), (90.0 - 32.0) * 5.0 / 9.0 + 273.15, Dim::TEMPERATURE);
+    close(val("100 °C + 5 K = ? °C"), 378.15, Dim::TEMPERATURE);
+    close(val("T_K := 300 K = ? °C"), 300.0, Dim::TEMPERATURE);
+    // Anything else made from temperatures is not known to be absolute.
+    for src in ["(T_1 + T_2)/2 = ? °C", "2*T_1 = ? °C", "-T_1 + 600 K = ? °F", "5 K + 3 K = ? °C", "|T_1| = ? °C"] {
+        assert_eq!(run(&mut env, src), Err(not_absolute(src.rsplit(' ').next().unwrap())), "{src}");
+    }
+    // User functions pass it through their parameters and result.
+    run(&mut env, "warm(t) := t + 5 Δ°C").expect("defines");
+    run(&mut env, "twice(t) := 2*t").expect("defines");
+    close(shown(&mut env, "warm(T_1) = ? °C"), 294.261_111_111_111_1 + 5.0, Dim::TEMPERATURE);
+    assert_eq!(run(&mut env, "twice(T_1) = ? °C"), Err(not_absolute("°C")));
+    assert_eq!(run(&mut env, "warm(5 Δ°C) = ? °C"), Err(not_absolute("°C")));
+    // The larger of two absolute temperatures is one of them.
+    close(shown(&mut env, "max(T_1, T_2) = ? °F"), 310.927_777_777_777_8, Dim::TEMPERATURE);
+    assert_eq!(run(&mut env, "max(T_2 - T_1, 1 K) = ? °F"), Err(not_absolute("°F")));
 }

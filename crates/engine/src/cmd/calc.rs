@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use wordcraft_calc::{
-    CalcError, RecalcReport, calc_unchanged, check_new_name, defined_name, defined_names, freeze_outside_body, is_calc_object, mark_stale, parse,
-    recalc,
+    CalcError, RecalcReport, calc_unchanged, check_new_name, check_quote_unit, defined_name, defined_names, freeze_outside_body, is_calc_object,
+    mark_stale, parse, recalc,
 };
 use wordcraft_doc::calc::{CalcRegion, CalcState, UnitSystem, calc_field_instr, parse_calc_field};
 use wordcraft_doc::math::Math;
@@ -457,6 +457,10 @@ fn insert_value(s: &mut Session, v: &Value) -> CmdResult {
     require_body(s, "insert.calcValue")?;
     if !defined_names(&s.doc).iter().any(|(n, _)| *n == name) {
         return Err(CmdError::Failed(format!("{name} isn't a defined variable")));
+    }
+    // A unit the value can't be shown in would only ever show `?`.
+    if let Some(unit) = unit.as_deref() {
+        check_quote_unit(&s.doc, &name, unit).map_err(|e| CmdError::Failed(format!("{name} can't be shown in {unit}: {e}")))?;
     }
     // The field code must read back as written, or the value would never be updated.
     let instr = calc_field_instr(&name, unit.as_deref(), precision);

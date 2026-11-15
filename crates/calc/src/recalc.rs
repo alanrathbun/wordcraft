@@ -15,9 +15,9 @@ use wordcraft_doc::math::Arg;
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph};
 
-use crate::eval::{MAX_PASS_STEPS, Pass, run_stmt_in};
+use crate::eval::{MAX_PASS_STEPS, Pass, check_unit_for, run_stmt_in};
 use crate::render::{self, Rendered, rendered, shown_result, shows_value};
-use crate::{CalcError, Env, Expr, Stmt, check_name, defined_name, eval_expr, free_names, parse};
+use crate::{CalcError, Env, Stmt, check_name, defined_name, free_names, parse};
 
 /// What a [`recalc`] pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,16 +58,7 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
     let found = collect(&doc.body);
     let (ids, reassigned_ids) = assign_ids(&found);
     let regions = &found.regions;
-    let mut index = Index::build(regions, &ids, page_of);
-    // A region's own display unit applies when its source names none.
-    for (stmt, r) in index.parsed.iter_mut().zip(regions) {
-        if let (Ok(stmt), Some(unit)) = (stmt, r.unit.as_deref().filter(|u| !u.trim().is_empty())) {
-            match stmt {
-                Stmt::Eval { show, .. } | Stmt::Define { show: Some(show), .. } if show.unit.is_none() => show.unit = Some(unit.to_string()),
-                _ => {}
-            }
-        }
-    }
+    let index = Index::build(regions, &ids, page_of);
     let (env, outcomes, failed) = evaluate(&index);
 
     let sys = unit_system(&settings);
@@ -139,6 +130,22 @@ fn names_of(doc: &Document) -> (Vec<u64>, Index) {
     let (ids, _) = assign_ids(&found);
     let index = Index::build(&found.regions, &ids, &|_| None);
     (ids, index)
+}
+
+/// Whether a quoted value of the variable `name` can show it in `unit`: the unit must read
+/// ([`parse_unit`]) and, when the variable has a value now, be of its dimension, and `°C`/`°F` only
+/// for an absolute temperature. A variable with no value now (an error) is checked when it has one;
+/// until then the quoted value shows `?`.
+pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), CalcError> {
+    parse_unit(unit)?;
+    let found = collect(&doc.body);
+    let (ids, _) = assign_ids(&found);
+    let index = Index::build(&found.regions, &ids, &|_| None);
+    let (env, _, _) = evaluate(&index);
+    match env.value(name) {
+        Some(v) => check_unit_for(v, unit),
+        None => Ok(()),
+    }
 }
 
 /// Whether `name` may be given to a new calculation, or to the region `editing` (whose own
@@ -513,7 +520,17 @@ impl Index {
             })
             .collect();
         let edited = regions.iter().map(|r| r.state == CalcState::EditedOutside).collect();
-        Index { parsed, early, owners, edited }
+        let mut index = Index { parsed, early, owners, edited };
+        // A region's own display unit applies when its source names none.
+        for (stmt, r) in index.parsed.iter_mut().zip(regions) {
+            if let (Ok(stmt), Some(unit)) = (stmt, r.unit.as_deref().filter(|u| !u.trim().is_empty())) {
+                match stmt {
+                    Stmt::Eval { show, .. } | Stmt::Define { show: Some(show), .. } if show.unit.is_none() => show.unit = Some(unit.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        index
     }
 }
 
@@ -761,8 +778,12 @@ fn field_result(f: &FoundField, index: &Index, env: &Env, failed: &[bool], setti
     if !valid {
         return "?".to_string();
     }
-    let Ok(q) = eval_expr(env, &Expr::Name(f.name.clone())) else { return "?".to_string() };
-    match format_value(q, f.unit.as_deref(), unit_system(settings), precision(f.precision, settings)) {
+    let Some(v) = env.value(&f.name) else { return "?".to_string() };
+    // A difference shown in °C or °F would be a wrong number.
+    if f.unit.as_deref().is_some_and(|u| check_unit_for(v, u).is_err()) {
+        return "?".to_string();
+    }
+    match format_value(v.q, f.unit.as_deref(), unit_system(settings), precision(f.precision, settings)) {
         Ok(shown) if shown.unit.is_empty() => render::text_number(&shown.number),
         Ok(shown) => format!("{} {}", render::text_number(&shown.number), shown.unit),
         Err(_) => "?".to_string(),

@@ -24,7 +24,8 @@ pub use ast::{Expr, Op, Show, Stmt, defined_name, free_names};
 pub use eval::{Env, check_name, eval_expr, run_stmt};
 pub use parse::parse;
 pub use recalc::{
-    NOT_CALCULATED_HERE, RecalcReport, calc_unchanged, check_new_name, defined_names, freeze_outside_body, is_calc_object, mark_stale, recalc,
+    NOT_CALCULATED_HERE, RecalcReport, calc_unchanged, check_new_name, check_quote_unit, defined_names, freeze_outside_body, is_calc_object,
+    mark_stale, recalc,
 };
 
 /// An error from parsing or evaluating a calculation. The message is shown to the author next to
@@ -71,6 +72,10 @@ pub enum CalcError {
         /// The page of the other definition, when known.
         page: Option<u32>,
     },
+    /// A value that isn't an absolute temperature shown on an offset scale (`°C`, `°F`): holds the
+    /// unit as written.
+    #[error("{0} shows an absolute temperature; use Δ{0} for a difference")]
+    NotAbsolute(String),
     /// A name that is a unit, function or constant.
     #[error("{0} is a unit, function or constant name — choose another name")]
     ReservedName(String),

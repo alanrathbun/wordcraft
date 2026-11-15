@@ -870,3 +870,30 @@ fn quoted_values_in_exponential_form_use_superscripts() {
     assert_eq!(quoted, ["2.9×10⁷ psi", "6.5×10⁻⁶", "-2.5×10⁹"]);
     assert!(quoted.iter().all(|q| !q.contains('^')), "no markup in a sentence");
 }
+
+#[test]
+fn a_temperature_difference_never_shows_on_an_offset_scale() {
+    let mut d = doc_with(&["T_1 := 70 °F", "T_2 := 100 °F", "dT := T_2 - T_1", "dT =", "T_1 = ? °C"]);
+    // The region's own unit, as Insert › Calculation's options would set it.
+    edit_region(&mut d, 4, |c, _| c.unit = Some("°F".into()));
+    if let Block::Para(p) = Arc::make_mut(&mut d.body[4]) {
+        for instr in [calc_field_instr("dT", Some("°C"), None), calc_field_instr("dT", Some("Δ°C"), None), calc_field_instr("T_1", Some("°C"), None)]
+        {
+            let end = p.text.len();
+            p.insert_object(end, field(&instr), &CharProps::default()).unwrap();
+        }
+    }
+    recalc(&mut d, &no_page);
+    let (r, linear, _) = region(&d, 4);
+    assert_eq!(r.state, err(CalcError::NotAbsolute("°F".into())), "{linear}");
+    assert!(!linear.contains('='), "{linear}");
+    assert_eq!(region(&d, 5).1, "T_1=21.111 \"°C\"");
+    let quoted: Vec<String> = objects(&d)
+        .into_iter()
+        .filter_map(|o| match o {
+            InlineObject::Field { result, .. } => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(quoted, ["?", "16.667 Δ°C", "21.111 °C"]);
+}

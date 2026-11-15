@@ -832,3 +832,25 @@ fn typing_text_in_manual_mode_leaves_results_current() {
     run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
     assert_eq!(region(&s, sigma).0.state, CalcState::Stale);
 }
+
+#[test]
+fn a_quoted_value_unit_is_checked() {
+    let mut s = session();
+    sample(&mut s);
+    calc(&mut s, "T_1 := 70 °F");
+    calc(&mut s, "T_2 := 100 °F");
+    calc(&mut s, "dT := T_2 - T_1");
+    for (name, unit, why) in [
+        ("σ", "furlongs", "furlongs"),
+        ("σ", "in", "σ can't be shown in in"),
+        ("dT", "°C", "°C shows an absolute temperature; use Δ°C for a difference"),
+    ] {
+        let e = s.run("insert.calcValue", &json!({"name": name, "unit": unit})).unwrap_err();
+        assert!(e.to_string().contains(why), "{name} in {unit}: {e}");
+    }
+    assert!(field_results(&s).is_empty(), "nothing inserted");
+    run(&mut s, "insert.calcValue", json!({"name": "σ", "unit": "ksi"}));
+    run(&mut s, "insert.calcValue", json!({"name": "T_1", "unit": "°C"}));
+    run(&mut s, "insert.calcValue", json!({"name": "dT", "unit": "Δ°C"}));
+    assert_eq!(field_results(&s), ["0.6 ksi", "21.111 °C", "16.667 Δ°C"]);
+}
