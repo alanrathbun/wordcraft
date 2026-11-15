@@ -15,8 +15,9 @@ use wordcraft_doc::math::Arg;
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph};
 
+use crate::eval::{MAX_PASS_STEPS, Pass, run_stmt_in};
 use crate::render::{self, Rendered, rendered, shown_result, shows_value};
-use crate::{CalcError, Env, Expr, Stmt, check_name, defined_name, eval_expr, free_names, parse, run_stmt};
+use crate::{CalcError, Env, Expr, Stmt, check_name, defined_name, eval_expr, free_names, parse};
 
 /// What a [`recalc`] pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -283,6 +284,57 @@ pub fn is_calc_object(o: &InlineObject) -> bool {
     }
 }
 
+/// One calculation object as far as the recalculation pass is concerned: what it reads, and what
+/// it writes (so a display or quoted value changed by anything else is drawn again).
+#[derive(PartialEq)]
+enum Item<'a> {
+    Region { story: Option<u32>, deleted: bool, region: &'a calc::CalcRegion, linear: &'a str },
+    Field { story: Option<u32>, deleted: bool, instr: &'a str, result: &'a str, dirty: bool },
+}
+
+/// Every calculation object of `doc` in document order: the body's, then each other story's.
+fn items(doc: &Document) -> Vec<Item<'_>> {
+    let mut out = Vec::new();
+    let stories = std::iter::once((None, &doc.body)).chain(doc.parts.iter().map(|(&k, part)| (Some(k), &part.blocks)));
+    for (story, blocks) in stories {
+        walk_paras(blocks, &mut |_, p| {
+            if !p.objects.iter().any(is_calc_object) {
+                return;
+            }
+            let deleted = p.deleted_ranges();
+            let mut anchors = p.text.char_indices().filter(|&(_, c)| c == OBJ).map(|(i, _)| i);
+            for o in &p.objects {
+                let deleted = anchors.next().is_some_and(|off| deleted.iter().any(|r| r.contains(&off)));
+                match o {
+                    InlineObject::Equation { linear, calc: Some(region), .. } => out.push(Item::Region { story, deleted, region, linear }),
+                    InlineObject::Field { instr, result, dirty, .. } if is_calc_object(o) => {
+                        out.push(Item::Field { story, deleted, instr, result, dirty: *dirty });
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    out
+}
+
+/// Whether the pass has nothing to do after a command turned `before` into `after`: the same
+/// calculation settings and the same calculation objects in the same order (each region's id,
+/// source, unit, precision, state and display; each quoted value's code and result; whether
+/// each is tracked-deleted and which story it is in), and, in automatic mode, no result out of
+/// date. Typing ordinary text leaves all of that alone, so it costs no recalculation (and in
+/// manual mode marks nothing stale).
+pub fn calc_unchanged(before: &Document, after: &Document) -> bool {
+    if before.calc_settings != after.calc_settings {
+        return false;
+    }
+    let now = items(after);
+    let manual = after.calc_settings.as_ref().is_some_and(|c| c.manual);
+    // In automatic mode a stale result is left from a pass that failed: the next edit retries.
+    let stale = !manual && now.iter().any(|i| matches!(i, Item::Region { region, .. } if region.state == CalcState::Stale));
+    !stale && items(before) == now
+}
+
 /// What a calculation outside the main text says instead of a result.
 pub const NOT_CALCULATED_HERE: &str = "not calculated here";
 
@@ -507,6 +559,8 @@ fn evaluate(index: &Index) -> (Env, Vec<Outcome>, Vec<bool>) {
         }
     }
     let mut env = Env::new();
+    // One budget for the whole pass: a hostile document errors instead of taking seconds.
+    let pass = Pass::new(MAX_PASS_STEPS);
     // Record that region `i` failed: using its name is then an upstream error.
     let fail = |env: &mut Env, node: &mut Node, i: usize| {
         node.failed = true;
@@ -528,7 +582,7 @@ fn evaluate(index: &Index) -> (Env, Vec<Outcome>, Vec<bool>) {
             _ if own_edit => Err(CalcError::EditedOutside),
             _ if upstream_edited => Err(CalcError::UpstreamEdited),
             _ if upstream => Err(CalcError::Upstream),
-            Some(Ok(stmt)) => run_stmt(&mut env, stmt),
+            Some(Ok(stmt)) => run_stmt_in(&mut env, stmt, &pass),
             Some(Err(e)) => Err(e.clone()),
             None => Err(CalcError::Upstream),
         };

@@ -785,3 +785,67 @@ fn perf_2000_regions() {
     assert_eq!(region(&d, 2000).1, "x_1999≔x_1998+1 \"in\"=2001 \"in\"");
     assert!(took.as_millis() < 100, "recalc took {took:?}");
 }
+
+#[test]
+fn one_budget_bounds_the_whole_pass() {
+    // Each f_i calls the one before twice: f_24(1) needs ~33 million steps, far over one
+    // statement's limit, and twenty of them would cost seconds if each had a limit of its own.
+    let mut sources: Vec<String> = vec!["f_0(x) := x".into()];
+    sources.extend((1..=24).map(|i| format!("f_{i}(x) := f_{}(x) + f_{}(x)", i - 1, i - 1)));
+    sources.extend((0..20).map(|i| format!("y_{i} := f_24(1) =")));
+    sources.push("z := 2 =".into());
+    let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+    let mut d = doc_with(&refs);
+    let started = Instant::now();
+    let report = recalc(&mut d, &no_page);
+    let elapsed = started.elapsed();
+    assert_eq!(report.errors, 20, "every y");
+    let budget = err(CalcError::TooMuchWork);
+    let states: Vec<CalcState> = regions(&d).into_iter().map(|(r, _, _)| r.state).collect();
+    // Each y spends its own million steps until the pass's five million are gone.
+    assert_eq!(states[25..29], vec![err(CalcError::TooComplex); 4]);
+    assert_eq!(states[29..45], vec![budget; 16]);
+    // z needs nothing, so it ran first and is correct.
+    assert_eq!(states[45], CalcState::Fresh);
+    for (r, linear, _) in regions(&d).into_iter().skip(25).take(20) {
+        assert!(!linear.contains('='), "{}: no number: {linear}", r.source);
+    }
+    // Generous: a debug build on a slow machine. Without the shared budget it is ~4× this work.
+    assert!(elapsed.as_secs() < 20, "{elapsed:?}");
+}
+
+#[test]
+fn unchanged_calculations_need_no_pass() {
+    use wordcraft_calc::calc_unchanged;
+    let mut d = doc_with(&["x := 1 =", "y := x + 1 ="]);
+    recalc(&mut d, &no_page);
+    // Typing ordinary text.
+    let mut typed = d.clone();
+    if let Block::Para(p) = Arc::make_mut(&mut typed.body[0]) {
+        p.insert_text(0, "More ", &CharProps::default()).unwrap();
+    }
+    assert!(calc_unchanged(&d, &typed));
+    // A source, a unit, the settings, a region's order: each needs a pass.
+    let mut changed = d.clone();
+    edit_region(&mut changed, 1, |c, _| c.source = "x := 2 =".into());
+    assert!(!calc_unchanged(&d, &changed));
+    let mut changed = d.clone();
+    edit_region(&mut changed, 2, |c, _| c.unit = Some("in".into()));
+    assert!(!calc_unchanged(&d, &changed));
+    let mut changed = d.clone();
+    changed.calc_settings = Some(CalcSettings { precision: 1, ..CalcSettings::default() });
+    assert!(!calc_unchanged(&d, &changed));
+    let mut changed = d.clone();
+    changed.body.swap(0, 1);
+    assert!(!calc_unchanged(&d, &changed));
+    // A display changed by something else is drawn again.
+    let mut changed = d.clone();
+    edit_region(&mut changed, 2, |_, linear| *linear = "y≔x+1=99".into());
+    assert!(!calc_unchanged(&d, &changed));
+    // In automatic mode a stale result (left by a pass that failed) is retried.
+    let mut stale = d.clone();
+    mark_stale(&mut stale);
+    assert!(!calc_unchanged(&stale, &stale.clone()));
+    stale.calc_settings = Some(CalcSettings { manual: true, ..CalcSettings::default() });
+    assert!(calc_unchanged(&stale, &stale.clone()));
+}

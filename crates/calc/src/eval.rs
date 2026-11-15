@@ -18,6 +18,9 @@ const MAX_CALL_DEPTH: usize = 32;
 const MAX_EVAL_DEPTH: usize = 2048;
 /// How many expression nodes one statement may evaluate.
 const MAX_STEPS: u32 = 1_000_000;
+/// How many expression nodes one recalculation of a whole document may evaluate: what keeps a
+/// hostile document from costing seconds on every edit.
+pub(crate) const MAX_PASS_STEPS: u64 = 5_000_000;
 
 /// What a name means in an [`Env`].
 #[derive(Debug, Clone, PartialEq)]
@@ -95,7 +98,24 @@ fn is_constant(name: &str) -> bool {
 
 /// Evaluate an expression against the defined names.
 pub fn eval_expr(env: &Env, e: &Expr) -> Result<Quantity, CalcError> {
-    let cx = Cx { env, steps: Cell::new(0) };
+    let pass = Pass::new(u64::MAX);
+    eval_in(env, e, &pass)
+}
+
+/// The work a whole recalculation may do, shared by every statement it runs.
+pub(crate) struct Pass {
+    spent: Cell<u64>,
+    limit: u64,
+}
+
+impl Pass {
+    pub(crate) fn new(limit: u64) -> Pass {
+        Pass { spent: Cell::new(0), limit }
+    }
+}
+
+fn eval_in(env: &Env, e: &Expr, pass: &Pass) -> Result<Quantity, CalcError> {
+    let cx = Cx { env, steps: Cell::new(0), pass };
     eval(&cx, &Frame::GLOBAL, e, 0)
 }
 
@@ -105,9 +125,15 @@ pub fn eval_expr(env: &Env, e: &Expr) -> Result<Quantity, CalcError> {
 /// Nothing is defined unless the whole statement succeeds, including a `= ? unit` that does not
 /// match the value's dimension. The unit itself is applied by whoever formats the value.
 pub fn run_stmt(env: &mut Env, s: &Stmt) -> Result<Option<Quantity>, CalcError> {
+    run_stmt_in(env, s, &Pass::new(u64::MAX))
+}
+
+/// [`run_stmt`], counting its work against `pass`: once the pass has done its limit, every
+/// statement is [`CalcError::TooMuchWork`].
+pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option<Quantity>, CalcError> {
     match s {
         Stmt::Eval { expr, show } => {
-            let q = eval_expr(env, expr)?;
+            let q = eval_in(env, expr, pass)?;
             check_show(show, q)?;
             Ok(Some(q))
         }
@@ -121,7 +147,7 @@ pub fn run_stmt(env: &mut Env, s: &Stmt) -> Result<Option<Quantity>, CalcError> 
                 env.define_fn(name, params.clone(), body.clone());
                 return Ok(None);
             }
-            let q = eval_expr(env, body)?;
+            let q = eval_in(env, body, pass)?;
             if let Some(show) = show {
                 check_show(show, q)?;
             }
@@ -145,6 +171,8 @@ struct Cx<'a> {
     env: &'a Env,
     /// Expression nodes evaluated so far.
     steps: Cell<u32>,
+    /// The whole recalculation's work.
+    pass: &'a Pass,
 }
 
 /// The parameters in scope, and how many user functions deep we are.
@@ -171,6 +199,11 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Quantity,
         return Err(CalcError::TooComplex);
     }
     cx.steps.set(steps);
+    let spent = cx.pass.spent.get().saturating_add(1);
+    if spent > cx.pass.limit {
+        return Err(CalcError::TooMuchWork);
+    }
+    cx.pass.spent.set(spent);
     match e {
         Expr::Num(v) => finite(*v),
         Expr::Name(n) => resolve(cx, fr, n),

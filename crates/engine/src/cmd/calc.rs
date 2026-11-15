@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use wordcraft_calc::{
-    CalcError, RecalcReport, check_new_name, defined_name, defined_names, freeze_outside_body, is_calc_object, mark_stale, parse, recalc,
+    CalcError, RecalcReport, calc_unchanged, check_new_name, defined_name, defined_names, freeze_outside_body, is_calc_object, mark_stale, parse,
+    recalc,
 };
 use wordcraft_doc::calc::{CalcRegion, CalcState, UnitSystem, calc_field_instr, parse_calc_field};
 use wordcraft_doc::math::Math;
@@ -95,15 +96,16 @@ pub(crate) fn parts_have_calc(doc: &Document) -> bool {
 }
 
 /// After a successful mutating command, inside its undo step: recalculate, or in manual mode mark
-/// the results stale. Skipped when the command changed nothing (it stays a no-op) and when the
-/// document has no calculations.
+/// the results stale. Skipped when the command changed nothing (it stays a no-op), when it
+/// changed nothing a calculation reads or shows ([`calc_unchanged`]: typing ordinary text) and
+/// when the document has no calculations.
 ///
 /// The pass reads file content, so it runs inside its own `catch_unwind` (the command's has
 /// already returned): a panic puts the document back as the command left it, greys every result
 /// (if even that works, so no result looks current) and says so in the status line. The edit
 /// itself stands.
 pub(crate) fn after_command(s: &mut Session, id: &str, before: &Document) {
-    if NO_AUTO_PASS.contains(&id) || s.doc.same_content(before) {
+    if NO_AUTO_PASS.contains(&id) || s.doc.same_content(before) || calc_unchanged(before, &s.doc) {
         return;
     }
     let (body, outside) = (has_calc(&s.doc), parts_have_calc(&s.doc));

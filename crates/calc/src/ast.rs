@@ -1,5 +1,7 @@
 //! The syntax tree of a calculation, and what a statement defines and uses.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// One calculation statement.
@@ -87,28 +89,31 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
         Stmt::Eval { expr, .. } => (expr, &[]),
     };
     let mut out: Vec<String> = Vec::new();
+    // Names already in `out` (or parameters): one lookup each, so a long body costs linear time.
+    let mut seen: HashSet<&str> = params.iter().map(String::as_str).collect();
     // An explicit stack keeps this safe on trees built by hand, deeper than the parser allows.
     let mut stack: Vec<&Expr> = vec![body];
     while let Some(e) = stack.pop() {
-        match e {
-            Expr::Num(_) | Expr::Quantity(..) => {}
-            Expr::Name(n) => note(&mut out, params, n),
-            Expr::Unary(_, a) | Expr::Abs(a) => stack.push(a),
+        let name = match e {
+            Expr::Num(_) | Expr::Quantity(..) => continue,
+            Expr::Name(n) => n,
+            Expr::Unary(_, a) | Expr::Abs(a) => {
+                stack.push(a);
+                continue;
+            }
             Expr::Binary(_, a, b) => {
                 stack.push(b);
                 stack.push(a);
+                continue;
             }
             Expr::Call(n, args) => {
-                note(&mut out, params, n);
                 stack.extend(args.iter().rev());
+                n
             }
+        };
+        if seen.insert(name) {
+            out.push(name.clone());
         }
     }
     out
-}
-
-fn note(out: &mut Vec<String>, params: &[String], name: &str) {
-    if !params.iter().any(|p| p == name) && !out.iter().any(|o| o == name) {
-        out.push(name.to_string());
-    }
 }

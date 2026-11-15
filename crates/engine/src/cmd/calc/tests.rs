@@ -163,18 +163,12 @@ fn duplicate_insert_is_refused() {
 fn duplicate_message_names_page() {
     let mut s = session();
     sample(&mut s);
-    // A pasted copy of P's definition (the paste bypasses the name check): put one straight into
-    // the document, then make any edit.
-    let end = s.doc.end_of(wordcraft_doc::StoryRef::Body);
-    let copy = InlineObject::Equation {
-        linear: String::new(),
-        display: true,
-        math: Math::default(),
-        calc: Some(Box::new(CalcRegion { id: 77, source: "P := 2 lbf".into(), unit: None, precision: None, state: CalcState::Fresh })),
-    };
-    s.doc.insert_object(&end, copy, &Default::default()).unwrap();
-    run(&mut s, "text.insert", json!({"text": "x"}));
-    let (r, _) = region(&s, 77);
+    // A pasted copy of P's definition (the paste bypasses the name check).
+    copy_object(&mut s, 0);
+    run(&mut s, "caret.docEnd", json!({}));
+    run(&mut s, "edit.paste", json!({}));
+    let (r, _) = regions(&s).pop().unwrap();
+    assert_eq!(r.source, "P := 1500 lbf");
     match r.state {
         CalcState::Error(m) => assert!(m.contains("already defined on page 1"), "{m}"),
         other => panic!("{other:?}"),
@@ -824,4 +818,17 @@ fn editing_a_pasted_copy_in_manual_mode_leaves_the_original() {
     run(&mut s, "calc.setSource", json!({"id": ids[1], "source": "b := 2 ="}));
     let sources: Vec<String> = regions(&s).into_iter().map(|(r, _)| r.source).collect();
     assert_eq!(sources, ["a := 1 =", "b := 2 ="]);
+}
+
+#[test]
+fn typing_text_in_manual_mode_leaves_results_current() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    run(&mut s, "text.insert", json!({"text": "The stress follows."}));
+    run(&mut s, "text.newParagraph", json!({}));
+    assert!(regions(&s).iter().all(|(r, _)| r.state == CalcState::Fresh), "typing text changes no input");
+    // Editing a source still marks what follows from it out of date.
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
+    assert_eq!(region(&s, sigma).0.state, CalcState::Stale);
 }
