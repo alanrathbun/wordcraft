@@ -734,7 +734,7 @@ fn hostile_documents_return_a_report() {
     let mut sources: Vec<String> = vec![long, "y := 10^400 =".into(), "√-1 =".into(), String::new(), "=".into(), ":=".into()];
     // A 3,000-long cycle.
     for i in 0..3000 {
-        sources.push(format!("c_{i} := c_{} + 1", (i + 1) % 3000));
+        sources.push(format!("q_{i} := q_{} + 1", (i + 1) % 3000));
     }
     let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
     let mut d = doc_with(&refs);

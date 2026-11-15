@@ -119,7 +119,7 @@ impl Env {
 }
 
 /// Refuse a name that is a unit (with or without an SI prefix), a built-in function, or one of
-/// the constants `π`, `pi` and `e`; and a name with an empty subscript part (`a__b`, `x_`),
+/// one of the built-in constants (`π`, `pi`, `e`, `g_0`, `c_0`, `R_u`); and a name with an empty subscript part (`a__b`, `x_`),
 /// which would display like a different name (`a_b`, `x`).
 pub fn check_name(name: &str) -> Result<(), CalcError> {
     if name.contains('_') && name.split('_').any(str::is_empty) {
@@ -131,10 +131,17 @@ pub fn check_name(name: &str) -> Result<(), CalcError> {
     Ok(())
 }
 
-fn constant(name: &str) -> Option<f64> {
+/// The built-in constants, with their units: π and e, standard gravity `g_0`, the speed of light
+/// `c_0` and the molar gas constant `R_u` (exact SI values). `g` alone is the gram, so gravity
+/// carries a subscript.
+fn constant(name: &str) -> Option<Quantity> {
+    let with = |value: f64, unit: &str| parse_unit(unit).ok().map(|s| Quantity::new(value * s.factor, s.dim));
     match name {
-        "π" | "pi" => Some(std::f64::consts::PI),
-        "e" => Some(std::f64::consts::E),
+        "π" | "pi" => Some(Quantity::dimensionless(std::f64::consts::PI)),
+        "e" => Some(Quantity::dimensionless(std::f64::consts::E)),
+        "g_0" => with(9.80665, "m/s^2"),
+        "c_0" => with(299_792_458.0, "m/s"),
+        "R_u" => with(8.314_462_618_153_24, "J/(mol·K)"),
         _ => None,
     }
 }
@@ -424,8 +431,8 @@ fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Val, CalcError> {
         Some(Entry::Func { .. }) => return Err(not_a_value(name)),
         None => {}
     }
-    if let Some(v) = constant(name) {
-        return Ok(Val::plain(Quantity::dimensionless(v)));
+    if let Some(q) = constant(name) {
+        return Ok(Val::plain(q));
     }
     // A unit wins over a built-in of the same spelling: `5 min` is minutes, `min(1, 2)` a call.
     if let Some(scale) = lookup(name) {

@@ -249,6 +249,92 @@ pub struct CalcBox {
     pub focus: bool,
     #[serde(skip)]
     pub anchor: Option<Pos2>,
+    /// Where the box's cursor last was (char index), so a symbol picked from the menu goes there.
+    #[serde(skip)]
+    pub cursor: Option<usize>,
+    /// Move the box's cursor to [`CalcBox::cursor`] on the next frame (after a symbol is inserted).
+    #[serde(skip)]
+    pub place_cursor: bool,
+}
+
+/// The symbols the box's menu offers, by group: Greek letters, operators, the units that are hard
+/// to type, and the built-in constants (`g` alone is the gram, so gravity is `g_0`).
+pub const SYMBOL_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Greek",
+        &[
+            "α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "κ", "λ", "μ", "ν", "ξ", "ρ", "σ", "τ", "υ", "φ", "χ", "ψ", "ω", "Γ", "Δ", "Θ", "Λ", "Ξ", "Σ",
+            "Φ", "Ψ", "Ω",
+        ],
+    ),
+    ("Operators", &["≔", "·", "×", "±", "√", "²", "³", "⁻¹", "|", "°"]),
+    ("Units", &["°F", "°C", "Δ°F", "Δ°C", "µm", "Ω"]),
+    ("Constants", &["π", "e", "g_0", "c_0", "R_u"]),
+];
+
+/// `\name` shortcuts the box turns into symbols, as in Word's math autocorrect.
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("alpha", "α"),
+    ("beta", "β"),
+    ("gamma", "γ"),
+    ("delta", "δ"),
+    ("epsilon", "ε"),
+    ("zeta", "ζ"),
+    ("eta", "η"),
+    ("theta", "θ"),
+    ("iota", "ι"),
+    ("kappa", "κ"),
+    ("lambda", "λ"),
+    ("mu", "μ"),
+    ("nu", "ν"),
+    ("xi", "ξ"),
+    ("pi", "π"),
+    ("rho", "ρ"),
+    ("sigma", "σ"),
+    ("tau", "τ"),
+    ("upsilon", "υ"),
+    ("phi", "φ"),
+    ("chi", "χ"),
+    ("psi", "ψ"),
+    ("omega", "ω"),
+    ("Gamma", "Γ"),
+    ("Delta", "Δ"),
+    ("Theta", "Θ"),
+    ("Lambda", "Λ"),
+    ("Xi", "Ξ"),
+    ("Pi", "Π"),
+    ("Sigma", "Σ"),
+    ("Phi", "Φ"),
+    ("Psi", "Ψ"),
+    ("Omega", "Ω"),
+    ("sqrt", "√"),
+    ("cdot", "·"),
+    ("times", "×"),
+    ("pm", "±"),
+    ("deg", "°"),
+];
+
+/// A `\name` just finished at char index `cursor` (the character before the cursor ends it) turned
+/// into its symbol: the new text and cursor. A space that ends the name is used up; any other
+/// character stays. `None` when nothing before the cursor is a known shortcut.
+pub fn expand_shortcut(text: &str, cursor: usize) -> Option<(String, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let end = cursor.checked_sub(1)?;
+    let ender = *chars.get(end)?;
+    if ender.is_alphanumeric() || ender == '\\' {
+        return None;
+    }
+    let start = chars[..end].iter().rposition(|c| !c.is_ascii_alphabetic())?;
+    if chars.get(start) != Some(&'\\') || start + 1 == end {
+        return None;
+    }
+    let name: String = chars[start + 1..end].iter().collect();
+    let symbol = SHORTCUTS.iter().find(|(n, _)| *n == name)?.1;
+    let replacement = if ender == ' ' { symbol.to_string() } else { format!("{symbol}{ender}") };
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(&replacement);
+    out.extend(chars.get(cursor..).unwrap_or_default());
+    Some((out, start + replacement.chars().count()))
 }
 
 /// The unique-name prompt: the clash message and a new name to rename the definition to.
@@ -283,7 +369,19 @@ pub enum Commit {
 
 impl CalcBox {
     pub fn new(editing: Option<u64>, source: &str, anchor: Option<Pos2>) -> CalcBox {
-        CalcBox { source: source.to_string(), editing, prompt: None, message: String::new(), focus: true, anchor }
+        CalcBox { source: source.to_string(), editing, prompt: None, message: String::new(), focus: true, anchor, cursor: None, place_cursor: false }
+    }
+
+    /// Put `symbol` at the box's cursor (at the end before the box has had one), leaving the
+    /// cursor after it and the keyboard back in the box.
+    pub fn insert_symbol(&mut self, symbol: &str) {
+        let len = self.source.chars().count();
+        let at = self.cursor.unwrap_or(len).min(len);
+        let byte = self.source.char_indices().nth(at).map_or(self.source.len(), |(i, _)| i);
+        self.source.insert_str(byte, symbol);
+        self.cursor = Some(at + symbol.chars().count());
+        self.place_cursor = true;
+        self.focus = true;
     }
 
     /// Enter: check the defined name, then insert the calculation or change the region's source.
@@ -419,8 +517,36 @@ fn source_ui(app: &mut WordApp, ui: &mut Ui, b: &mut CalcBox) -> bool {
     }
     if out.response.changed() {
         b.message.clear();
+        let cursor: usize = out.cursor_range.map_or(b.source.chars().count(), |r| r.primary.index.into());
+        if let Some((text, at)) = expand_shortcut(&b.source, cursor) {
+            b.source = text;
+            b.cursor = Some(at);
+            b.place_cursor = true;
+        }
+    }
+    if std::mem::take(&mut b.place_cursor) {
+        let at = b.cursor.unwrap_or(b.source.chars().count());
+        out.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(at))));
+        out.state.clone().store(ui.ctx(), out.response.id);
     }
     fix_define_mark(ui, &mut out, &mut b.source, covered);
+    if let Some(r) = out.cursor_range {
+        b.cursor = Some(r.primary.index.into());
+    }
+    ui.menu_button(tl!("Insert Symbol"), |ui| {
+        for (group, symbols) in SYMBOL_GROUPS {
+            ui.label(egui::RichText::new(tl!(*group)).small().weak());
+            ui.horizontal_wrapped(|ui| {
+                for s in *symbols {
+                    if ui.button(*s).clicked() {
+                        b.insert_symbol(s);
+                        ui.close();
+                    }
+                }
+            });
+        }
+        ui.label(egui::RichText::new(tl!("Tip: type \\sigma, \\theta, \\Delta… then a space.")).small().weak());
+    });
     error_line(ui, &b.message);
     ui.label(egui::RichText::new(tl!("Define with :=, show a result with = at the end (σ := P/A =).")).small().weak());
     let ok = if b.editing.is_some() { tl!("Update") } else { tl!("Insert") };

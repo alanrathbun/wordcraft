@@ -401,3 +401,23 @@ fn offset_display_needs_an_absolute_temperature() {
     close(shown(&mut env, "max(T_1, T_2) = ? °F"), 310.927_777_777_777_8, Dim::TEMPERATURE);
     assert_eq!(run(&mut env, "max(T_2 - T_1, 1 K) = ? °F"), Err(not_absolute("°F")));
 }
+
+#[test]
+fn engineering_constants_carry_their_units() {
+    let accel = Dim::LENGTH.div(Dim::TIME.powi(2).unwrap()).unwrap();
+    close(val("a := g_0 ="), 9.80665, accel);
+    close(val("v := c_0 ="), 299_792_458.0, Dim::LENGTH.div(Dim::TIME).unwrap());
+    let r = val("r := R_u =");
+    assert!((r.value - 8.314_462_618).abs() < 1e-9, "{}", r.value);
+    // A weight: 10 kg under standard gravity is 98.0665 N, and 1 lbm weighs 1 lbf.
+    close(val("F_w := 10 kg·g_0 ="), 98.0665, val("n_1 := 1 N =").dim);
+    let mut env = Env::new();
+    let w = shown(&mut env, "F_1 := 1 lbm·g_0 =");
+    let f = format(w, Some(&craft_units::parse_unit("lbf").unwrap()), UnitSystem::UsCustomary, Precision::new(6)).unwrap();
+    assert_eq!(f.number, "1");
+    // The constants are taken: they can't be redefined.
+    for name in ["g_0", "c_0", "R_u"] {
+        assert!(matches!(check_name(name), Err(CalcError::ReservedName(_))), "{name}");
+    }
+    assert!(check_name("g_1").is_ok(), "other subscripts are free");
+}

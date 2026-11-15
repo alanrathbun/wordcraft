@@ -28,8 +28,29 @@ below its definition. Defining a name twice is an error ("already defined on pag
 unique name"), and so is a circular definition (`a := b`, `b := a`).
 
 A name can't be a unit, a built-in function or a constant. That rules out `m`, `A`, `L`, `h`, `g`,
-`s`, `N`, `W`, `J`, `kN`, `min`, `sin`, `π`, `e` and the rest. Use a subscript instead: `A_b`,
-`L_1`. A subscript can't be empty (`a__b` and `x_` are refused).
+`s`, `N`, `W`, `J`, `kN`, `min`, `sin`, `π`, `e`, `g_0`, `c_0`, `R_u` and the rest. Use a subscript
+instead: `A_b`, `L_1`. A subscript can't be empty (`a__b` and `x_` are refused).
+
+## Constants
+
+| Name | Value |
+|---|---|
+| `π` or `pi` | 3.141592653589793… |
+| `e` | 2.718281828459045… |
+| `g_0` | standard gravity, 9.80665 m/s² (`g` alone is the gram) |
+| `c_0` | speed of light, 299 792 458 m/s |
+| `R_u` | molar gas constant, 8.314462618 J/(mol·K) |
+
+The constants carry their units, so `W_t := 10 kg·g_0 = ? N` shows 98.067 N and `1 lbm·g_0 = ? lbf`
+shows 1 lbf.
+
+## Symbols
+
+In the calculation box, **Insert Symbol** lists Greek letters, operators (`≔ · × ± √ ² ³`), the
+temperature units and the constants; picking one puts it at the cursor. You can also type a
+backslash name followed by a space, as in Word: `\sigma` → σ, `\theta` → θ, `\Delta` → Δ, `\mu` → μ,
+`\omega` → ω, `\sqrt` → √, `\cdot` → ·, `\times` → ×, `\pm` → ±, `\deg` → °. Any Greek letter's
+name works, with a capital for the capital letter.
 
 ## Units
 

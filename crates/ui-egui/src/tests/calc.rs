@@ -524,3 +524,51 @@ fn right_clicking_a_calculation_offers_its_number() {
     h.run_steps(3);
     assert!(regions(h.state())[0].1.numbered, "the menu numbered the calculation");
 }
+
+#[test]
+fn backslash_names_become_symbols() {
+    // A space after the name turns it into the symbol and is used up, as in Word's math
+    // autocorrect; any other character after it stays.
+    assert_eq!(calc_ui::expand_shortcut("\\sigma ", 7), Some(("σ".to_string(), 1)));
+    assert_eq!(calc_ui::expand_shortcut("x := \\theta+1", 12), Some(("x := θ+1".to_string(), 7)));
+    assert_eq!(calc_ui::expand_shortcut("\\Delta ", 7), Some(("Δ".to_string(), 1)));
+    assert_eq!(calc_ui::expand_shortcut("\\sqrt(x)", 6), Some(("√(x)".to_string(), 2)));
+    // Unknown names, and names still being typed, are left alone.
+    assert_eq!(calc_ui::expand_shortcut("\\sigm", 5), None);
+    assert_eq!(calc_ui::expand_shortcut("\\nonsense ", 10), None);
+    assert_eq!(calc_ui::expand_shortcut("plain text ", 11), None);
+}
+
+#[test]
+fn symbol_menu_inserts_at_the_cursor() {
+    let mut b = calc_ui::CalcBox::new(None, "x := 2", None);
+    b.cursor = Some(1);
+    b.insert_symbol("_0");
+    assert_eq!(b.source, "x_0 := 2");
+    assert_eq!(b.cursor, Some(3), "the cursor ends after what was inserted");
+    let mut b = calc_ui::CalcBox::new(None, "A := ", None);
+    b.cursor = None;
+    b.insert_symbol("π");
+    assert_eq!(b.source, "A := π", "with no cursor yet, at the end");
+    assert!(calc_ui::SYMBOL_GROUPS.iter().any(|(_, s)| s.contains(&"σ")), "Greek letters are offered");
+    assert!(calc_ui::SYMBOL_GROUPS.iter().any(|(_, s)| s.contains(&"g_0")), "the constants are offered");
+}
+
+#[test]
+fn insert_symbol_menu_works_in_the_box() {
+    let mut h = ready(app());
+    open_box(&mut h);
+    type_text(&mut h, "\\sigma ");
+    h.run_steps(3);
+    assert_eq!(calc_box(h.state()).expect("open").source, "σ", "the shortcut became σ");
+    type_text(&mut h, "_b := 2 kg·");
+    h.run_steps(2);
+    h.get_by_label("Insert Symbol").click();
+    h.run_steps(3);
+    h.get_by_label("g_0").click();
+    h.run_steps(3);
+    let source = calc_box(h.state()).expect("open").source;
+    assert!(source.ends_with("2 kg·g_0"), "{source}");
+    enter(&mut h);
+    assert_eq!(sources(h.state()), ["σ_b := 2 kg·g_0"]);
+}
