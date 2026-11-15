@@ -417,7 +417,7 @@ fn insert_calculation(s: &mut Session, v: &Value) -> CmdResult {
     // On an empty line it's a display equation, in text an inline one.
     let empty_line = s.doc.para_at(&at).is_none_or(|p| p.text.trim().is_empty());
     let display = display.unwrap_or(empty_line);
-    let region = CalcRegion { id, source, unit: None, precision: None, state: CalcState::Fresh };
+    let region = CalcRegion { id, source, unit: None, precision: None, numbered: false, state: CalcState::Fresh };
     let obj = InlineObject::Equation { linear: String::new(), display, math: Math::default(), calc: Some(Box::new(region)) };
     let end = s.doc.insert_object(&at, obj, &props)?;
     s.sel = Selection::caret(end);

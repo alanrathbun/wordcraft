@@ -97,7 +97,7 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
             errors += 1;
         }
         let parse_failed = Err(CalcError::Upstream);
-        let display = rendered(stmt.unwrap_or(&parse_failed), &r.source, shown.as_ref(), &state);
+        let display = number_if(r.numbered, rendered(stmt.unwrap_or(&parse_failed), &r.source, shown.as_ref(), &state));
         edits.push(Edit { at: r.at.clone(), change: Change::Region { id, state, display: Some(display) } });
     }
     for f in &found.fields {
@@ -186,7 +186,7 @@ pub fn mark_stale(doc: &mut Document) {
             _ => None,
         });
         let shown = stmt.as_ref().ok().filter(|s| shows_value(s)).and(old);
-        let display = rendered(&stmt, &r.source, shown.as_ref(), &CalcState::Stale);
+        let display = number_if(r.numbered, rendered(&stmt, &r.source, shown.as_ref(), &CalcState::Stale));
         edits.push(Edit { at: r.at.clone(), change: Change::Region { id, state: CalcState::Stale, display: Some(display) } });
     }
     // A quoted value is out of date too: it gets the same `≈`, once.
@@ -219,6 +219,7 @@ pub(crate) struct FoundRegion {
     source: String,
     unit: Option<String>,
     precision: Option<u8>,
+    numbered: bool,
     state: CalcState,
 }
 
@@ -378,6 +379,11 @@ pub fn freeze_outside_body(doc: &mut Document) -> usize {
     changed
 }
 
+/// `display`, numbered when the region is ([`render::numbered`]).
+fn number_if(numbered: bool, display: Rendered) -> Rendered {
+    if numbered { render::numbered(display) } else { display }
+}
+
 /// Whether [`freeze_outside_body`] has anything to do to `o`.
 fn needs_freezing(o: &InlineObject) -> bool {
     match o {
@@ -394,6 +400,7 @@ fn freeze(o: &mut InlineObject) {
             let state = CalcState::Error(NOT_CALCULATED_HERE.to_string());
             let mut display = rendered(&parse(&region.source), &region.source, None, &state);
             render::push_note(&mut display, NOT_CALCULATED_HERE);
+            let display = number_if(region.numbered, display);
             *linear = display.linear;
             set_nodes(math, display.math);
         }
@@ -428,6 +435,7 @@ fn visit(path: &[u32], p: &Paragraph, found: &mut Found) {
                         source: c.source.clone(),
                         unit: c.unit.clone(),
                         precision: c.precision,
+                        numbered: c.numbered,
                         state: c.state.clone(),
                     });
                 }

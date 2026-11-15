@@ -11,6 +11,7 @@ fn calc_equation() -> InlineObject {
             source: "σ_max := P / A".into(),
             unit: Some("ksi".into()),
             precision: Some(2),
+            numbered: true,
             state: CalcState::Error("undefined: P".into()),
         })),
     }
@@ -115,7 +116,7 @@ fn calc_equation_serde_round_trip() {
     let back: InlineObject = serde_json::from_str(&json).unwrap();
     assert_eq!(back, eq);
     for state in [CalcState::Fresh, CalcState::Stale, CalcState::Error("x".into()), CalcState::EditedOutside] {
-        let region = CalcRegion { id: 1, source: "a:=1".into(), unit: None, precision: None, state };
+        let region = CalcRegion { id: 1, source: "a:=1".into(), unit: None, precision: None, numbered: false, state };
         let back: CalcRegion = serde_json::from_str(&serde_json::to_string(&region).unwrap()).unwrap();
         assert_eq!(back, region);
     }

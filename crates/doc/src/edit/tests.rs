@@ -467,7 +467,14 @@ fn pasted_box_copies_count_the_objects_they_copy() {
     // A calculation equation's file-sourced strings count: source, unit, error message.
     let region = |source: usize, unit: usize, error: usize| {
         let state = if error > 0 { crate::calc::CalcState::Error("e".repeat(error)) } else { Default::default() };
-        let calc = crate::calc::CalcRegion { id: 1, source: "s".repeat(source), unit: (unit > 0).then(|| "u".repeat(unit)), precision: None, state };
+        let calc = crate::calc::CalcRegion {
+            id: 1,
+            source: "s".repeat(source),
+            unit: (unit > 0).then(|| "u".repeat(unit)),
+            precision: None,
+            numbered: false,
+            state,
+        };
         InlineObject::Equation { linear: String::new(), display: false, math: Default::default(), calc: Some(Box::new(calc)) }
     };
     assert!(object_cost(&region(100_000, 0, 0)) >= 100_000);

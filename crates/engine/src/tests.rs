@@ -2695,7 +2695,10 @@ fn calc_survives_native_format() {
     use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, UnitSystem, calc_field_instr};
     use wordcraft_doc::para::{InlineObject, Paragraph};
     let mut p = Paragraph::with_text("", Default::default());
-    let region = CalcRegion { id: 3, source: "σ_max := P / A".into(), unit: Some("ksi".into()), precision: Some(2), state: CalcState::Stale };
+    let region =
+        CalcRegion {
+            id: 3, source: "σ_max := P / A".into(), unit: Some("ksi".into()), precision: Some(2), numbered: false, state: CalcState::Stale
+        };
     let calc = InlineObject::Equation { linear: "σ_max=12.5".into(), display: true, math: Default::default(), calc: Some(Box::new(region)) };
     let quoted = InlineObject::Field {
         instr: calc_field_instr("σ_max", Some("ksi"), Some(2)),

@@ -45,9 +45,11 @@ fn fnv1a64(parts: &[&[u8]]) -> u64 {
     h
 }
 
-/// The linear form a fingerprint is taken of: the math tree's, or (no tree) the linear text's.
+/// The linear form a fingerprint is taken of: the math tree's, or (no tree) the linear text's,
+/// without an equation number (saved as `#`, it comes back from Word as `#(1)`).
 fn canonical(linear: &str, math: &Math) -> String {
-    if math.nodes.is_empty() { to_linear(&parse_linear(linear)) } else { to_linear(&math.nodes) }
+    let nodes = if math.nodes.is_empty() { parse_linear(linear) } else { math.nodes.clone() };
+    to_linear(&crate::render::unnumbered(&nodes).unwrap_or(nodes))
 }
 
 /// The fingerprint of an equation as shown: FNV-1a 64 of its canonical linear form.
@@ -94,9 +96,9 @@ pub fn export(doc: &Document) -> (Document, CalcStore) {
             let text = canonical(linear, math);
             let fingerprint =
                 if region.state == CalcState::EditedOutside { fnv1a64(&[EDITED_SALT, text.as_bytes()]) } else { fnv1a64(&[text.as_bytes()]) };
-            let CalcRegion { source, unit, precision, .. } = *region;
+            let CalcRegion { source, unit, precision, numbered, .. } = *region;
             if let Some(slot) = stored.get_mut(i) {
-                *slot = Some(StoredRegion { id, source, unit, precision, fingerprint });
+                *slot = Some(StoredRegion { id, source, unit, precision, numbered, fingerprint });
             }
             let control = ContentControl {
                 tag: format!("{CALC_TAG_PREFIX}{id}"),
@@ -209,8 +211,8 @@ pub fn import(doc: &mut Document, store: Option<CalcStore>) -> crate::RecalcRepo
         let Some(stored) = by_id.remove(&id) else { continue };
         if let Some(InlineObject::Equation { linear, math, calc, .. }) = p.objects.get_mut(k) {
             let state = if fingerprint(linear, math) == stored.fingerprint { CalcState::Fresh } else { CalcState::EditedOutside };
-            let StoredRegion { id, source, unit, precision, .. } = stored;
-            *calc = Some(Box::new(CalcRegion { id, source, unit, precision, state }));
+            let StoredRegion { id, source, unit, precision, numbered, .. } = stored;
+            *calc = Some(Box::new(CalcRegion { id, source, unit, precision, numbered, state }));
             p.touch();
         }
     }
@@ -252,7 +254,7 @@ mod tests {
             linear: String::new(),
             display: false,
             math: Math::default(),
-            calc: Some(Box::new(CalcRegion { id, source: source.into(), unit: None, precision: None, state: CalcState::Fresh })),
+            calc: Some(Box::new(CalcRegion { id, source: source.into(), unit: None, precision: None, numbered: false, state: CalcState::Fresh })),
         };
         let mut p = Paragraph::with_text("", CharProps::default());
         p.insert_object(0, eq(1, "a := 1"), &CharProps { del: Some(1), ..Default::default() }).unwrap();

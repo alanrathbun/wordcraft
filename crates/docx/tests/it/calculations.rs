@@ -31,7 +31,7 @@ fn calc_eq(id: u64, source: &str, display: bool) -> InlineObject {
         linear: String::new(),
         display,
         math: Math::default(),
-        calc: Some(Box::new(CalcRegion { id, source: source.into(), unit: None, precision: None, state: CalcState::Fresh })),
+        calc: Some(Box::new(CalcRegion { id, source: source.into(), unit: None, precision: None, numbered: false, state: CalcState::Fresh })),
     }
 }
 

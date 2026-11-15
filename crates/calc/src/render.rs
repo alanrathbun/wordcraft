@@ -151,9 +151,49 @@ pub fn strip_edited_mark(linear: &mut String, math: &mut Math) {
     math.omml.clear();
 }
 
+/// `display` with an automatic equation number, the way a numbered plain equation has one
+/// (`equation.number`): one equation-array row ending in `#`, which layout numbers and a `.docx`
+/// writes as `#(n)`.
+pub(crate) fn numbered(mut display: Rendered) -> Rendered {
+    let mut row = std::mem::take(&mut display.math);
+    row.push(MNode::Run(MRun::new("#")));
+    display.math = vec![MNode::EqArr { rows: vec![row] }];
+    display.linear.push('#');
+    display
+}
+
+/// A numbered equation's one row without its number (everything from the `#` on): what its
+/// fingerprint is taken of, so the automatic `#` saved and the `#(1)` Word gives back match.
+/// `None` when the equation isn't numbered that way.
+pub(crate) fn unnumbered(nodes: &[MNode]) -> Option<Arg> {
+    let [MNode::EqArr { rows }] = nodes else { return None };
+    let [row] = rows.as_slice() else { return None };
+    if !wordcraft_doc::math::has_number_mark(row) {
+        return None;
+    }
+    let mut out = Vec::new();
+    for n in row {
+        match n {
+            MNode::Run(r) if !r.lit && !r.nor && r.text.contains('#') => {
+                let mut r = r.clone();
+                if let Some(k) = r.text.find('#') {
+                    r.text.truncate(k);
+                }
+                if !r.text.is_empty() {
+                    out.push(MNode::Run(r));
+                }
+                break;
+            }
+            n => out.push(n.clone()),
+        }
+    }
+    Some(out)
+}
+
 /// The result shown in a display made by [`rendered`] (`…=600 "psi"`), read back from its
 /// linear text; `None` when the text doesn't end in a result.
 pub(crate) fn shown_result(linear: &str) -> Option<Formatted> {
+    let linear = linear.strip_suffix('#').unwrap_or(linear);
     let (_, tail) = linear.rsplit_once('=')?;
     let tail = tail.replace(TEN, "10");
     let tail = tail.as_str();

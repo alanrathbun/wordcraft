@@ -733,6 +733,9 @@ fn justify(s: &mut Session, v: &Value) -> CmdResult {
 /// Add (or remove) an automatic equation number: `#` with nothing after it.
 fn number(s: &mut Session, v: &Value) -> CmdResult {
     let at = equation_at_caret(s).ok_or_else(|| CmdError::Disabled("no equation at the caret".into()))?;
+    if is_calculation(s, &at) {
+        return number_calculation(s, &at, v);
+    }
     let mut pos_reset = false;
     let (_, effect) = with_eq(s, &at, |math, display| {
         let numbered = matches!(math.nodes.as_slice(), [MNode::EqArr { rows }] if rows.iter().any(|r| wordcraft_doc::math::has_number_mark(r)));
@@ -758,6 +761,31 @@ fn number(s: &mut Session, v: &Value) -> CmdResult {
     }
     s.clamp_selection();
     apply_effect(s, effect, false);
+    result(s)
+}
+
+/// Numbers a calculation (or takes its number away): its display is drawn from its source, so
+/// the region keeps the choice and the recalculation pass that follows draws the number, as `#`
+/// draws one on a plain equation. A numbered calculation is a display equation.
+fn number_calculation(s: &mut Session, at: &Pos, v: &Value) -> CmdResult {
+    let para = s.doc.para_mut(at.story, &at.path)?;
+    let Some(InlineObject::Equation { display, calc: Some(c), .. }) = para.object_at_mut(at.off) else {
+        return Err(CmdError::Failed("no calculation there".into()));
+    };
+    if c.state == wordcraft_doc::calc::CalcState::EditedOutside {
+        return Err(CmdError::Disabled("this calculation was edited in Word: restore it or keep Word's equation first".into()));
+    }
+    let want = p::bool(v, "value").unwrap_or(!c.numbered);
+    if want == c.numbered {
+        classified_noop(s);
+        return result(s);
+    }
+    c.numbered = want;
+    if want {
+        *display = true;
+    }
+    para.touch();
+    apply_effect(s, EquationEffect { content_changed: true, state_changed: true }, false);
     result(s)
 }
 

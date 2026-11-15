@@ -311,7 +311,7 @@ fn equation_commands_refuse_a_calculation() {
     // Caret just after P's equation.
     let path = s.doc.para_paths(wordcraft_doc::StoryRef::Body)[1].clone();
     s.sel = crate::Selection::caret(Pos { story: wordcraft_doc::StoryRef::Body, path, off: wordcraft_doc::para::OBJ.len_utf8() });
-    for (id, v) in [("equation.set", json!({"linear": "y"})), ("equation.number", json!({})), ("equation.edit", json!({}))] {
+    for (id, v) in [("equation.set", json!({"linear": "y"})), ("equation.edit", json!({}))] {
         let e = s.run(id, &v).unwrap_err();
         assert!(e.to_string().contains("calculation source"), "{id}: {e}");
     }
@@ -435,7 +435,14 @@ fn a_pasted_copy_is_found_by_its_recalculated_id_in_manual_mode() {
         linear: String::new(),
         display: true,
         math: Math::default(),
-        calc: Some(Box::new(CalcRegion { id: sigma, source: "τ := 2*P/A_b =".into(), unit: None, precision: None, state: CalcState::Fresh })),
+        calc: Some(Box::new(CalcRegion {
+            id: sigma,
+            source: "τ := 2*P/A_b =".into(),
+            unit: None,
+            precision: None,
+            numbered: false,
+            state: CalcState::Fresh,
+        })),
     };
     s.doc.insert_object(&end, copy, &Default::default()).unwrap();
     run(&mut s, "text.insert", json!({"text": "x"}));
@@ -791,7 +798,7 @@ fn calculations_outside_the_body_are_frozen_on_open() {
         linear: "y≔2=2".into(),
         display: false,
         math: Math::default(),
-        calc: Some(Box::new(CalcRegion { id: 99, source: "y := 2 =".into(), unit: None, precision: None, state: CalcState::Fresh })),
+        calc: Some(Box::new(CalcRegion { id: 99, source: "y := 2 =".into(), unit: None, precision: None, numbered: false, state: CalcState::Fresh })),
     };
     let field =
         InlineObject::Field { instr: "WCCALC σ".into(), result: "600 psi".into(), locked: true, dirty: false, code: false, form: String::new() };
@@ -853,4 +860,71 @@ fn a_quoted_value_unit_is_checked() {
     run(&mut s, "insert.calcValue", json!({"name": "T_1", "unit": "°C"}));
     run(&mut s, "insert.calcValue", json!({"name": "dT", "unit": "Δ°C"}));
     assert_eq!(field_results(&s), ["0.6 ksi", "21.111 °C", "16.667 Δ°C"]);
+}
+
+/// The caret just after the region `id`'s equation.
+fn caret_after(s: &mut Session, id: u64) {
+    for path in s.doc.para_paths(wordcraft_doc::StoryRef::Body) {
+        let para = s.doc.para(wordcraft_doc::StoryRef::Body, &path).unwrap();
+        if let Some((off, _)) = para.objects_with_offsets().find(|(_, o)| matches!(o, InlineObject::Equation { calc: Some(c), .. } if c.id == id)) {
+            s.sel = crate::Selection::caret(Pos { story: wordcraft_doc::StoryRef::Body, path, off: off + wordcraft_doc::para::OBJ.len_utf8() });
+            return;
+        }
+    }
+    panic!("no region {id}");
+}
+
+/// Whether the region `id`'s equation is numbered the way a plain one is: one row ending in `#`.
+fn numbered_eq(doc: &Document, id: u64) -> bool {
+    let mut found = None;
+    for o in objects(doc) {
+        if let InlineObject::Equation { math, display, calc: Some(c), .. } = o
+            && c.id == id
+        {
+            found = Some(
+                display
+                    && matches!(math.nodes.as_slice(), [wordcraft_doc::math::MNode::EqArr { rows }] if rows.len() == 1 && wordcraft_doc::math::has_number_mark(&rows[0])),
+            );
+        }
+    }
+    found.unwrap_or_else(|| panic!("no region {id}"))
+}
+
+#[test]
+fn a_calculation_can_be_numbered() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    caret_after(&mut s, sigma);
+    run(&mut s, "equation.number", json!({}));
+    assert!(region(&s, sigma).0.numbered);
+    assert!(numbered_eq(&s.doc, sigma), "drawn with an automatic number");
+    let (_, linear) = region(&s, sigma);
+    assert!(linear.ends_with("=600 \"psi\"#"), "{linear}");
+    // The number stays through a recalculation, and in manual mode through going stale.
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
+    assert!(numbered_eq(&s.doc, sigma));
+    assert!(region(&s, sigma).1.ends_with("=1200 \"psi\"#"), "{}", region(&s, sigma).1);
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 1500 lbf"}));
+    assert_eq!(region(&s, sigma).0.state, CalcState::Stale);
+    assert!(numbered_eq(&s.doc, sigma));
+    assert!(region(&s, sigma).1.contains("≈1200"), "the stale result is kept: {}", region(&s, sigma).1);
+    run(&mut s, "calc.recalculate", json!({}));
+    // Through .docx: Word gets a numbered equation, and it comes back live and numbered.
+    let bytes = crate::io::save_bytes("report.docx", &s.doc).unwrap();
+    let mut xml = String::new();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+    std::io::Read::read_to_string(&mut z.by_name("word/document.xml").unwrap(), &mut xml).unwrap();
+    assert!(xml.contains("<m:eqArr>") && xml.contains("#"), "Word sees a numbered equation");
+    let back = Session::new(crate::io::open_bytes("report.docx", &bytes).unwrap());
+    let (r, linear) = region(&back, sigma);
+    assert_eq!(r.state, CalcState::Fresh, "{linear}");
+    assert!(r.numbered && numbered_eq(&back.doc, sigma), "{linear}");
+    assert_eq!(linear, region(&s, sigma).1);
+    assert!(regions(&back).iter().all(|(r, _)| r.state == CalcState::Fresh));
+    // And the number can be taken away again.
+    caret_after(&mut s, sigma);
+    run(&mut s, "equation.number", json!({"value": false}));
+    assert!(!region(&s, sigma).0.numbered && !numbered_eq(&s.doc, sigma));
+    assert!(!region(&s, sigma).1.ends_with('#'));
 }

@@ -21,6 +21,9 @@ pub struct CalcRegion {
     /// Significant decimals for this region; `None` = the document's [`CalcSettings::precision`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precision: Option<u8>,
+    /// Shown with an automatic equation number, like a numbered plain equation (`#`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub numbered: bool,
     #[serde(default)]
     pub state: CalcState,
 }
@@ -114,6 +117,8 @@ pub struct StoredRegion {
     pub unit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precision: Option<u8>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub numbered: bool,
     /// Hash of the equation as saved: when the equation read back hashes differently, it was
     /// edited outside WordCraft.
     pub fingerprint: u64,
