@@ -175,18 +175,23 @@ fn missing_pictures_from_shared(source: craft_wordmodel::MissingPictures) -> Res
 
 /// Most custom XML parts looked at for a calculation store that isn't under its own name.
 const MAX_STORE_CANDIDATES: usize = 256;
-/// Most bytes of custom XML parts read looking for a renamed calculation store.
+/// Most bytes of custom XML parts read looking for a renamed store.
 const MAX_SCANNED_BYTES: usize = 32 * 1024 * 1024;
 
-/// Take the calculation store out of the kept parts: under the name it was written with, or (Word
-/// may rename the custom XML parts it keeps) any custom XML part holding one. The part found is
-/// removed, so a save never writes a stale copy beside the new one; so is a part under our name
-/// that doesn't hold a sound store. Anyone else's part is never touched. `None` when there is no
-/// sound store.
-fn take_calc_store(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<u8>>>) -> Option<wordcraft_doc::calc::CalcStore> {
-    let is_ours = |k: &str| k.eq_ignore_ascii_case(crate::calc_store::PART);
-    if let Some(key) = passthrough.keys().find(|k| is_ours(k)).cloned() {
-        let store = passthrough.get(&key).and_then(|bytes| crate::calc_store::read_from_bytes(bytes));
+/// Take one of WordCraft's stores out of the kept parts: under the name `part` it was written
+/// with, or (Word may rename the custom XML parts it keeps) any custom XML part holding one, told
+/// by its `kind` marker and read with `read`. The part found is removed with what came with it
+/// ([`forget_kept_part`]), so a save never writes a stale copy beside the new one; so is a part
+/// under our name that doesn't hold a sound store. Anyone else's part is never touched. `None`
+/// when there is no sound store.
+fn take_store<T>(
+    passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<u8>>>,
+    part: &str,
+    kind: &str,
+    read: fn(&[u8]) -> Option<T>,
+) -> Option<T> {
+    if let Some(key) = passthrough.keys().find(|k| k.eq_ignore_ascii_case(part)).cloned() {
+        let store = passthrough.get(&key).and_then(|bytes| read(bytes));
         forget_kept_part(passthrough, &key);
         if store.is_some() {
             return store;
@@ -204,12 +209,42 @@ fn take_calc_store(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<
         // Cheap test first: a store names its kind near the start.
         .filter(|(_, bytes)| {
             let head = bytes.get(..bytes.len().min(512)).unwrap_or(bytes);
-            head.windows(crate::calc_store::KIND.len()).any(|w| w == crate::calc_store::KIND.as_bytes())
+            head.windows(kind.len()).any(|w| w == kind.as_bytes())
         })
-        .find_map(|(k, bytes)| crate::calc_store::read_from_bytes(bytes).map(|store| (k.clone(), store)));
+        .find_map(|(k, bytes)| read(bytes).map(|store| (k.clone(), store)));
     let (key, store) = renamed?;
     forget_kept_part(passthrough, &key);
     Some(store)
+}
+
+/// Drop every kept custom XML data store whose properties part names data store id `item_id`
+/// (a copy of a store about to be written, which Word saved under its own names), with its
+/// properties and relationships: a package never has the same id twice. Only the custom XML
+/// parts are looked at, at most [`MAX_STORE_CANDIDATES`] of them.
+fn forget_kept_stores_with_id(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<u8>>>, item_id: &str) {
+    let needle = format!("itemID=\"{item_id}\"");
+    let props: Vec<String> = passthrough
+        .iter()
+        .filter(|(k, _)| k.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("customxml/")))
+        .take(MAX_STORE_CANDIDATES)
+        .filter(|(_, b)| b.len() <= 64 * 1024 && b.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes())))
+        .map(|(k, _)| k.clone())
+        .collect();
+    if props.is_empty() {
+        return;
+    }
+    const EMBEDDED_PARTS: &str = "wordcraft:embedded.parts";
+    let manifest = passthrough.get(EMBEDDED_PARTS).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+    let items: Vec<String> = manifest
+        .lines()
+        .filter_map(|l| match l.split('\t').collect::<Vec<_>>().as_slice() {
+            ["R", from, _, _, target, "I"] if props.iter().any(|p| p == target) => Some((*from).to_string()),
+            _ => None,
+        })
+        .collect();
+    for item in items.iter().chain(&props) {
+        forget_kept_part(passthrough, item);
+    }
 }
 
 /// Drop a kept custom XML part that is read into the model (one of WordCraft's stores), with what
@@ -260,16 +295,8 @@ fn set_or_remove(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<u8
 
 /// Converts the shared reader's model without copying the full document or its embedded media.
 pub fn from_shared_model(mut source: craft_wordmodel::Document) -> Result<wordcraft_doc::Document, DocxError> {
-    let mut fit_state = None;
-    let fit_key = source.passthrough.keys().find(|k| k.eq_ignore_ascii_case(crate::fit::PART)).cloned();
-    if let Some(key) = fit_key
-        && let Some(xml_bytes) = source.passthrough.get(&key)
-        && let Some(state) = crate::fit::read_from_bytes(xml_bytes)
-    {
-        fit_state = Some(state);
-        forget_kept_part(&mut source.passthrough, &key);
-    }
-    let calc_store = take_calc_store(&mut source.passthrough);
+    let fit_state = take_store(&mut source.passthrough, crate::fit::PART, crate::fit::KIND, crate::fit::read_from_bytes);
+    let calc_store = take_store(&mut source.passthrough, crate::calc_store::PART, crate::calc_store::KIND, crate::calc_store::read_from_bytes);
 
     let craft_wordmodel::Document {
         body,
@@ -483,6 +510,7 @@ fn keep_custom_xml_part(document: &mut craft_wordmodel::Document, part: &str, ns
     let props = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="no"?><ds:datastoreItem ds:itemID="{item_id}" xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml"><ds:schemaRefs><ds:schemaRef ds:uri="{ns}"/></ds:schemaRefs></ds:datastoreItem>"#
     );
+    forget_kept_stores_with_id(&mut document.passthrough, item_id);
     document.passthrough.insert(part.into(), Arc::new(xml));
     document.passthrough.insert(props_part.clone(), Arc::new(props.into_bytes()));
     // One relationship from the main document, however the one read with it spelled its type.

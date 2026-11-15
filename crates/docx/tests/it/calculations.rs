@@ -578,3 +578,81 @@ fn stores_renamed_by_word_are_written_once() {
     assert!(dangling(&saved).is_empty(), "{:?}", dangling(&saved));
     assert_eq!(regions(&open(&zip(&saved))).len(), SOURCES.len());
 }
+
+const FIT_ITEM_ID: &str = "{3B8E2C14-7A5D-4F69-9E01-2D6C8B4A7F53}";
+
+/// The package `save` writes for `doc`, with the fit store moved to Word's names
+/// (`item2.xml` + `itemProps2.xml`), its JSON payload changed by `payload`.
+fn fit_renamed_by_word(doc: &Document, payload: impl Fn(String) -> String) -> Vec<u8> {
+    let renames = [("wordcraftfitProps.xml", "itemProps2.xml"), ("wordcraftfit.xml", "item2.xml")];
+    let rename = |s: &str| renames.iter().fold(s.to_string(), |s, (a, b)| s.replace(a, b));
+    let p: BTreeMap<String, Vec<u8>> = parts(&save(doc))
+        .into_iter()
+        .map(|(k, v)| {
+            let k = rename(&k);
+            let v = if k.ends_with(".rels") || k == "[Content_Types].xml" {
+                rename(&String::from_utf8(v).unwrap()).into_bytes()
+            } else if k.ends_with("item2.xml") {
+                payload(String::from_utf8(v).unwrap()).into_bytes()
+            } else {
+                v
+            };
+            (k, v)
+        })
+        .collect();
+    assert!(p.keys().any(|k| k.ends_with("itemProps2.xml")), "{:?}", p.keys().collect::<Vec<_>>());
+    zip(&p)
+}
+
+fn assert_one_props_per_id(p: &BTreeMap<String, Vec<u8>>) {
+    let mut ids = item_ids(p);
+    ids.sort();
+    let n = ids.len();
+    ids.dedup();
+    assert_eq!(ids.len(), n, "an itemID twice: {:?}", p.keys().collect::<Vec<_>>());
+    assert!(dangling(p).is_empty(), "{:?}", dangling(p));
+}
+
+#[test]
+fn a_fit_store_renamed_by_word_is_read_and_written_once() {
+    let doc = with_fit(report());
+    let mut back = open(&fit_renamed_by_word(&doc, |x| x));
+    assert_eq!(back.fit_state, doc.fit_state, "found by its content");
+    back.fit_state = Some(wordcraft_doc::FitState { cum_delta: 2.0, ..Default::default() });
+    let saved = save(&back);
+    let p = parts(&saved);
+    assert_one_props_per_id(&p);
+    assert_eq!(item_ids(&p).iter().filter(|id| *id == FIT_ITEM_ID).count(), 1);
+    assert_eq!(wordcraft_docx::read(&saved).unwrap().fit_state, back.fit_state);
+}
+
+#[test]
+fn a_kept_copy_of_a_store_never_duplicates_its_id() {
+    // A renamed fit store WordCraft can't read (broken) stays as Word's data, until a fit store is
+    // written: then the copy with the same data store id goes.
+    let doc = with_fit(report());
+    let bytes = fit_renamed_by_word(&doc, |x| x.replace("<fitState>", "<fitState>{broken"));
+    let mut back = open(&bytes);
+    assert!(back.fit_state.is_none());
+    back.fit_state = Some(wordcraft_doc::FitState { cum_delta: 3.0, ..Default::default() });
+    let saved = save(&back);
+    let p = parts(&saved);
+    assert_one_props_per_id(&p);
+    assert_eq!(item_ids(&p).iter().filter(|id| *id == FIT_ITEM_ID).count(), 1);
+    assert!(!p.keys().any(|k| k.ends_with("item2.xml")), "{:?}", p.keys().collect::<Vec<_>>());
+    assert_eq!(wordcraft_docx::read(&saved).unwrap().fit_state, back.fit_state);
+}
+
+#[test]
+fn a_broken_fit_store_under_its_own_name_is_dropped() {
+    let mut p = parts(&save(&with_fit(report())));
+    let name = p.keys().find(|k| k.to_ascii_lowercase().ends_with("customxml/wordcraftfit.xml")).cloned().unwrap();
+    let broken = String::from_utf8(p[&name].clone()).unwrap().replace("<fitState>", "<fitState>{broken");
+    p.insert(name, broken.into_bytes());
+    let back = open(&zip(&p));
+    assert!(back.fit_state.is_none());
+    assert!(!back.passthrough.keys().any(|k| k.to_ascii_lowercase().contains("wordcraftfit")), "{:?}", back.passthrough.keys().collect::<Vec<_>>());
+    let saved = parts(&save(&back));
+    assert!(!item_ids(&saved).iter().any(|id| id == FIT_ITEM_ID));
+    assert!(dangling(&saved).is_empty(), "{:?}", dangling(&saved));
+}
