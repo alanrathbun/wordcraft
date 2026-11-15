@@ -175,6 +175,8 @@ fn missing_pictures_from_shared(source: craft_wordmodel::MissingPictures) -> Res
 
 /// Most custom XML parts looked at for a calculation store that isn't under its own name.
 const MAX_STORE_CANDIDATES: usize = 256;
+/// Most bytes of custom XML parts read looking for a renamed calculation store.
+const MAX_SCANNED_BYTES: usize = 32 * 1024 * 1024;
 
 /// Take the calculation store out of the kept parts: under the name it was written with, or (Word
 /// may rename the custom XML parts it keeps) any custom XML part holding one. The part found is
@@ -193,6 +195,11 @@ fn take_calc_store(passthrough: &mut std::collections::BTreeMap<String, Arc<Vec<
         .iter()
         .filter(|(k, _)| k.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("customxml/")))
         .take(MAX_STORE_CANDIDATES)
+        // At most `MAX_SCANNED_BYTES` of them, in all.
+        .scan(0usize, |seen, (k, bytes)| {
+            *seen = seen.saturating_add(bytes.len());
+            (*seen <= MAX_SCANNED_BYTES).then_some((k, bytes))
+        })
         // Cheap test first: a store names its kind near the start.
         .filter(|(_, bytes)| {
             let head = bytes.get(..bytes.len().min(512)).unwrap_or(bytes);
@@ -413,28 +420,54 @@ fn missing_pictures_to_shared(source: &wordcraft_doc::MissingPictures) -> Result
     Ok(target)
 }
 
-/// Have the writer save `xml` as custom XML part `part` of the main document: its bytes, its
-/// manifest entry and its relationship, each added once.
-fn keep_custom_xml_part(document: &mut craft_wordmodel::Document, part: &str, xml: Vec<u8>) {
+/// Have the writer save `xml` as custom XML part `part` of the main document, a proper custom
+/// XML data store as Word keeps them: its bytes, its properties part (`ds:datastoreItem` with the
+/// store's id `item_id` and its namespace `ns` as schema reference) related from it, their
+/// manifest entries (with content types) and the main document's relationship, each added once.
+fn keep_custom_xml_part(document: &mut craft_wordmodel::Document, part: &str, ns: &str, item_id: &str, xml: Vec<u8>) {
     const CUSTOM_XML_ROOTS: &str = "wordcraft:customXml.roots";
     const EMBEDDED_PARTS: &str = "wordcraft:embedded.parts";
+    const PROPS_TYPE: &str = "application/vnd.openxmlformats-officedocument.customXmlProperties+xml";
+    const PROPS_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps";
+    const CUSTOM_XML_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml";
 
+    // `customxml/wordcraftcalc.xml` → `customxml/wordcraftcalcProps.xml`.
+    let props_part = format!("{}Props.xml", part.strip_suffix(".xml").unwrap_or(part));
+    let props = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="no"?><ds:datastoreItem ds:itemID="{item_id}" xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml"><ds:schemaRefs><ds:schemaRef ds:uri="{ns}"/></ds:schemaRefs></ds:datastoreItem>"#
+    );
     document.passthrough.insert(part.into(), Arc::new(xml));
-    let mut add_line = |key: &str, line: String| {
-        let text = match document.passthrough.get(key) {
-            Some(existing) => {
-                let mut text = String::from_utf8_lossy(existing).to_string();
-                if !text.contains(part) {
-                    text.push_str(&line);
-                }
-                text
+    document.passthrough.insert(props_part.clone(), Arc::new(props.into_bytes()));
+    // One relationship from the main document, however the one read with it spelled its type.
+    let related = document
+        .passthrough
+        .get(CUSTOM_XML_ROOTS)
+        .is_some_and(|b| String::from_utf8_lossy(b).lines().any(|l| l.starts_with("D\t") && l.rsplit('\t').next() == Some(part)));
+    // The store's relationships are ours alone: any read with it (Word may renumber them) give way
+    // to the one below, so it never has two properties parts.
+    let own_rels = format!("R\t{part}\t");
+    let mut add_lines = |key: &str, lines: &[String]| {
+        let kept = document.passthrough.get(key).map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+        let mut text: String = kept.lines().filter(|l| !l.starts_with(&own_rels)).flat_map(|l| [l, "\n"]).collect();
+        for line in lines {
+            if !text.lines().any(|l| l == line) {
+                text.push_str(line);
+                text.push('\n');
             }
-            None => line,
-        };
+        }
         document.passthrough.insert(key.into(), Arc::new(text.into_bytes()));
     };
-    add_line(EMBEDDED_PARTS, format!("P\t{part}\tapplication/xml\n"));
-    add_line(CUSTOM_XML_ROOTS, format!("D\thttp://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\t{part}\n"));
+    add_lines(
+        EMBEDDED_PARTS,
+        &[
+            format!("P\t{part}\tapplication/xml"),
+            format!("P\t{props_part}\t{PROPS_TYPE}"),
+            format!("R\t{part}\trIdWordCraftProps\t{PROPS_REL}\t{props_part}\tI"),
+        ],
+    );
+    if !related {
+        add_lines(CUSTOM_XML_ROOTS, &[format!("D\t{CUSTOM_XML_REL}\t{part}")]);
+    }
 }
 
 /// Converts a WordCraft document to the shared model for serialization.
@@ -460,10 +493,16 @@ pub fn to_shared_model(source: &wordcraft_doc::Document) -> Result<craft_wordmod
 
     // WordCraft's own stores travel as custom XML parts.
     if let Some(fit) = &source.fit_state {
-        keep_custom_xml_part(&mut document, crate::fit::PART, crate::fit::write(fit)?);
+        keep_custom_xml_part(&mut document, crate::fit::PART, crate::fit::NS, crate::fit::ITEM_ID, crate::fit::write(fit)?);
     }
     if let Some(store) = source.calc_store.as_ref().filter(|s| !s.is_empty()) {
-        keep_custom_xml_part(&mut document, crate::calc_store::PART, crate::calc_store::write(store)?);
+        keep_custom_xml_part(
+            &mut document,
+            crate::calc_store::PART,
+            crate::calc_store::NS,
+            crate::calc_store::ITEM_ID,
+            crate::calc_store::write(store)?,
+        );
     }
 
     Ok(document)

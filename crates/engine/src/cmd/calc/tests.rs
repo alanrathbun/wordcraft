@@ -581,4 +581,52 @@ fn a_panicking_open_pass_leaves_nothing_looking_current() {
     INJECT_PANIC.with(|p| p.set(false));
     let back = Session::new(opened.unwrap());
     assert_eq!(region(&back, sigma).0.state, CalcState::Stale);
+    assert!(super::take_open_notice().is_some_and(|n| n.contains("out of date")));
+
+    // Through file.open, from a .docx: the status line says what happened.
+    let docx = crate::io::save_bytes("report.docx", &s.doc).unwrap();
+    let mut t = session();
+    INJECT_PANIC.with(|p| p.set(true));
+    let opened = t.run("file.open", &json!({"path": "report.docx", "data": crate::cmd::insert::base64_encode(&docx)}));
+    INJECT_PANIC.with(|p| p.set(false));
+    opened.unwrap();
+    assert!(t.status.contains("opened as plain equations"), "{}", t.status);
+    assert!(regions(&t).is_empty());
+}
+
+#[test]
+fn a_tracked_deleted_calculation_survives_docx_and_comes_back_on_reject() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    run(&mut s, "review.trackChanges", json!({"value": true}));
+    run(&mut s, "caret.docStart", json!({}));
+    run(&mut s, "select.paragraph", json!({}));
+    run(&mut s, "text.delete", json!({}));
+    assert_eq!(region(&s, sigma).0.state, CalcState::Error("P isn't defined".into()));
+    let bytes = crate::io::save_bytes("report.docx", &s.doc).unwrap();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut z.by_name("word/document.xml").unwrap(), &mut xml).unwrap();
+    // The control is outside the deletion, which marks the equation inside it.
+    let sdt = &xml[xml.find("<w:sdt>").unwrap()..xml.find("</w:sdt>").unwrap()];
+    assert!(sdt.contains("wordcraft-calc:1") && sdt.contains("<w:del ") && sdt.contains("P≔1500"), "{sdt}");
+    let mut back = reopen(&s, "report.docx");
+    assert_eq!(region(&back, p).0.source, "P := 1500 lbf", "the deleted calculation keeps its source");
+    assert!(matches!(region(&back, sigma).0.state, CalcState::Error(_)), "still deleted, so still undefined");
+    run(&mut back, "review.rejectAll", json!({}));
+    assert_eq!(region(&back, p).0.state, CalcState::Fresh);
+    let (sig, linear) = region(&back, sigma);
+    assert_eq!(sig.state, CalcState::Fresh, "{linear}");
+    assert_eq!(
+        linear,
+        region(
+            &{
+                let mut fresh = session();
+                sample(&mut fresh);
+                fresh
+            },
+            sigma
+        )
+        .1
+    );
 }

@@ -17,6 +17,8 @@ pub(crate) const ROOT: &str = "wordcraftCalc";
 pub(crate) const NS: &str = "urn:wordcraft:calc";
 /// Marker attribute the parser keeps (namespace declarations are stripped from `El`).
 pub(crate) const KIND: &str = "wordcraft-calc-v1";
+/// The store's data store id (`ds:itemID` of its properties part): the same for every document.
+pub(crate) const ITEM_ID: &str = "{6F1D3A52-9C1B-4E7A-8B2D-5C0A7E3F9D41}";
 /// The element holding the JSON payload.
 const PAYLOAD: &str = "calcStore";
 

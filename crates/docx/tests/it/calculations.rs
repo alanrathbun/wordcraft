@@ -375,11 +375,19 @@ fn tables_and_stale_results_are_saved_as_shown() {
     let table = wordcraft_doc::Table { rows: vec![wordcraft_doc::Row { cells: vec![cell], ..Default::default() }], ..Default::default() };
     doc.body.insert(0, std::sync::Arc::new(Block::Table(table)));
     doc.body.insert(1, para_block(Paragraph::new()));
+    // A region in error.
+    let mut bad = Paragraph::with_text("", CharProps::default());
+    bad.insert_object(0, calc_eq(60, "e := q + 1 = ?", false), &CharProps::default()).unwrap();
+    doc.body.insert(1, para_block(bad));
     wordcraft_calc::recalc(&mut doc, &|_| None);
+    assert!(matches!(region(&doc, 60).0.state, CalcState::Error(_)));
     wordcraft_calc::mark_stale(&mut doc);
     let xml = document_xml(&save(&doc));
     assert!(xml.contains("wordcraft-calc:50"));
     assert!(xml.contains('≈'), "a stale result is written stale");
+    let errored = sdt_of(&xml, 60);
+    assert!(errored.contains('⚠') && errored.contains(r#"w:val="C00000""#), "an error is written as its red mark: {errored}");
+    assert!(errored.contains(">e≔q+1<") && !errored.contains("≔q+1="), "and no value: {errored}");
     let back = open(&save(&doc));
     let (y, _) = region(&back, 50);
     assert_eq!(y.source, "y := 2 × P = ? lbf");
@@ -419,4 +427,38 @@ fn word_reserializing_an_untouched_equation_is_no_edit() {
     });
     let back = open(&bytes);
     assert_eq!(region(&back, 1).0.state, CalcState::Fresh);
+}
+
+#[test]
+fn stores_are_proper_custom_xml_data_stores() {
+    // Word keeps a custom XML part as a data store when it has its properties part (itemProps):
+    // both WordCraft stores get one, related from the store, with its content type.
+    let mut doc = report();
+    doc.fit_state = Some(wordcraft_doc::FitState { cum_delta: 1.0, ..Default::default() });
+    let bytes = save(&doc);
+    let p = parts(&bytes);
+    let types = String::from_utf8(p["[Content_Types].xml"].clone()).unwrap();
+    for (store, ns) in [("wordcraftcalc.xml", "urn:wordcraft:calc"), ("wordcraftfit.xml", "urn:wordcraft:fit")] {
+        let item = p.keys().find(|k| k.to_ascii_lowercase().ends_with(&format!("customxml/{store}"))).unwrap_or_else(|| panic!("{store}"));
+        let (dir, file) = item.rsplit_once('/').unwrap();
+        let rels = String::from_utf8(p[&format!("{dir}/_rels/{file}.rels")].clone()).unwrap();
+        assert!(rels.contains("/relationships/customXmlProps"), "{rels}");
+        let target = rels.split("Target=\"").nth(1).unwrap().split('"').next().unwrap();
+        let props_name = format!("{dir}/{target}");
+        let props = String::from_utf8(p[&props_name].clone()).unwrap();
+        assert!(props.contains("datastoreItem") && props.contains("itemID=\"{") && props.contains(&format!("schemaRef ds:uri=\"{ns}\"")), "{props}");
+        assert!(
+            types.contains(&format!(
+                "PartName=\"/{props_name}\" ContentType=\"application/vnd.openxmlformats-officedocument.customXmlProperties+xml\""
+            )),
+            "{types}"
+        );
+    }
+    let back = wordcraft_docx::read(&bytes).unwrap();
+    assert_eq!(back.fit_state, doc.fit_state);
+    assert_eq!(regions(&open(&bytes)).len(), SOURCES.len());
+    // Saved again: still one of each, each with its properties.
+    let again = parts(&save(&open(&bytes)));
+    let props = again.values().filter(|d| d.windows(13).any(|w| w == b"datastoreItem")).count();
+    assert_eq!(props, 2, "{:?}", again.keys().collect::<Vec<_>>());
 }

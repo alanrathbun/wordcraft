@@ -268,6 +268,9 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
     if let Some(z) = s.doc.settings.zoom {
         super::view::restore_zoom(s, z);
     }
+    if let Some(notice) = super::calc::take_open_notice() {
+        s.status = notice;
+    }
     s.path = Some(path.into());
     // A Markdown file's own text, for the view to show and Save to write back as it is.
     if super::md_source::is_markdown_file(std::path::Path::new(path)) {
@@ -310,6 +313,8 @@ fn markdown_file_text(path: &str, v: &Value) -> super::md_source::FileText {
 /// one) is a new blank document (#1384). Plain text and Markdown carry no language, so they are
 /// in the editing language.
 fn read_document(s: &Session, path: &str, v: &Value) -> Result<(Document, bool), CmdError> {
+    // A message left by an earlier open isn't this file's.
+    let _ = super::calc::take_open_notice();
     let password = p::str(v, "password");
     let (mut doc, encrypted) = if let Some(data) = p::str(v, "data") {
         let bytes = super::insert::base64_decode(data).ok_or_else(|| CmdError::Params("bad base64".into()))?;
@@ -346,6 +351,9 @@ pub(crate) fn new_from_template(s: &mut Session, v: &Value) -> CmdResult {
         s.set_document(doc);
     } else {
         s.add_document(doc);
+    }
+    if let Some(notice) = super::calc::take_open_notice() {
+        s.status = notice;
     }
     s.dirty = true;
     sel_result(s)

@@ -204,6 +204,8 @@ pub(crate) struct Found {
     fields: Vec<FoundField>,
     /// Ids of tracked-deleted regions: never reused for a reassigned id.
     deleted_ids: Vec<u64>,
+    /// Where each tracked-deleted region is, with its id (in document order).
+    pub(crate) deleted: Vec<(At, u64)>,
 }
 
 /// The calculation regions and quoted values of the body, in document order.
@@ -260,6 +262,7 @@ fn visit(path: &[u32], p: &Paragraph, found: &mut Found) {
             InlineObject::Equation { calc: Some(c), .. } => {
                 if is_deleted {
                     found.deleted_ids.push(c.id);
+                    found.deleted.push((at(), c.id));
                 } else {
                     found.regions.push(FoundRegion {
                         at: at(),

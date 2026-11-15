@@ -117,31 +117,49 @@ pub(crate) fn after_command(s: &mut Session, id: &str, before: &Document) {
     s.status = format!("Calculations couldn't be updated: {message}");
 }
 
+thread_local! {
+    /// What [`after_open`] has to tell about the document it last failed on, for `file.open` to
+    /// show in the status line (opening has no session to show it in).
+    static OPEN_NOTICE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Take the message [`after_open`] left, if any (see `OPEN_NOTICE`).
+pub(crate) fn take_open_notice() -> Option<String> {
+    OPEN_NOTICE.with(|n| n.borrow_mut().take())
+}
+
 /// After a document is opened (any format): calculations saved in a `.docx` come back live from
 /// the store read with it (`wordcraft_calc::docx::import`), and every calculation is
 /// recalculated so the results are current; regions edited outside WordCraft keep what they
 /// show. A document with no calculations is left as it was read.
 ///
 /// The pass reads file content, so it runs inside `catch_unwind` like [`after_command`]: a panic
-/// puts the document back as read and greys every result, so none looks current.
+/// puts the document back as read, greys every result so none looks current, and leaves a
+/// message for the status line ([`take_open_notice`]).
 pub(crate) fn after_open(doc: &mut Document) {
     let store = doc.calc_store.take();
     if store.is_none() && !has_calc(doc) && !wordcraft_calc::docx::has_calc_controls(doc) {
         return;
     }
+    let had_store = store.is_some();
     let saved = doc.clone();
     let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         tests::maybe_inject_panic();
         wordcraft_calc::docx::import(doc, store);
     }));
-    if pass.is_ok() {
-        return;
-    }
+    let Err(panic) = pass else { return };
+    let message = panic.downcast_ref::<&str>().map(ToString::to_string).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
     *doc = saved.clone();
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mark_stale(doc))).is_err() {
         *doc = saved;
     }
+    let notice = if had_store {
+        format!("Calculations couldn't be restored ({message}): the saved sources were lost, so they opened as plain equations.")
+    } else {
+        format!("Calculations couldn't be updated ({message}): their results are shown out of date.")
+    };
+    OPEN_NOTICE.with(|n| *n.borrow_mut() = Some(notice));
 }
 
 /// Recalculate the document. A duplicate-name message names the page of the first definition,

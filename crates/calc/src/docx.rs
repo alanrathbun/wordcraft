@@ -57,21 +57,28 @@ pub fn fingerprint(linear: &str, math: &Math) -> u64 {
 
 /// A copy of `doc` to give a `.docx` writer, and the store to save beside it.
 ///
-/// Every calculation region the recalculation pass sees (body and table cells, tracked deletions
-/// left out) becomes a plain equation, showing what it shows now, inside a content control
-/// tagged with its id; a repeated id (a copy not yet recalculated) gets the id recalculation
-/// would give it. The quoted values stay as they are (locked fields). `doc` is not changed.
+/// Every calculation region in the body and table cells becomes a plain equation, showing what it
+/// shows now, inside a content control tagged with its id; a repeated id (a copy not yet
+/// recalculated) gets the id recalculation would give it. Tracked-deleted regions are saved too
+/// (with an id no live one has), so rejecting the deletion, in Word or after reopening, brings
+/// the calculation back. The quoted values stay as they are (locked fields). `doc` is not changed.
 pub fn export(doc: &Document) -> (Document, CalcStore) {
     let mut copy = doc.clone();
     copy.calc_store = None;
     let found = collect(&copy.body);
-    let (ids, _) = assign_ids(&found);
+    let (live_ids, _) = assign_ids(&found);
+    // Every region to save, live and tracked-deleted (rejecting the deletion brings one back),
+    // in document order, each with an id no other saved region has.
+    let mut all: Vec<(&[u32], usize, u64)> = found.regions.iter().zip(&live_ids).map(|(r, &id)| (r.at.path.as_slice(), r.at.obj, id)).collect();
+    all.extend(unique_deleted_ids(&live_ids, &found.deleted).into_iter().map(|(at, id)| (at.path.as_slice(), at.obj, id)));
+    all.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     // Each paragraph's regions together, last object first, so earlier offsets stay valid.
     let mut by_para: BTreeMap<Vec<u32>, Vec<(usize, usize)>> = BTreeMap::new();
-    for (i, r) in found.regions.iter().enumerate() {
-        by_para.entry(r.at.path.clone()).or_default().push((r.at.obj, i));
+    for (i, (path, obj, _)) in all.iter().enumerate() {
+        by_para.entry(path.to_vec()).or_default().push((*obj, i));
     }
-    let mut stored: Vec<Option<StoredRegion>> = vec![None; found.regions.len()];
+    let ids: Vec<u64> = all.iter().map(|&(_, _, id)| id).collect();
+    let mut stored: Vec<Option<StoredRegion>> = vec![None; all.len()];
     for (path, mut objs) in by_para {
         let Some(p) = para_mut(&mut copy.body, &path) else { continue };
         let anchors: Vec<usize> = p.text.char_indices().filter(|&(_, c)| c == OBJ).map(|(i, _)| i).collect();
@@ -102,6 +109,38 @@ pub fn export(doc: &Document) -> (Document, CalcStore) {
     }
     let settings = doc.calc_settings.clone().unwrap_or_default();
     (copy, CalcStore { settings, regions: stored.into_iter().flatten().collect() })
+}
+
+/// The tracked-deleted regions with the ids they are saved under: their own, unless a live region
+/// (whose ids `live` holds) or an earlier deleted one has it already; then the next id above all
+/// of them (or, at the top of the range, the lowest free one).
+fn unique_deleted_ids<'a>(live: &[u64], deleted: &'a [(crate::recalc::At, u64)]) -> Vec<(&'a crate::recalc::At, u64)> {
+    let mut taken: HashSet<u64> = live.iter().copied().collect();
+    let mut next = live.iter().chain(deleted.iter().map(|(_, id)| id)).max().and_then(|m| m.checked_add(1));
+    let mut probe: u64 = 0;
+    deleted
+        .iter()
+        .map(|(at, id)| {
+            let id = if taken.contains(id) {
+                match next {
+                    Some(n) => {
+                        next = n.checked_add(1);
+                        n
+                    }
+                    None => {
+                        while taken.contains(&probe) {
+                            probe = probe.saturating_add(1);
+                        }
+                        probe
+                    }
+                }
+            } else {
+                *id
+            };
+            taken.insert(id);
+            (at, id)
+        })
+        .collect()
 }
 
 /// The region id a content control tag names, if it is a calculation's.
@@ -200,6 +239,27 @@ mod tests {
         assert_eq!(tagged_id("wordcraft-calc:42"), Some(Some(42)));
         assert_eq!(tagged_id("wordcraft-calc:x"), Some(None));
         assert_eq!(tagged_id("other"), None);
+    }
+
+    #[test]
+    fn a_deleted_region_sharing_a_live_id_is_saved_under_its_own() {
+        use wordcraft_doc::{CharProps, Paragraph, para_block};
+        let eq = |id, source: &str| InlineObject::Equation {
+            linear: String::new(),
+            display: false,
+            math: Math::default(),
+            calc: Some(Box::new(CalcRegion { id, source: source.into(), unit: None, precision: None, state: CalcState::Fresh })),
+        };
+        let mut p = Paragraph::with_text("", CharProps::default());
+        p.insert_object(0, eq(1, "a := 1"), &CharProps { del: Some(1), ..Default::default() }).unwrap();
+        let end = p.len();
+        p.insert_object(end, eq(1, "b := 2"), &CharProps::default()).unwrap();
+        let mut doc = Document::new();
+        doc.body = vec![para_block(p)];
+        let (_, store) = export(&doc);
+        let mut got: Vec<(u64, &str)> = store.regions.iter().map(|r| (r.id, r.source.as_str())).collect();
+        got.sort();
+        assert_eq!(got, vec![(1, "b := 2"), (2, "a := 1")]);
     }
 
     #[test]
