@@ -124,7 +124,7 @@ fn calc_equation_serde_round_trip() {
 
 #[test]
 fn settings_serde_round_trip_and_partial_load() {
-    let s = CalcSettings { system: UnitSystem::Si, precision: 6, manual: true };
+    let s = CalcSettings { system: UnitSystem::Si, precision: 6, manual: true, g: GMeans::Gram };
     assert_eq!(serde_json::from_str::<CalcSettings>(&serde_json::to_string(&s).unwrap()).unwrap(), s);
     assert_eq!(serde_json::from_str::<CalcSettings>("{}").unwrap(), CalcSettings::default());
 }
@@ -134,7 +134,7 @@ fn document_calc_settings_serde() {
     let mut doc = crate::Document::new();
     let plain = serde_json::to_string(&doc).unwrap();
     assert!(!plain.contains("calc_settings"), "an untouched document stays as it was");
-    doc.calc_settings = Some(CalcSettings { system: UnitSystem::Si, precision: 5, manual: true });
+    doc.calc_settings = Some(CalcSettings { system: UnitSystem::Si, precision: 5, manual: true, g: GMeans::Gram });
     let back: crate::Document = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
     assert_eq!(back.calc_settings, doc.calc_settings);
     assert!(!back.same_content(&crate::Document::new()), "calc settings are part of the document's content");

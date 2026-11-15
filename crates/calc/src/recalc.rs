@@ -59,7 +59,7 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
     let (ids, reassigned_ids) = assign_ids(&found);
     let regions = &found.regions;
     let index = Index::build(regions, &ids, page_of);
-    let (env, outcomes, failed) = evaluate(&index);
+    let (env, outcomes, failed) = evaluate(&index, &settings);
 
     let sys = unit_system(&settings);
     let mut errors = 0;
@@ -160,7 +160,9 @@ pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), Ca
     let found = collect(&doc.body);
     let (ids, _) = assign_ids(&found);
     let index = Index::build(&found.regions, &ids, &|_| None);
-    let (env, _, _) = evaluate(&index);
+    let settings = doc.calc_settings.clone().unwrap_or_default();
+    let (env, _, _) = evaluate(&index, &settings);
+    env.check_display_unit(unit)?;
     match env.value(name) {
         Some(v) => check_unit_for(v, unit),
         None => Ok(()),
@@ -584,7 +586,7 @@ struct Node {
 
 /// Evaluate every region in dependency order: the environment of defined names, each region's
 /// outcome, and which regions failed.
-fn evaluate(index: &Index) -> (Env, Vec<Outcome>, Vec<bool>) {
+fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<bool>) {
     let mut nodes: Vec<Node> = index.early.iter().map(|e| Node { outcome: e.clone().map(Err), ..Node::default() }).collect();
     // Edges run from the region owning a name to each region using it. Only owned names count:
     // anything else (a unit, constant, built-in, or nothing) is left for the evaluator.
@@ -606,6 +608,7 @@ fn evaluate(index: &Index) -> (Env, Vec<Outcome>, Vec<bool>) {
         }
     }
     let mut env = Env::new();
+    env.set_g_is_gravity(settings.g == wordcraft_doc::calc::GMeans::Gravity);
     // One budget for the whole pass: a hostile document errors instead of taking seconds.
     let pass = Pass::new(MAX_PASS_STEPS);
     // Record that region `i` failed: using its name is then an upstream error.
@@ -810,7 +813,7 @@ fn field_result(f: &FoundField, index: &Index, env: &Env, failed: &[bool], setti
     }
     let Some(v) = env.value(&f.name) else { return "?".to_string() };
     // A difference shown in °C or °F would be a wrong number.
-    if f.unit.as_deref().is_some_and(|u| check_unit_for(v, u).is_err()) {
+    if f.unit.as_deref().is_some_and(|u| env.check_display_unit(u).is_err() || check_unit_for(v, u).is_err()) {
         return "?".to_string();
     }
     match format_value(v.q, f.unit.as_deref(), unit_system(settings), precision(f.precision, settings)) {

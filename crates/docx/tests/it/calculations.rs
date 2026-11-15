@@ -60,7 +60,7 @@ fn report() -> Document {
     };
     p.insert_object(off, field, &CharProps::default()).unwrap();
     d.body.push(para_block(p));
-    d.calc_settings = Some(CalcSettings { system: UnitSystem::UsCustomary, precision: 2, manual: false });
+    d.calc_settings = Some(CalcSettings { system: UnitSystem::UsCustomary, precision: 2, manual: false, g: wordcraft_doc::calc::GMeans::Gram });
     wordcraft_calc::recalc(&mut d, &|_| None);
     d
 }

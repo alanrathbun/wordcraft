@@ -258,7 +258,7 @@ pub struct CalcBox {
 }
 
 /// The symbols the box's menu offers, by group: Greek letters, operators, the units that are hard
-/// to type, and the built-in constants (`g` alone is the gram, so gravity is `g_0`).
+/// to type, and the built-in constants (`g` is gravity unless the document chose the SI gram).
 pub const SYMBOL_GROUPS: &[(&str, &[&str])] = &[
     (
         "Greek",
@@ -268,8 +268,8 @@ pub const SYMBOL_GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("Operators", &["≔", "·", "×", "±", "√", "²", "³", "⁻¹", "|", "°"]),
-    ("Units", &["°F", "°C", "Δ°F", "Δ°C", "µm", "Ω"]),
-    ("Constants", &["π", "e", "g_0", "c_0", "R_u"]),
+    ("Units", &["gm", "°F", "°C", "Δ°F", "Δ°C", "µm", "Ω"]),
+    ("Constants", &["π", "e", "g", "g_0", "c_0", "R_u"]),
 ];
 
 /// `\name` shortcuts the box turns into symbols, as in Word's math autocorrect.
@@ -718,6 +718,8 @@ pub struct OptionsForm {
     pub precision: u8,
     /// Recalculate only on request.
     pub manual: bool,
+    /// What `g` means: `gravity` (Mathcad) or `gram` (SI).
+    pub g: String,
     pub message: String,
 }
 
@@ -730,12 +732,16 @@ impl OptionsForm {
             UnitSystem::UsCustomary => "us",
             UnitSystem::Si => "si",
         };
-        OptionsForm { system: system.into(), precision: s.precision.min(15), manual: s.manual, message: String::new() }
+        let g = match s.g {
+            wordcraft_doc::calc::GMeans::Gravity => "gravity",
+            wordcraft_doc::calc::GMeans::Gram => "gram",
+        };
+        OptionsForm { system: system.into(), precision: s.precision.min(15), manual: s.manual, g: g.into(), message: String::new() }
     }
 
     /// The `calc.settings` parameters.
     pub fn params(&self) -> Value {
-        json!({"system": self.system, "precision": self.precision.min(15), "manual": self.manual})
+        json!({"system": self.system, "precision": self.precision.min(15), "manual": self.manual, "g": self.g})
     }
 }
 
@@ -751,6 +757,10 @@ fn options_ui(app: &mut WordApp, ui: &mut Ui, f: &mut OptionsForm) -> bool {
     ui.add_space(6.0);
     ui.checkbox(&mut f.manual, tl!("Recalculate manually"))
         .on_hover_text(tl!("Results update only on References › Recalculate; until then they show out of date"));
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(tl!("g means")).strong());
+    ui.radio_value(&mut f.g, "gravity".to_string(), tl!("Standard gravity (Mathcad): grams are gm"));
+    ui.radio_value(&mut f.g, "gram".to_string(), tl!("Gram (SI): gravity is g_0"));
     error_line(ui, &f.message);
     let (ok, cancel) = crate::dialogs::buttons(ui, tl!("OK"));
     if cancel {

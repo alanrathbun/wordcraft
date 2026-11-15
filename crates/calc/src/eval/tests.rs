@@ -421,3 +421,20 @@ fn engineering_constants_carry_their_units() {
     }
     assert!(check_name("g_1").is_ok(), "other subscripts are free");
 }
+
+#[test]
+fn g_is_gravity_when_the_document_says_so() {
+    let accel = Dim::LENGTH.div(Dim::TIME.powi(2).unwrap()).unwrap();
+    let mut env = Env::new();
+    env.set_g_is_gravity(true);
+    close(shown(&mut env, "a_1 := g ="), 9.80665, accel);
+    close(shown(&mut env, "F_w := 5 kg·g ="), 49.03325, val("n_1 := 1 N =").dim);
+    close(shown(&mut env, "m_1 := 5 gm ="), 0.005, Dim::MASS);
+    close(shown(&mut env, "m_2 := 5 kg ="), 5.0, Dim::MASS);
+    // `g` as a display unit would read as gravity: refused, with the way out named.
+    let e = run(&mut env, "m_3 := 5 kg = ? g").expect_err("g is gravity here");
+    assert!(e.to_string().contains("gm"), "{e}");
+    assert!(run(&mut env, "m_4 := 5 kg = ? gm").is_ok());
+    // Off (SI): g is the gram again.
+    close(val("m_5 := 5 g ="), 0.005, Dim::MASS);
+}

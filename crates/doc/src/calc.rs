@@ -64,6 +64,17 @@ pub enum UnitSystem {
     Si,
 }
 
+/// What `g` means in a document's calculations. Mathcad's convention is the default: `g` is
+/// standard gravity and the gram is `gm`. The SI convention makes `g` the gram (gravity is then
+/// `g_0`). It belongs to the document, so a report calculates the same on every computer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GMeans {
+    #[default]
+    Gravity,
+    Gram,
+}
+
 /// Document-wide calculation settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -73,11 +84,13 @@ pub struct CalcSettings {
     pub precision: u8,
     /// Recalculate only on request (regions go [`CalcState::Stale`] instead).
     pub manual: bool,
+    /// What `g` stands for (see [`GMeans`]).
+    pub g: GMeans,
 }
 
 impl Default for CalcSettings {
     fn default() -> Self {
-        CalcSettings { system: UnitSystem::UsCustomary, precision: 3, manual: false }
+        CalcSettings { system: UnitSystem::UsCustomary, precision: 3, manual: false, g: GMeans::Gravity }
     }
 }
 

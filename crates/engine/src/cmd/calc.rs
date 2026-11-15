@@ -13,7 +13,7 @@ use wordcraft_calc::{
     CalcError, RecalcReport, calc_unchanged, check_new_name, check_quote_unit, defined_name, defined_names, freeze_outside_body, is_calc_object,
     mark_stale, parse, recalc,
 };
-use wordcraft_doc::calc::{CalcRegion, CalcState, UnitSystem, calc_field_instr, parse_calc_field};
+use wordcraft_doc::calc::{CalcRegion, CalcState, GMeans, UnitSystem, calc_field_instr, parse_calc_field};
 use wordcraft_doc::math::Math;
 use wordcraft_doc::{Block, Document, InlineObject, Paragraph, Pos, StoryRef};
 
@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("calc.checkName", "Check Calculation Name", "Calculation", check).pure().params(r#"{"name": string, "id"?: n}"#),
         CommandSpec::new("calc.recalculate", "Recalculate", "References › Calculation", recalculate),
         CommandSpec::new("calc.settings", "Calculation Options", "References › Calculation", settings)
-            .params(r#"{"system"?: "us|si", "precision"?: n (0–15), "manual"?: bool}"#),
+            .params(r#"{"system"?: "us|si", "precision"?: n (0–15), "manual"?: bool, "g"?: "gravity|gram"}"#),
         CommandSpec::new("calc.resolveEdited", "Resolve Edited Calculation", "Calculation", resolve_edited)
             .params(r#"{"id": n, "keep": "source|word"}"#),
     ]
@@ -527,6 +527,13 @@ fn recalculate(s: &mut Session, _: &Value) -> CmdResult {
     Ok(report_json(recalc_now(s)))
 }
 
+fn g_name(g: GMeans) -> &'static str {
+    match g {
+        GMeans::Gravity => "gravity",
+        GMeans::Gram => "gram",
+    }
+}
+
 fn system_name(sys: UnitSystem) -> &'static str {
     match sys {
         UnitSystem::UsCustomary => "us",
@@ -534,7 +541,7 @@ fn system_name(sys: UnitSystem) -> &'static str {
     }
 }
 
-/// Sets the document's unit system, precision and manual mode. Back in automatic mode the
+/// Sets the document's unit system, precision, manual mode and what `g` means. Back in automatic mode the
 /// document recalculates; in manual mode a change to how results are shown marks them stale,
 /// and switching to manual alone leaves them current.
 fn settings(s: &mut Session, v: &Value) -> CmdResult {
@@ -557,17 +564,27 @@ fn settings(s: &mut Session, v: &Value) -> CmdResult {
         None | Some(Value::Null) => {}
         Some(x) => new.manual = x.as_bool().ok_or_else(|| CmdError::Params("`manual` is true or false".into()))?,
     }
+    match v.get("g") {
+        None | Some(Value::Null) => {}
+        Some(x) => {
+            new.g = match x.as_str() {
+                Some("gravity") => GMeans::Gravity,
+                Some("gram") => GMeans::Gram,
+                _ => return Err(CmdError::Params("`g` is \"gravity\" or \"gram\"".into())),
+            }
+        }
+    }
     if new != old {
         s.doc.calc_settings = Some(new.clone());
     }
     if has_calc(&s.doc) {
         if !new.manual {
             recalc_now(s);
-        } else if new.system != old.system || new.precision != old.precision {
+        } else if new.system != old.system || new.precision != old.precision || new.g != old.g {
             mark_stale(&mut s.doc);
         }
     }
-    Ok(json!({"system": system_name(new.system), "precision": new.precision, "manual": new.manual}))
+    Ok(json!({"system": system_name(new.system), "precision": new.precision, "manual": new.manual, "g": g_name(new.g)}))
 }
 
 /// A region edited outside the calculator: `"source"` draws it again from its source (the edited

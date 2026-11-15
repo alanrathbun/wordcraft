@@ -228,6 +228,8 @@ fn options_dialog_sets_settings() {
     h.run_steps(2);
     h.get_by_label("Recalculate manually").click();
     h.run_steps(2);
+    h.get_by_label("Gram (SI): gravity is g_0").click();
+    h.run_steps(2);
     if let Some(dialogs::Dialog::Calc(d)) = h.state_mut().dialog.as_mut()
         && let CalcDialog::Options(f) = &mut **d
     {
@@ -238,6 +240,7 @@ fn options_dialog_sets_settings() {
     assert!(h.state().dialog.is_none());
     let s = h.state().session.doc.calc_settings.clone().expect("settings set");
     assert_eq!((s.system, s.precision, s.manual), (UnitSystem::Si, 5, true));
+    assert_eq!(s.g, wordcraft_doc::calc::GMeans::Gram);
 }
 
 /// Insert › Calculated Value lists the defined names and inserts the chosen one's value.

@@ -1044,3 +1044,21 @@ fn a_calculation_can_be_aligned_and_made_inline() {
     run(&mut s, "edit.undo", json!({}));
     assert!(!layout_of(&s.doc, sigma).0);
 }
+
+#[test]
+fn g_setting_switches_between_gravity_and_gram() {
+    let mut s = session();
+    let w = calc(&mut s, "F_w := 5 kg·g = ? N");
+    assert!(region(&s, w).1.ends_with("=49.033 \"N\""), "Mathcad's g by default: {}", region(&s, w).1);
+    let r = run(&mut s, "calc.settings", json!({"g": "gram"}));
+    assert_eq!(r["g"], "gram");
+    assert!(matches!(region(&s, w).0.state, CalcState::Error(_)), "g is the gram now: kg·g isn't a force");
+    // It's saved with the document, .docx included.
+    let bytes = crate::io::save_bytes("report.docx", &s.doc).unwrap();
+    let back = Session::new(crate::io::open_bytes("report.docx", &bytes).unwrap());
+    assert_eq!(back.doc.calc_settings.clone().unwrap_or_default().g, wordcraft_doc::calc::GMeans::Gram);
+    run(&mut s, "calc.settings", json!({"g": "gravity"}));
+    assert!(region(&s, w).1.ends_with("=49.033 \"N\""));
+    let bad = s.run("calc.settings", &json!({"g": "grams"}));
+    assert!(bad.is_err());
+}

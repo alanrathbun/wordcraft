@@ -919,3 +919,15 @@ fn body_regions_reach_every_depth_with_recalculation_ids() {
     let p = d.para(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path(found[1].0.clone())).unwrap();
     assert!(matches!(p.object_at(found[1].1), Some(InlineObject::Equation { calc: Some(c), .. }) if c.id == 2));
 }
+
+#[test]
+fn g_follows_the_document_setting() {
+    let mut d = doc_with(&["F_w := 5 kg·g = ? N", "m_1 := 250 gm = ? kg"]);
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 1).1.ends_with("=49.033 \"N\""), "Mathcad's g is the default: {}", region(&d, 1).1);
+    assert!(region(&d, 2).1.ends_with("=0.25 \"kg\""), "{}", region(&d, 2).1);
+    d.calc_settings = Some(CalcSettings { g: wordcraft_doc::calc::GMeans::Gram, ..CalcSettings::default() });
+    recalc(&mut d, &no_page);
+    assert!(matches!(region(&d, 1).0.state, CalcState::Error(_)), "kg·g is kg² as grams: no longer a force");
+    assert!(region(&d, 2).1.ends_with("=0.25 \"kg\""), "gm is a gram either way");
+}

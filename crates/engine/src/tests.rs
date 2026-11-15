@@ -2714,7 +2714,7 @@ fn calc_survives_native_format() {
     }
     let mut doc = wordcraft_doc::Document::new();
     doc.body = vec![wordcraft_doc::para_block(p)];
-    doc.calc_settings = Some(CalcSettings { system: UnitSystem::Si, precision: 5, manual: true });
+    doc.calc_settings = Some(CalcSettings { system: UnitSystem::Si, precision: 5, manual: true, g: wordcraft_doc::calc::GMeans::Gram });
     let saved = crate::io::save_bytes("calc.json", &doc).unwrap();
     // The file itself holds everything as it was, state included.
     let back: wordcraft_doc::Document = serde_json::from_slice(&saved).unwrap();

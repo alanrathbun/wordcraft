@@ -80,12 +80,34 @@ enum Entry {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Env {
     entries: BTreeMap<String, Entry>,
+    /// `g` is standard gravity (Mathcad's convention) rather than the gram; the gram is then `gm`.
+    g_is_gravity: bool,
 }
 
 impl Env {
-    /// An empty environment.
+    /// An empty environment (`g` is the gram until [`Env::set_g_is_gravity`]).
     pub fn new() -> Env {
         Env::default()
+    }
+
+    /// Make `g` standard gravity (Mathcad's convention), or the gram.
+    pub fn set_g_is_gravity(&mut self, on: bool) {
+        self.g_is_gravity = on;
+    }
+
+    /// A built-in constant as this environment reads it: `g` is gravity when the document says so.
+    fn constant(&self, name: &str) -> Option<Quantity> {
+        if self.g_is_gravity && name == "g" { constant("g_0") } else { constant(name) }
+    }
+
+    /// When `g` is gravity, a display unit spelled with `g` (`= ? g`, `kg/g`) would read as
+    /// gravity: refused, naming `gm`.
+    pub(crate) fn check_display_unit(&self, text: &str) -> Result<(), CalcError> {
+        let gram = text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '°')).any(|w| w == "g");
+        if self.g_is_gravity && gram {
+            return Err(CalcError::Syntax("g is gravity in this document — write gm for grams".into()));
+        }
+        Ok(())
     }
 
     /// Define a variable (not an absolute temperature: see [`Temp`]).
@@ -192,7 +214,7 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
     match s {
         Stmt::Eval { expr, show } => {
             let v = eval_val(env, expr, pass)?;
-            check_show(show, v)?;
+            check_show(env, show, v)?;
             Ok(Some(v.q))
         }
         Stmt::Define { name, params, body, show } => {
@@ -207,7 +229,7 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
             }
             let v = eval_val(env, body, pass)?;
             if let Some(show) = show {
-                check_show(show, v)?;
+                check_show(env, show, v)?;
             }
             env.entries.insert(name.to_string(), Entry::Var(v.q, v.t));
             Ok(show.as_ref().map(|_| v.q))
@@ -216,10 +238,11 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
 }
 
 /// A `= ? unit` must be a unit of the value's dimension.
-fn check_show(show: &Show, v: Val) -> Result<(), CalcError> {
+fn check_show(env: &Env, show: &Show, v: Val) -> Result<(), CalcError> {
     let Some(text) = &show.unit else {
         return Ok(());
     };
+    env.check_display_unit(text)?;
     check_unit_for(v, text)
 }
 
@@ -386,7 +409,7 @@ fn unit_literal<'e>(cx: &Cx<'_>, fr: &Frame<'_>, num: &Expr, unit_name: &'e Expr
     let Expr::Name(n) = unit_name else {
         return None;
     };
-    if fr.param(n).is_some() || cx.env.entries.contains_key(n.as_str()) || is_constant(n) {
+    if fr.param(n).is_some() || cx.env.entries.contains_key(n.as_str()) || cx.env.constant(n).is_some() {
         return None;
     }
     Some((v, lookup(n)?, n))
@@ -431,7 +454,7 @@ fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Val, CalcError> {
         Some(Entry::Func { .. }) => return Err(not_a_value(name)),
         None => {}
     }
-    if let Some(q) = constant(name) {
+    if let Some(q) = cx.env.constant(name) {
         return Ok(Val::plain(q));
     }
     // A unit wins over a built-in of the same spelling: `5 min` is minutes, `min(1, 2)` a call.

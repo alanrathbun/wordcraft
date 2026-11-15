@@ -37,12 +37,23 @@ instead: `A_b`, `L_1`. A subscript can't be empty (`a__b` and `x_` are refused).
 |---|---|
 | `π` or `pi` | 3.141592653589793… |
 | `e` | 2.718281828459045… |
-| `g_0` | standard gravity, 9.80665 m/s² (`g` alone is the gram) |
+| `g` | standard gravity, 9.80665 m/s², as in Mathcad (see below) |
+| `g_0` | standard gravity, under either setting |
 | `c_0` | speed of light, 299 792 458 m/s |
 | `R_u` | molar gas constant, 8.314462618 J/(mol·K) |
 
-The constants carry their units, so `W_t := 5 kg·g_0 = ? N` shows 49.033 N and `1 lbm·g_0 = ? lbf`
+The constants carry their units, so `W_t := 5 kg·g = ? N` shows 49.033 N and `1 lbm·g = ? lbf`
 shows 1 lbf.
+
+### `g`: gravity or gram
+
+By default `g` means standard gravity, as in Mathcad, and the gram is written `gm` (`250 gm`).
+`kg`, `mg` and the other prefixed grams are unchanged. To use the SI convention instead, where `g`
+is the gram and gravity is `g_0`, choose **Gram (SI)** under "g means" in References ›
+Calculation Options. The setting is saved in the document, `.docx` included, so a report
+calculates the same on every computer. Changing it recalculates the document, so check any
+calculation that uses `g`. While `g` means gravity, a display unit written with `g` (`= ? g`) is
+refused; write `gm`.
 
 ## Symbols
 
