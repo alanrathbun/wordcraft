@@ -18,7 +18,7 @@ use crate::WordApp;
 
 /// The definition mark the box shows for a typed `:=` (U+2254 COLON EQUALS). The parser reads
 /// either; what is stored is the ASCII `:=`.
-const DEFINE_MARK: char = '\u{2254}';
+pub(crate) const DEFINE_MARK: char = '\u{2254}';
 
 /// How many `<name>_N` the rename suggestion tries before leaving the field to the user.
 const MAX_SUGGESTIONS: u32 = 99;
@@ -148,6 +148,28 @@ fn check_name(session: &mut Session, name: &str, editing: Option<u64>) -> Result
 
 fn is_ok(v: &Value) -> bool {
     v.get("ok").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// The face the interface borrows to draw `≔` in the source box (its own fonts have none): the
+/// math font equations are drawn with, which has it, else any document font that does. Looked
+/// up once per [`wordcraft_fonts::FontDb::generation`].
+pub(crate) fn define_mark_face() -> Option<std::sync::Arc<wordcraft_fonts::FontFace>> {
+    type Memo = Option<(u64, Option<std::sync::Arc<wordcraft_fonts::FontFace>>)>;
+    static MEMO: std::sync::Mutex<Memo> = std::sync::Mutex::new(None);
+    let db = wordcraft_fonts::FontDb::global();
+    let generation = db.generation();
+    let mut memo = MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((g, face)) = memo.as_ref()
+        && *g == generation
+    {
+        return face.clone();
+    }
+    // Very large faces (system CJK collections) aren't borrowed by the interface.
+    let usable = |f: &std::sync::Arc<wordcraft_fonts::FontFace>| f.covers(DEFINE_MARK) && f.data().len() <= 16 << 20;
+    let (math, _) = wordcraft_fonts::math::resolve_math("Cambria Math");
+    let face = Some(db.face(&math.family, &math.style)).filter(usable).or_else(|| db.fallback_for(DEFINE_MARK, u32::MAX).filter(usable));
+    *memo = Some((generation, face.clone()));
+    face
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -649,6 +671,10 @@ pub fn bar_target(app: &WordApp) -> Option<(u64, Pos)> {
 /// The bar under a region edited outside WordCraft (the one hovered, else the one at the caret):
 /// Restore from calculation, or Keep Word's equation (`calc.resolveEdited`).
 pub(crate) fn bar(app: &mut WordApp, ctx: &egui::Context) {
+    // Not over a dialog (the source box opens at the caret, where the bar would be).
+    if app.dialog.is_some() {
+        return;
+    }
     let pointer = ctx.pointer_hover_pos();
     let frame = ctx.cumulative_frame_nr();
     let hovered = ctx

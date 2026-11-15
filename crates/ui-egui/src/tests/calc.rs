@@ -69,12 +69,14 @@ fn enter(h: &mut egui_kittest::Harness<'static, WordApp>) {
 fn calc_box_commits_source() {
     let mut h = ready(app());
     open_box(&mut h);
-    type_text(&mut h, "P := 1500 lbf");
-    let b = calc_box(h.state()).expect("the box is open");
-    // `:` then `=` shows as `≔` where the interface font has it (else the ASCII stays).
+    // `:` then `=`: the box borrows the math font for `≔` and shows it.
+    type_text(&mut h, "P :");
+    type_text(&mut h, "= 1500 lbf");
+    h.run_steps(3);
     let font = egui::TextStyle::Body.resolve(&h.ctx.global_style());
-    let covered = h.ctx.fonts_mut(|f| f.has_glyph(&font, '\u{2254}'));
-    assert_eq!(b.source, if covered { "P \u{2254} 1500 lbf" } else { "P := 1500 lbf" });
+    assert!(h.ctx.fonts_mut(|f| f.has_glyph(&font, '\u{2254}')), "the interface can draw the definition mark while the box is open");
+    let b = calc_box(h.state()).expect("the box is open");
+    assert_eq!(b.source, "P \u{2254} 1500 lbf", "`:=` shows as the definition mark");
     enter(&mut h);
     assert!(h.state().dialog.is_none(), "Enter commits and closes the box");
     assert_eq!(sources(h.state()), ["P := 1500 lbf"]);
@@ -106,18 +108,9 @@ fn double_click_opens_source() {
     a.run("insert.calculation", json!({"source": "P := 1500 lbf", "display": false})).unwrap();
     a.run("text.insert", json!({"text": " here"})).unwrap();
     a.run("view.commentsPane", json!({"value": false})).unwrap();
-    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
-        |ui, app: &mut WordApp| {
-            let ctx = ui.ctx().clone();
-            app.logic(&ctx);
-            app.ui(ui);
-        },
-        a,
-    );
-    h.run_steps(6);
+    let mut h = timed(a);
     let (at, region) = regions(h.state()).remove(0);
-    let eq = h.state_mut().session.layout().equation_box(&at, 0).expect("the calculation is laid out");
-    let p = crate::canvas::page_to_screen(h.state_mut(), eq.page, eq.x + eq.math.width / 2.0, eq.base - 2.0).expect("on screen");
+    let p = on_screen(&mut h, &at);
     double_click(&mut h, p);
     let b = calc_box(h.state()).expect("the double-click opens the source box");
     assert_eq!(b.editing, Some(region.id));
@@ -130,6 +123,35 @@ fn double_click_opens_source() {
     assert!(h.state().dialog.is_none());
     assert_eq!(sources(h.state()), ["P := 2000 lbf"]);
     assert_eq!(regions(h.state())[0].1.id, region.id, "the same region");
+}
+
+/// A harness whose frames advance the clock (egui needs it to see a double-click or a hover).
+fn timed(a: WordApp) -> egui_kittest::Harness<'static, WordApp> {
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(6);
+    h
+}
+
+/// The middle of the calculation at `at`, on screen.
+fn on_screen(h: &mut egui_kittest::Harness<'static, WordApp>, at: &Pos) -> Pos2 {
+    let eq = h.state_mut().session.layout().equation_box(at, 0).expect("the calculation is laid out");
+    crate::canvas::page_to_screen(h.state_mut(), eq.page, eq.x + eq.math.width / 2.0, eq.base - 2.0).expect("on screen")
+}
+
+fn set_state(a: &mut WordApp, index: usize, state: CalcState) {
+    let (at, _) = regions(a).remove(index);
+    if let Ok(p) = a.session.doc.para_mut(at.story, &at.path)
+        && let Some(InlineObject::Equation { calc: Some(c), .. }) = p.object_at_mut(at.off)
+    {
+        c.state = state;
+    }
 }
 
 fn double_click(h: &mut egui_kittest::Harness<'static, WordApp>, at: Pos2) {
@@ -328,4 +350,83 @@ fn calc_edited_outside_bar_resolves_the_region() {
     h.run_steps(3);
     let r = regions(h.state());
     assert_eq!(r.len(), 1, "kept as a plain equation, no longer a calculation");
+}
+
+/// The bar doesn't show over a dialog (the source box opens where it would be).
+#[test]
+fn calc_edited_outside_bar_hides_behind_a_dialog() {
+    let mut a = app();
+    a.run("insert.calculation", json!({"source": "P := 1500 lbf ="})).unwrap();
+    set_state(&mut a, 0, CalcState::EditedOutside);
+    let (at, _) = regions(&a).remove(0);
+    a.session.sel = wordcraft_engine::Selection::caret(at);
+    let mut h = ready(a);
+    assert!(h.query_by_label("Restore from calculation").is_some(), "the bar shows");
+    h.state_mut().run("insert.calculation", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Restore from calculation").is_none(), "not while the box is open");
+}
+
+/// Hovering an errored calculation shows its message; hovering one edited outside WordCraft
+/// brings up its bar (the caret elsewhere).
+#[test]
+fn calc_hover_shows_the_error_and_the_edited_bar() {
+    let mut a = app();
+    a.run("text.insert", json!({"text": "Bad "})).unwrap();
+    a.run("insert.calculation", json!({"source": "x := 1 lbf + 2 ft =", "display": false})).unwrap();
+    a.run("text.insert", json!({"text": " and "})).unwrap();
+    a.run("insert.calculation", json!({"source": "Q := 2 lbf =", "display": false})).unwrap();
+    a.run("text.insert", json!({"text": " end"})).unwrap();
+    a.run("view.commentsPane", json!({"value": false})).unwrap();
+    set_state(&mut a, 1, CalcState::EditedOutside);
+    a.run("caret.docStart", json!({})).unwrap();
+    let r = regions(&a);
+    let CalcState::Error(message) = r[0].1.state.clone() else { panic!("not an error: {:?}", r[0].1.state) };
+    let mut h = timed(a);
+    let first = on_screen(&mut h, &r[0].0);
+    h.event(Event::PointerMoved(first));
+    h.run_steps(4);
+    assert!(h.query_by_label(&message).is_some(), "the error's message shows: {message}");
+    assert!(h.query_by_label("Restore from calculation").is_none());
+    let second = on_screen(&mut h, &r[1].0);
+    h.event(Event::PointerMoved(second));
+    h.run_steps(4);
+    assert!(h.query_by_label(&message).is_none(), "the tooltip goes with the pointer");
+    assert!(h.query_by_label("Restore from calculation").is_some(), "hovering brings up the bar");
+    assert!(h.query_by_label("Keep Word's equation").is_some());
+    // Out of both: the bar goes.
+    h.event(Event::PointerMoved(Pos2::new(700.0, 850.0)));
+    h.run_steps(4);
+    assert!(h.query_by_label("Restore from calculation").is_none(), "leaving takes the bar away");
+}
+
+/// A refused resolve reaches the status bar.
+#[test]
+fn calc_resolve_refusal_shows_in_the_status_bar() {
+    let mut a = app();
+    calc_ui::resolve(&mut a, 9999, "source");
+    let status = a.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+    assert!(status.contains("no calculation 9999"), "{status:?}");
+}
+
+/// Go to existing finds a definition inside a table cell.
+#[test]
+fn calc_go_to_existing_finds_a_definition_in_a_table() {
+    let mut a = app();
+    a.run("insert.table", json!({"rows": 2, "cols": 2})).unwrap();
+    a.run("insert.calculation", json!({"source": "P := 1500 lbf"})).unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    let (owner, region) = regions(&a).remove(0);
+    assert!(owner.path.cell().is_some(), "the definition is in a cell");
+    assert_eq!(calc_ui::region_pos(&a.session.doc, region.id), Some(owner.clone()));
+    let mut h = ready(a);
+    open_box(&mut h);
+    type_text(&mut h, "P := 2 lbf");
+    enter(&mut h);
+    assert_eq!(calc_box(h.state()).and_then(|b| b.prompt).and_then(|p| p.existing), Some(region.id));
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Go to existing").click();
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none(), "the box closes");
+    assert_eq!(h.state().session.sel.focus, owner, "the caret is at the owning region");
+    assert_eq!(sources(h.state()), ["P := 1500 lbf"]);
 }

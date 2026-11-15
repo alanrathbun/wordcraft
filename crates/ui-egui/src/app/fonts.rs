@@ -63,6 +63,21 @@ impl WordApp {
         }
     }
 
+    /// The calculation box shows a typed `:=` as `≔`, which the interface fonts lack: while it is
+    /// open, borrow the face equations draw it with ([`crate::calc_ui::define_mark_face`]).
+    pub(super) fn ensure_calc_fonts(&mut self) {
+        if !matches!(self.dialog, Some(crate::dialogs::Dialog::Calc(_))) {
+            return;
+        }
+        if self.canvas.ime_faces.iter().any(|f| f.covers(crate::calc_ui::DEFINE_MARK)) {
+            return;
+        }
+        if let Some(face) = crate::calc_ui::define_mark_face() {
+            self.canvas.ime_faces.push(face);
+            self.styled = false;
+        }
+    }
+
     /// File › Recover draws the recovered documents' names with the interface faces too: a
     /// Chinese name was a row of boxes, an Arabic or Hebrew one likewise. The same treatment as
     /// the caption (and as the Recent list, `ensure_recent_fonts`): CJK loads the CJK UI font,
