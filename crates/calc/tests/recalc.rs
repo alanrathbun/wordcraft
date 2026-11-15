@@ -614,7 +614,9 @@ fn vectors_indexes_and_ranges_display_as_matrices_and_subscripts() {
     assert_eq!(shown("x := 2 D[0]"), "x≔2·D_0");
     assert_eq!(shown("x := 1, 1.5..3"), "x≔1,1.5..3");
     assert_eq!(shown("x := 0 in, 0.5 in..1 in"), "x≔0 \"in\",0.5 \"in\"..1 \"in\"");
-    assert_eq!(shown("x := -1..(n - 1)"), "x≔-1..(n-1)");
+    assert_eq!(shown("i := 0..n - 1"), "i≔0..n-1");
+    assert_eq!(shown("i := 0..(n - 1)"), "i≔0..n-1");
+    assert_eq!(shown("x := 1, 1 + 0.5..a/b"), "x≔1,1+0.5..(a/b)");
     assert_eq!(shown("t_o[k] := k"), "〖t_o〗_k≔k");
     assert_eq!(shown("t[i_0] := 1"), "t_(i_0)≔1");
 }

@@ -7,8 +7,7 @@
 //!            | expr show                                       evaluate and show
 //! head      := name | name "(" params ")" | name"[" name "]"   variable, function, indexed
 //! body      := range | expr
-//! range     := end [ "," end ] ".." end                       first, second..last
-//! end       := power { adjacency power }                       `0.5 in`, but not `2·0`
+//! range     := expr [ "," expr ] ".." expr                    first, second..last; `..` loosest
 //! show      := "=" [ "?" ] [ unit text ]                       the rest of the text is the unit
 //! expr      := term { ("+" | "-") term }
 //! term      := unary { ("*" | "/" | adjacency) unary }
@@ -406,8 +405,8 @@ struct Parser<'a> {
     depth: usize,
     /// Whether a `|` ends the current absolute value instead of starting a new factor.
     bar_closes: bool,
-    /// Whether a `..` ends the current expression, as it ends a range's first or second value;
-    /// anywhere else it is an error.
+    /// Whether a `..` ends the current expression, as it ends a value of a range at the top of
+    /// a definition's right side; anywhere else it is an error.
     in_range_end: bool,
 }
 
@@ -458,43 +457,32 @@ impl<'a> Parser<'a> {
         self.expr_inner(0)
     }
 
-    /// Parse the right side of a definition: a range, or else an ordinary expression (which
-    /// refuses any `..`).
+    /// Parse the right side of a definition: a range, or else an ordinary expression. `..` is the
+    /// loosest operator and is only accepted here, at the top: each value of a range is a whole
+    /// expression (`0..n-1`, `1, 1+0.5..n`).
     fn body(&mut self) -> Result<Node, CalcError> {
-        let start = self.pos;
-        match self.range_start() {
-            Ok(Some((first, second))) => self.range_rhs(first, second),
-            // Over a limit: parsing again would only be over it again.
-            Err(e) if !matches!(e, CalcError::Syntax(_)) => Err(e),
-            Ok(None) | Err(_) => {
-                self.pos = start;
-                self.root()
+        let first = self.range_value()?;
+        let second = match self.peek_kind() {
+            Some(Kind::Comma) => {
+                self.pos += 1;
+                let second = self.range_value()?;
+                if self.peek_kind() != Some(&Kind::DotDot) {
+                    return Err(syntax("a list needs brackets, like [1, 2]; a range with a step is written like 1, 1.5..3"));
+                }
+                Some(second)
             }
-        }
-    }
-
-    /// The start of a range, `first..` or `first, second..`, with its `..` consumed; `None` when
-    /// the right side doesn't start like one.
-    fn range_start(&mut self) -> Result<Option<(Node, Option<Node>)>, CalcError> {
-        let first = self.range_end()?;
-        let second = if self.peek_kind() == Some(&Kind::Comma) {
-            self.pos += 1;
-            Some(self.range_end()?)
-        } else {
-            None
+            Some(Kind::DotDot) => None,
+            _ => return Ok(first),
         };
-        if self.peek_kind() != Some(&Kind::DotDot) {
-            return Ok(None);
-        }
-        self.pos += 1;
-        Ok(Some((first, second)))
+        self.pos += 1; // the `..`
+        self.range_rhs(first, second)
     }
 
     /// The rest of a range after its `..`: the last value, then the end of the statement or its
     /// `=`, since a range is the whole right side.
     fn range_rhs(&mut self, first: Node, second: Option<Node>) -> Result<Node, CalcError> {
-        let last = self.range_end()?;
-        if !matches!(self.peek_kind(), None | Some(Kind::Eq)) {
+        let last = self.range_value()?;
+        if self.peek_kind() == Some(&Kind::DotDot) {
             return Err(misplaced_range());
         }
         let height = first.height.max(last.height).max(second.as_ref().map_or(0, |s| s.height));
@@ -502,25 +490,14 @@ impl<'a> Parser<'a> {
         Node::over(height, range)
     }
 
-    /// One end of a range: factors multiplied by adjacency only (`-2`, `0.5 in`, `2^n`,
-    /// `(n - 1)`), so an explicit operator beside the `..` (`2·0..5`) leaves it out of the range.
-    fn range_end(&mut self) -> Result<Node, CalcError> {
+    /// One value of a range: a whole expression ended by a `..` at its top level (not inside a
+    /// bracket). Like the whole expression of a statement, it isn't counted as nesting; with no
+    /// `..` after it, it is that expression.
+    fn range_value(&mut self) -> Result<Node, CalcError> {
         let outer = std::mem::replace(&mut self.in_range_end, true);
-        let r = self.range_factors();
+        let r = self.expr_inner(0);
         self.in_range_end = outer;
         r
-    }
-
-    /// The factors of a range end. Like the whole expression of a statement, they aren't counted
-    /// as nesting.
-    fn range_factors(&mut self) -> Result<Node, CalcError> {
-        let mut lhs = self.expr_inner(MUL_BP.1)?;
-        while self.starts_factor() {
-            self.check_adjacent()?;
-            let rhs = self.expr_inner(MUL_BP.1)?;
-            lhs = Node::over(lhs.height.max(rhs.height), Expr::Binary(Op::Mul, Box::new(lhs.expr), Box::new(rhs.expr)))?;
-        }
-        Ok(lhs)
     }
 
     /// Run `f` inside a bracket, where a `|` ends an absolute value only when `bar_closes` and a

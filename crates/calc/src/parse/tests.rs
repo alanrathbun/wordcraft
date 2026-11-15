@@ -517,6 +517,12 @@ fn range_dots_are_not_decimal_points() {
         range(bin(Op::Mul, num(0.0), name("in")), Some(bin(Op::Mul, num(0.5), name("in"))), bin(Op::Mul, num(1.0), name("in")))
     );
     assert_eq!(body_of("x := 0..2^n"), range(num(0.0), None, bin(Op::Pow, num(2.0), name("n"))));
+    // `..` is the loosest operator: each value is a whole expression.
+    assert_eq!(body_of("i := 0..n-1"), range(num(0.0), None, bin(Op::Sub, name("n"), num(1.0))));
+    assert_eq!(body_of("i := 0..length(D)-1"), range(num(0.0), None, bin(Op::Sub, call("length", vec![name("D")]), num(1.0))));
+    assert_eq!(body_of("x := 1, 1+0.5..n"), range(num(1.0), Some(bin(Op::Add, num(1.0), num(0.5))), name("n")));
+    assert_eq!(body_of("x := 2·0..5"), range(bin(Op::Mul, num(2.0), num(0.0)), None, num(5.0)));
+    assert_eq!(body_of("x := -1 + a..b/2"), range(bin(Op::Add, neg(num(1.0)), name("a")), None, bin(Op::Div, name("b"), num(2.0))));
     assert_eq!(body_of("x := 0..(n - 1)"), range(num(0.0), None, bin(Op::Sub, name("n"), num(1.0))));
     assert!(matches!(parse("i := 0..5 ="), Ok(Stmt::Define { show: Some(_), .. })));
     syntax("x := 1.5.3");
@@ -524,7 +530,7 @@ fn range_dots_are_not_decimal_points() {
     assert_eq!(syntax_msg("x := 0.."), "the expression ends too soon");
     assert_eq!(syntax_msg("x := 0...5"), "`...` isn't valid; a range is written like 0..5");
     syntax("x := ..5");
-    syntax("x := 1, 2");
+    assert_eq!(syntax_msg("x := 1, 2"), "a list needs brackets, like [1, 2]; a range with a step is written like 1, 1.5..3");
     syntax("x := 1, 2, 3..4");
     syntax("x := 0..1..2");
     syntax("x := 1 2..3");
@@ -532,8 +538,18 @@ fn range_dots_are_not_decimal_points() {
 
 #[test]
 fn ranges_are_whole_right_hand_sides() {
-    for src in ["x := (0..5)", "x := 2·0..5", "0..5 =", "f(0..5) =", "x := [0..5]", "x := 0..5 + 1", "x := D[0..1]", "x := |0..1|", "x := 1 + 0..5"]
-    {
+    for src in [
+        "x := (0..5)",
+        "0..5 =",
+        "f(0..5) =",
+        "x := [0..5]",
+        "x := D[0..1]",
+        "x := |0..1|",
+        "x := 0..1..2",
+        "x := 2·(0..5)",
+        "x := 1, (2..3)",
+        "x := 0..f(1..2)",
+    ] {
         assert_eq!(syntax_msg(src), "a range like 0..5 can only be the whole right side of a definition", "{src}");
     }
 }

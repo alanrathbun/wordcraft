@@ -500,10 +500,11 @@ fn index_simple(e: &Expr) -> bool {
     }
 }
 
-/// Needs parentheses as an end of a range: a sum (`0..(n-1)`) or a quotient, whose operand
-/// UnicodeMath could take to run on into the `..`.
+/// Needs parentheses as a value of a range. `..` is the loosest operator, so a sum needs none
+/// (`0..n-1`); a quotient does, so UnicodeMath can't run its denominator on into the `..`, and so
+/// does a range built by hand inside another.
 fn range_end_parens(e: &Expr) -> bool {
-    prec(e) < 2 || matches!(e, Expr::Binary(Op::Div, ..))
+    matches!(e, Expr::Binary(Op::Div, ..) | Expr::Range { .. })
 }
 
 /// Push `e`, in parentheses when `parens`.
