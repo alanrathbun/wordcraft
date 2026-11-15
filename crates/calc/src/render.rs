@@ -507,6 +507,38 @@ fn range_end_parens(e: &Expr) -> bool {
     matches!(e, Expr::Binary(Op::Div, ..) | Expr::Range { .. })
 }
 
+/// Whether `e` is written ending in a sub- or superscript, a square root, or anything else whose
+/// operand UnicodeMath could run on into a `..` after it: a numeric script takes every letter,
+/// digit and `.` that follows (`D_0..5` would lower `0..5`). Errs towards yes.
+fn ends_in_script(e: &Expr) -> bool {
+    let mut e = e;
+    loop {
+        match e {
+            Expr::Num(v) => return exponential(*v),
+            Expr::Name(n) => return n.contains('_') && !is_unit(n),
+            Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } => return false,
+            Expr::Call(..) => return is_sqrt(e),
+            Expr::Index(..) | Expr::Binary(Op::Pow, ..) => return true,
+            Expr::Unary(_, a) | Expr::Binary(_, _, a) => e = a,
+            Expr::Range { last, .. } => e = last,
+        }
+    }
+}
+
+/// Push the value written just before a range's `..`: in invisible brackets when it ends in a
+/// script (`〖D_0〗..5`), so the `..` stays out of the script.
+fn push_before_dots<'a>(todo: &mut Vec<Step<'a>>, e: &'a Expr) {
+    if range_end_parens(e) {
+        wrap(todo, e, true);
+    } else if ends_in_script(e) {
+        todo.push(Step::Text(INVISIBLE_CLOSE));
+        todo.push(Step::Expr(e));
+        todo.push(Step::Text(INVISIBLE_OPEN));
+    } else {
+        todo.push(Step::Expr(e));
+    }
+}
+
 /// Push `e`, in parentheses when `parens`.
 fn wrap<'a>(todo: &mut Vec<Step<'a>>, e: &'a Expr, parens: bool) {
     if parens {
@@ -646,11 +678,14 @@ fn push_array_syntax<'a>(e: &'a Expr, todo: &mut Vec<Step<'a>>, out: &mut Out) {
         Expr::Range { first, second, last } => {
             wrap(todo, last, range_end_parens(last));
             todo.push(Step::Text(".."));
-            if let Some(second) = second {
-                wrap(todo, second, range_end_parens(second));
-                todo.push(Step::Text(","));
+            match second {
+                Some(second) => {
+                    push_before_dots(todo, second);
+                    todo.push(Step::Text(","));
+                    wrap(todo, first, range_end_parens(first));
+                }
+                None => push_before_dots(todo, first),
             }
-            wrap(todo, first, range_end_parens(first));
         }
         _ => {}
     }

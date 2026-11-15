@@ -490,9 +490,13 @@ fn indexing_needs_no_space() {
     assert_eq!(expr_of("M[i, j]"), index("M", vec![name("i"), name("j")]));
     assert_eq!(expr_of("D [2]"), bin(Op::Mul, name("D"), matrix(1, 1, vec![num(2.0)])));
     assert_eq!(syntax_msg("f(x)[2] ="), "only a name can be indexed, like D[2]");
-    for src in ["(a)[2] =", "D[1][2] =", "x²[1] =", "[1][0] =", "|a|[0] ="] {
+    for src in ["(a)[2] =", "D[1][2] =", "[1][0] =", "f(x)[2] [3] ="] {
         assert_eq!(syntax_msg(src), "only a name can be indexed, like D[2]", "{src}");
     }
+    // After anything else, a touching `[` starts a literal factor, like `2(a+b)`.
+    assert_eq!(expr_of("2[1, 2]"), bin(Op::Mul, num(2.0), matrix(2, 1, vec![num(1.0), num(2.0)])));
+    assert_eq!(expr_of("x²[1]"), bin(Op::Mul, bin(Op::Pow, name("x"), num(2.0)), matrix(1, 1, vec![num(1.0)])));
+    assert_eq!(expr_of("|a|[0]"), bin(Op::Mul, Expr::Abs(Box::new(name("a"))), matrix(1, 1, vec![num(0.0)])));
     // An index is a whole expression; it binds like a call, tighter than `^`.
     assert_eq!(expr_of("D_o[i + 1]^2"), bin(Op::Pow, index("D_o", vec![bin(Op::Add, name("i"), num(1.0))]), num(2.0)));
     assert_eq!(expr_of("2 D[0]"), bin(Op::Mul, num(2.0), index("D", vec![num(0.0)])));

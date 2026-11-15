@@ -579,11 +579,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Before the next factor of an implied product: a number straight after a value is refused,
-    /// and so is a `[` touching anything but a name (a name took it as an index already).
+    /// and so is a `[` touching a closing bracket (`f(x)[2]`, `D[1][2]`), which looks like an
+    /// index of something that isn't a name. A `[` touching a name was taken as an index already;
+    /// after anything else it starts a literal factor, as `(` does (`2[1, 2]`).
     fn check_adjacent(&self) -> Result<(), CalcError> {
         match self.peek() {
             Some(Tok { kind: Kind::Num(_), .. }) if self.after_value() => Err(syntax("two values in a row \u{2014} did you mean `*`?")),
-            Some(Tok { kind: Kind::LBracket, start, .. }) if self.prev().is_some_and(|p| p.end == *start) => {
+            Some(Tok { kind: Kind::LBracket, start, .. })
+                if self.prev().is_some_and(|p| p.end == *start && matches!(p.kind, Kind::RParen | Kind::RBracket)) =>
+            {
                 Err(syntax("only a name can be indexed, like D[2]"))
             }
             _ => Ok(()),

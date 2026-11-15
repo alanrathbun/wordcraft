@@ -617,6 +617,12 @@ fn vectors_indexes_and_ranges_display_as_matrices_and_subscripts() {
     assert_eq!(shown("i := 0..n - 1"), "i≔0..n-1");
     assert_eq!(shown("i := 0..(n - 1)"), "i≔0..n-1");
     assert_eq!(shown("x := 1, 1 + 0.5..a/b"), "x≔1,1+0.5..(a/b)");
+    // The value before `..` is kept whole when it ends in a script, so the dots stay out of it.
+    assert_eq!(shown("x := D[0]..5"), "x≔〖D_0〗..5");
+    assert_eq!(shown("x := 10^2..10^3"), "x≔〖〖10〗^2〗..〖10〗^3");
+    assert_eq!(shown("x := D[0], D[1]..D[5]"), "x≔D_0,〖D_1〗..D_5");
+    assert_eq!(shown("x := 1, -x^2..5"), "x≔1,〖-x^2〗..5");
+    assert_eq!(shown("x := a_1..5"), "x≔〖a_1〗..5");
     assert_eq!(shown("t_o[k] := k"), "〖t_o〗_k≔k");
     assert_eq!(shown("t[i_0] := 1"), "t_(i_0)≔1");
 }
@@ -646,6 +652,43 @@ fn a_literal_is_a_bracketed_matrix_and_an_index_a_subscript_in_the_math() {
     let Some((base, sub)) = script else { panic!("{:#?}", math.nodes) };
     assert!(matches!(base.as_slice(), [MNode::Script { .. }]), "{base:#?}");
     assert!(matches!(sub.as_slice(), [MNode::Run(r)] if r.text == "i"), "{sub:#?}");
+}
+
+/// Every sub- and superscript in `nodes`, at any depth.
+fn scripts(nodes: &[MNode]) -> Vec<(Vec<MNode>, Vec<MNode>)> {
+    let mut out = Vec::new();
+    let mut todo: Vec<&MNode> = nodes.iter().collect();
+    while let Some(n) = todo.pop() {
+        match n {
+            MNode::Script { base, sub, sup, .. } => {
+                out.push((sub.clone(), sup.clone()));
+                todo.extend(base.iter().chain(sub.iter()).chain(sup.iter()));
+            }
+            MNode::Frac { num, den, .. } => todo.extend(num.iter().chain(den.iter())),
+            MNode::Rad { deg, e, .. } => todo.extend(deg.iter().chain(e.iter())),
+            MNode::Delim { elems, .. } => todo.extend(elems.iter().flatten()),
+            MNode::Func { name, e } => todo.extend(name.iter().chain(e.iter())),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn a_range_keeps_its_dots_out_of_scripts_in_the_math() {
+    let sources = ["x := D[0]..5", "x := 10^2..10^3", "x := D[0], D[1]..D[5]", "x := a_1..5", "x := 1e20..1e21"];
+    let mut d = doc_with(&sources);
+    recalc(&mut d, &no_page);
+    for (k, src) in sources.iter().enumerate() {
+        let (_, linear, math) = region(&d, k as u64 + 1);
+        let all = scripts(&math.nodes);
+        assert!(!all.is_empty(), "{src}: no scripts in {:#?}", math.nodes);
+        for (sub, sup) in all {
+            let text: String = runs(&sub).iter().chain(runs(&sup).iter()).map(|r| r.text.clone()).collect();
+            assert!(!text.contains('.'), "{src} ({linear}): a script holds {text:?}");
+        }
+        assert!(runs(&math.nodes).iter().any(|r| r.text.contains("..")), "{src}: no `..` run in {:#?}", math.nodes);
+    }
 }
 
 #[test]
