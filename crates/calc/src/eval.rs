@@ -247,7 +247,9 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
             check_show(env, show, &v)?;
             Ok(Some(v))
         }
-        Stmt::Define { name, params, body, show } => {
+        // Indexed definitions are evaluated from Task 3 of the vectors work.
+        Stmt::Define { index: Some(_), .. } => Err(CalcError::Syntax("not supported yet".to_string())),
+        Stmt::Define { name, params, body, show, index: None } => {
             check_name(name)?;
             params.iter().try_for_each(|p| check_name(p))?;
             if !params.is_empty() {
@@ -395,6 +397,8 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
             })
         }
         Expr::Call(name, args) => call(cx, fr, name, args, depth),
+        // Literals, indexes and ranges are evaluated from Task 3 of the vectors work.
+        Expr::Matrix { .. } | Expr::Index(..) | Expr::Range { .. } => Err(CalcError::Syntax("not supported yet".to_string())),
     }
 }
 

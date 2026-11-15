@@ -3,16 +3,28 @@
 //! Grammar, loosest binding first:
 //!
 //! ```text
-//! statement := name [ "(" params ")" ] ":=" expr [ show ]      define (and optionally show)
+//! statement := head ":=" body [ show ]                          define (and optionally show)
 //!            | expr show                                       evaluate and show
+//! head      := name | name "(" params ")" | name"[" name "]"   variable, function, indexed
+//! body      := range | expr
+//! range     := end [ "," end ] ".." end                       first, second..last
+//! end       := power { adjacency power }                       `0.5 in`, but not `2·0`
 //! show      := "=" [ "?" ] [ unit text ]                       the rest of the text is the unit
 //! expr      := term { ("+" | "-") term }
 //! term      := unary { ("*" | "/" | adjacency) unary }
 //! unary     := "-" unary | power                               so -x^2 is -(x^2)
 //! power     := atom [ "^" unary ]                              right-associative
-//! atom      := number | name | name"(" args ")" | "(" expr ")" | "|" expr "|" | "√" atom
+//! atom      := number | name | name"(" args ")" | name"[" args "]" | "(" expr ")"
+//!            | "[" rows "]" | "|" expr "|" | "√" atom
+//! rows      := items { ";" items }                             every row the same length
+//! items     := expr { "," expr }
 //! postfix   := atom { "²" | "³" | "⁻¹" ... }                   one superscript digit, like `^`
 //! ```
+//!
+//! A `(` or `[` right after a name, with no space, is a call or an index (`f(x)`, `D[2]`); after
+//! a space it starts a factor (`D [2]` is `D` times a one-element literal). A literal with no `;`
+//! is a column (`[1, 2, 3]` is 3 rows × 1). A range (`0..5`, `1, 1.5..3`) can only be the whole
+//! right side of a definition, so its commas are never confused with list or argument commas.
 //!
 //! Adjacency (implicit multiplication) groups exactly like `*`, left to right, so `1/2 x` is
 //! `(1/2) x` and not `1/(2 x)` (the Mathcad convention). A number directly after a number, name
@@ -32,8 +44,8 @@ mod tests;
 const MAX_SOURCE_BYTES: usize = 16 * 1024;
 /// Most tokens accepted.
 const MAX_TOKENS: usize = 10_000;
-/// Deepest nesting of expressions (parentheses, calls, `|…|`, prefix signs and `^` operands)
-/// accepted: one more is `TooComplex`.
+/// Deepest nesting of expressions (parentheses, calls, literals, indexes, `|…|`, prefix signs and
+/// `^` operands) accepted: one more is `TooComplex`.
 const MAX_DEPTH: usize = 64;
 /// Tallest syntax tree (levels, counting the leaves) accepted. A flat sum of `n` terms is `n`
 /// levels tall, so this also bounds how long a sum or product can be.
@@ -61,11 +73,11 @@ pub fn parse(src: &str) -> Result<Stmt, CalcError> {
     let toks = lex(src)?;
     match toks.iter().position(|t| t.kind == Kind::Define) {
         Some(at) => {
-            let (name, params) = define_head(toks.get(..at).unwrap_or_default())?;
+            let (name, index, params) = define_head(toks.get(..at).unwrap_or_default())?;
             let mut p = Parser::new(toks.get(at + 1..).unwrap_or_default());
-            let body = p.root()?.expr;
+            let body = p.body()?.expr;
             let show = p.finish(src)?;
-            Ok(Stmt::Define { name, params, body, show })
+            Ok(Stmt::Define { name, index, params, body, show })
         }
         None => {
             let mut p = Parser::new(&toks);
@@ -80,6 +92,11 @@ pub fn parse(src: &str) -> Result<Stmt, CalcError> {
 
 fn syntax(msg: impl Into<String>) -> CalcError {
     CalcError::Syntax(msg.into())
+}
+
+/// A `..` anywhere but between the ends of a definition's whole right side.
+fn misplaced_range() -> CalcError {
+    syntax("a range like 0..5 can only be the whole right side of a definition")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -98,7 +115,13 @@ enum Kind {
     Bar,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Comma,
+    /// Separates the rows of a literal.
+    Semi,
+    /// `..`, between the ends of a range.
+    DotDot,
     Sqrt,
     /// A superscript exponent such as `²` or `⁻¹`, already decoded.
     Sup(i32),
@@ -121,7 +144,11 @@ impl Kind {
             Kind::Bar => "`|`".into(),
             Kind::LParen => "`(`".into(),
             Kind::RParen => "`)`".into(),
+            Kind::LBracket => "`[`".into(),
+            Kind::RBracket => "`]`".into(),
             Kind::Comma => "`,`".into(),
+            Kind::Semi => "`;`".into(),
+            Kind::DotDot => "`..`".into(),
             Kind::Sqrt => "`√`".into(),
             Kind::Sup(_) => "a superscript".into(),
             Kind::Define => "`:=`".into(),
@@ -201,7 +228,10 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
             '|' => Kind::Bar,
             '(' => Kind::LParen,
             ')' => Kind::RParen,
+            '[' => Kind::LBracket,
+            ']' => Kind::RBracket,
             ',' => Kind::Comma,
+            ';' => Kind::Semi,
             '√' => Kind::Sqrt,
             '≔' => Kind::Define,
             ':' => match chars.next_if(|&(_, n)| n == '=') {
@@ -223,10 +253,19 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
                 toks.push(Tok { kind: Kind::Eq, start, end });
                 return Ok(toks);
             }
+            '.' if chars.peek().is_some_and(|&(_, n)| n == '.') => {
+                chars.next();
+                end += 1;
+                if chars.peek().is_some_and(|&(_, n)| n == '.') {
+                    return Err(syntax("`...` isn't valid; a range is written like 0..5"));
+                }
+                Kind::DotDot
+            }
             c if c.is_ascii_digit() || (c == '.' && chars.peek().is_some_and(|&(_, n)| n.is_ascii_digit())) => {
                 end = lex_number(src, start, &mut chars);
                 let text = src.get(start..end).unwrap_or_default();
-                if chars.peek().is_some_and(|&(_, n)| n == '.') {
+                // A second `.` is an error, unless it starts a range's `..` (`1.5..3`).
+                if chars.peek().is_some_and(|&(_, n)| n == '.') && !starts_range(src, end) {
                     return Err(syntax(format!("`{text}.` isn't a valid number")));
                 }
                 match text.parse::<f64>() {
@@ -249,6 +288,11 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
 
 type Chars<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
 
+/// Whether the source at `at` is a range's `..`.
+fn starts_range(src: &str, at: usize) -> bool {
+    src.get(at..).is_some_and(|rest| rest.starts_with(".."))
+}
+
 /// Consume ASCII digits, advancing `end` past them.
 fn eat_digits(chars: &mut Chars<'_>, end: &mut usize) {
     while let Some((i, d)) = chars.next_if(|&(_, n)| n.is_ascii_digit()) {
@@ -258,11 +302,12 @@ fn eat_digits(chars: &mut Chars<'_>, end: &mut usize) {
 
 /// Consume the rest of a number that starts at `start` (a digit, or a `.` before a digit) and
 /// return its end offset: digits, an optional fraction, an optional exponent. An exponent marker
-/// only counts when digits follow it, so `2eV` is `2` then the name `eV`.
+/// only counts when digits follow it, so `2eV` is `2` then the name `eV`. A number stops before a
+/// range's `..`, so `0..5` is `0`, `..`, `5` and never `0.` and `.5`.
 fn lex_number(src: &str, start: usize, chars: &mut Chars<'_>) -> usize {
     let mut end = start + 1;
     eat_digits(chars, &mut end);
-    if chars.next_if(|&(_, n)| n == '.').is_some() {
+    if !starts_range(src, end) && chars.next_if(|&(_, n)| n == '.').is_some() {
         end += 1;
         eat_digits(chars, &mut end);
     }
@@ -290,17 +335,24 @@ fn lex_number(src: &str, start: usize, chars: &mut Chars<'_>) -> usize {
 // Statement head
 // ---------------------------------------------------------------------------------------------
 
-/// The tokens before `:=` must be `name` or `name(param, ...)`.
-fn define_head(head: &[Tok]) -> Result<(String, Vec<String>), CalcError> {
+/// The tokens before `:=` must be `name`, `name(param, ...)` or `name[i]`: the name, the range
+/// variable of an indexed definition, and the parameters.
+fn define_head(head: &[Tok]) -> Result<(String, Option<String>, Vec<String>), CalcError> {
     let bad = || syntax("`:=` must follow a name, or a function like f(x, y)");
     let mut it = head.iter();
-    let Some(Tok { kind: Kind::Name(name), .. }) = it.next() else {
+    let Some(Tok { kind: Kind::Name(name), end: name_end, .. }) = it.next() else {
         return Err(bad());
     };
     let mut params: Vec<String> = Vec::new();
     match it.next() {
-        None => return Ok((name.clone(), params)),
+        None => return Ok((name.clone(), None, params)),
         Some(Tok { kind: Kind::LParen, .. }) => {}
+        Some(Tok { kind: Kind::LBracket, start, .. }) if start == name_end => {
+            return match (it.next(), it.next(), it.next()) {
+                (Some(Tok { kind: Kind::Name(i), .. }), Some(Tok { kind: Kind::RBracket, .. }), None) => Ok((name.clone(), Some(i.clone()), params)),
+                _ => Err(syntax("an indexed definition takes one range variable, like t[i] := 2·D[i]")),
+            };
+        }
         Some(_) => return Err(bad()),
     }
     loop {
@@ -320,7 +372,7 @@ fn define_head(head: &[Tok]) -> Result<(String, Vec<String>), CalcError> {
         }
     }
     match it.next() {
-        None => Ok((name.clone(), params)),
+        None => Ok((name.clone(), None, params)),
         Some(_) => Err(bad()),
     }
 }
@@ -354,11 +406,14 @@ struct Parser<'a> {
     depth: usize,
     /// Whether a `|` ends the current absolute value instead of starting a new factor.
     bar_closes: bool,
+    /// Whether a `..` ends the current expression, as it ends a range's first or second value;
+    /// anywhere else it is an error.
+    in_range_end: bool,
 }
 
 impl<'a> Parser<'a> {
     fn new(toks: &'a [Tok]) -> Self {
-        Parser { toks, pos: 0, depth: 0, bar_closes: false }
+        Parser { toks, pos: 0, depth: 0, bar_closes: false, in_range_end: false }
     }
 
     fn peek(&self) -> Option<&'a Tok> {
@@ -403,6 +458,82 @@ impl<'a> Parser<'a> {
         self.expr_inner(0)
     }
 
+    /// Parse the right side of a definition: a range, or else an ordinary expression (which
+    /// refuses any `..`).
+    fn body(&mut self) -> Result<Node, CalcError> {
+        let start = self.pos;
+        match self.range_start() {
+            Ok(Some((first, second))) => self.range_rhs(first, second),
+            // Over a limit: parsing again would only be over it again.
+            Err(e) if !matches!(e, CalcError::Syntax(_)) => Err(e),
+            Ok(None) | Err(_) => {
+                self.pos = start;
+                self.root()
+            }
+        }
+    }
+
+    /// The start of a range, `first..` or `first, second..`, with its `..` consumed; `None` when
+    /// the right side doesn't start like one.
+    fn range_start(&mut self) -> Result<Option<(Node, Option<Node>)>, CalcError> {
+        let first = self.range_end()?;
+        let second = if self.peek_kind() == Some(&Kind::Comma) {
+            self.pos += 1;
+            Some(self.range_end()?)
+        } else {
+            None
+        };
+        if self.peek_kind() != Some(&Kind::DotDot) {
+            return Ok(None);
+        }
+        self.pos += 1;
+        Ok(Some((first, second)))
+    }
+
+    /// The rest of a range after its `..`: the last value, then the end of the statement or its
+    /// `=`, since a range is the whole right side.
+    fn range_rhs(&mut self, first: Node, second: Option<Node>) -> Result<Node, CalcError> {
+        let last = self.range_end()?;
+        if !matches!(self.peek_kind(), None | Some(Kind::Eq)) {
+            return Err(misplaced_range());
+        }
+        let height = first.height.max(last.height).max(second.as_ref().map_or(0, |s| s.height));
+        let range = Expr::Range { first: Box::new(first.expr), second: second.map(|s| Box::new(s.expr)), last: Box::new(last.expr) };
+        Node::over(height, range)
+    }
+
+    /// One end of a range: factors multiplied by adjacency only (`-2`, `0.5 in`, `2^n`,
+    /// `(n - 1)`), so an explicit operator beside the `..` (`2·0..5`) leaves it out of the range.
+    fn range_end(&mut self) -> Result<Node, CalcError> {
+        let outer = std::mem::replace(&mut self.in_range_end, true);
+        let r = self.range_factors();
+        self.in_range_end = outer;
+        r
+    }
+
+    /// The factors of a range end. Like the whole expression of a statement, they aren't counted
+    /// as nesting.
+    fn range_factors(&mut self) -> Result<Node, CalcError> {
+        let mut lhs = self.expr_inner(MUL_BP.1)?;
+        while self.starts_factor() {
+            self.check_adjacent()?;
+            let rhs = self.expr_inner(MUL_BP.1)?;
+            lhs = Node::over(lhs.height.max(rhs.height), Expr::Binary(Op::Mul, Box::new(lhs.expr), Box::new(rhs.expr)))?;
+        }
+        Ok(lhs)
+    }
+
+    /// Run `f` inside a bracket, where a `|` ends an absolute value only when `bar_closes` and a
+    /// `..` never ends a range's value.
+    fn bracketed<T>(&mut self, bar_closes: bool, f: impl FnOnce(&mut Self) -> Result<T, CalcError>) -> Result<T, CalcError> {
+        let outer_bar = std::mem::replace(&mut self.bar_closes, bar_closes);
+        let outer_range = std::mem::replace(&mut self.in_range_end, false);
+        let r = f(self);
+        self.bar_closes = outer_bar;
+        self.in_range_end = outer_range;
+        r
+    }
+
     /// Parse an expression whose operators all bind at least as tightly as `min_bp`.
     fn expr(&mut self, min_bp: u8) -> Result<Node, CalcError> {
         self.depth += 1;
@@ -432,17 +563,16 @@ impl<'a> Parser<'a> {
                 Some(Kind::Star) => (Op::Mul, MUL_BP, false),
                 Some(Kind::Slash) => (Op::Div, MUL_BP, false),
                 Some(Kind::Caret) => (Op::Pow, POW_BP, false),
-                Some(Kind::Num(_) | Kind::Name(_) | Kind::LParen | Kind::Sqrt) => (Op::Mul, MUL_BP, true),
-                Some(Kind::Bar) if !self.bar_closes => (Op::Mul, MUL_BP, true),
+                Some(Kind::DotDot) if !self.in_range_end => return Err(misplaced_range()),
+                _ if self.starts_factor() => (Op::Mul, MUL_BP, true),
                 _ => break,
             };
             if left_bp < min_bp {
                 break;
             }
-            if implicit && self.peek_kind().is_some_and(|k| matches!(k, Kind::Num(_))) && self.after_value() {
-                return Err(syntax("two values in a row \u{2014} did you mean `*`?"));
-            }
-            if !implicit {
+            if implicit {
+                self.check_adjacent()?;
+            } else {
                 self.pos += 1;
             }
             let rhs = self.expr(right_bp)?;
@@ -451,11 +581,36 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
+    /// The token just consumed.
+    fn prev(&self) -> Option<&'a Tok> {
+        self.pos.checked_sub(1).and_then(|i| self.toks.get(i))
+    }
+
     /// Whether the token just consumed ends a value: a number, name, closing bracket or bar, or a
     /// superscript.
     fn after_value(&self) -> bool {
-        let prev = self.pos.checked_sub(1).and_then(|i| self.toks.get(i));
-        prev.is_some_and(|t| matches!(t.kind, Kind::Num(_) | Kind::Name(_) | Kind::RParen | Kind::Bar | Kind::Sup(_)))
+        self.prev().is_some_and(|t| matches!(t.kind, Kind::Num(_) | Kind::Name(_) | Kind::RParen | Kind::RBracket | Kind::Bar | Kind::Sup(_)))
+    }
+
+    /// Whether the next token starts a factor, which after a value is an implied product.
+    fn starts_factor(&self) -> bool {
+        match self.peek_kind() {
+            Some(Kind::Num(_) | Kind::Name(_) | Kind::LParen | Kind::LBracket | Kind::Sqrt) => true,
+            Some(Kind::Bar) => !self.bar_closes,
+            _ => false,
+        }
+    }
+
+    /// Before the next factor of an implied product: a number straight after a value is refused,
+    /// and so is a `[` touching anything but a name (a name took it as an index already).
+    fn check_adjacent(&self) -> Result<(), CalcError> {
+        match self.peek() {
+            Some(Tok { kind: Kind::Num(_), .. }) if self.after_value() => Err(syntax("two values in a row \u{2014} did you mean `*`?")),
+            Some(Tok { kind: Kind::LBracket, start, .. }) if self.prev().is_some_and(|p| p.end == *start) => {
+                Err(syntax("only a name can be indexed, like D[2]"))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn prefix(&mut self) -> Result<Node, CalcError> {
@@ -465,28 +620,28 @@ impl<'a> Parser<'a> {
         match &tok.kind {
             Kind::Num(v) => Ok(Node::leaf(Expr::Num(*v))),
             Kind::Name(n) => {
-                // `f(` with no space is a call; `f (` is `f` times a parenthesised factor.
+                // `f(` with no space is a call and `D[` an index; `f (` is `f` times a
+                // parenthesised factor and `D [` is `D` times a literal.
                 match self.peek() {
                     Some(next) if next.kind == Kind::LParen && next.start == tok.end => {
                         self.pos += 1;
                         self.call(n.clone())
                     }
+                    Some(next) if next.kind == Kind::LBracket && next.start == tok.end => {
+                        self.pos += 1;
+                        self.index(n.clone())
+                    }
                     _ => Ok(Node::leaf(Expr::Name(n.clone()))),
                 }
             }
             Kind::LParen => {
-                let outer = std::mem::replace(&mut self.bar_closes, false);
-                let inner = self.expr(0);
-                self.bar_closes = outer;
-                let inner = inner?;
+                let inner = self.bracketed(false, |p| p.expr(0))?;
                 self.expect(&Kind::RParen)?;
                 Ok(inner)
             }
+            Kind::LBracket => self.bracketed(false, Self::literal),
             Kind::Bar => {
-                let outer = std::mem::replace(&mut self.bar_closes, true);
-                let inner = self.expr(0);
-                self.bar_closes = outer;
-                let inner = inner?;
+                let inner = self.bracketed(true, |p| p.expr(0))?;
                 self.expect(&Kind::Bar)?;
                 Node::over(inner.height, Expr::Abs(Box::new(inner.expr)))
             }
@@ -505,30 +660,79 @@ impl<'a> Parser<'a> {
 
     /// The arguments of a call, after its `(`.
     fn call(&mut self, name: String) -> Result<Node, CalcError> {
-        let outer = std::mem::replace(&mut self.bar_closes, false);
-        let args = self.args();
-        self.bar_closes = outer;
-        let (args, height) = args?;
+        let (args, height) = self.bracketed(false, |p| p.list(&Kind::RParen))?;
         Node::over(height, Expr::Call(name, args))
     }
 
-    fn args(&mut self) -> Result<(Vec<Expr>, usize), CalcError> {
-        let mut args = Vec::new();
+    /// The indexes of `name[…]`, after its `[`: one, or a row and a column.
+    fn index(&mut self, name: String) -> Result<Node, CalcError> {
+        let (at, height) = self.bracketed(false, |p| p.list(&Kind::RBracket))?;
+        if !(1..=2).contains(&at.len()) {
+            return Err(syntax("an index is one number, or a row and a column, like D[2] or M[1, 0]"));
+        }
+        Node::over(height, Expr::Index(name, at))
+    }
+
+    /// Expressions separated by commas up to `close`, which is consumed, and their tallest height.
+    fn list(&mut self, close: &Kind) -> Result<(Vec<Expr>, usize), CalcError> {
+        let mut items = Vec::new();
         let mut height = 0;
-        if self.peek_kind() == Some(&Kind::RParen) {
+        if self.peek_kind() == Some(close) {
             self.pos += 1;
-            return Ok((args, height));
+            return Ok((items, height));
         }
         loop {
-            let arg = self.expr(0)?;
-            height = height.max(arg.height);
-            args.push(arg.expr);
+            let item = self.expr(0)?;
+            height = height.max(item.height);
+            items.push(item.expr);
             match self.bump() {
                 Some(Tok { kind: Kind::Comma, .. }) => {}
-                Some(Tok { kind: Kind::RParen, .. }) => return Ok((args, height)),
-                Some(t) => return Err(syntax(format!("expected `,` or `)` but found {}", t.kind.describe()))),
-                None => return Err(syntax("expected `)`")),
+                Some(t) if t.kind == *close => return Ok((items, height)),
+                Some(t) => return Err(syntax(format!("expected `,` or {} but found {}", close.describe(), t.kind.describe()))),
+                None => return Err(syntax(format!("expected {}", close.describe()))),
             }
         }
+    }
+
+    /// A vector or matrix literal, after its `[`: elements separated by `,`, rows by `;`, every
+    /// row as long as the first. A single row is a column vector.
+    fn literal(&mut self) -> Result<Node, CalcError> {
+        if self.peek_kind() == Some(&Kind::RBracket) {
+            return Err(syntax("a matrix needs at least one element, like [1, 2]"));
+        }
+        let mut items = Vec::new();
+        let mut height = 0;
+        let mut rows = 0;
+        let mut cols = 0;
+        let mut in_row = 0;
+        loop {
+            let item = self.expr(0)?;
+            if matches!(item.expr, Expr::Matrix { .. }) {
+                return Err(syntax("a matrix element can't be another matrix; use `;` to start a new row"));
+            }
+            height = height.max(item.height);
+            items.push(item.expr);
+            in_row += 1;
+            let closes = match self.bump() {
+                Some(Tok { kind: Kind::Comma, .. }) => continue,
+                Some(Tok { kind: Kind::Semi, .. }) => false,
+                Some(Tok { kind: Kind::RBracket, .. }) => true,
+                Some(t) => return Err(syntax(format!("expected `,`, `;` or `]` but found {}", t.kind.describe()))),
+                None => return Err(syntax("expected `]`")),
+            };
+            rows += 1;
+            if rows == 1 {
+                cols = in_row;
+            } else if in_row != cols {
+                let noun = if in_row == 1 { "element" } else { "elements" };
+                return Err(syntax(format!("row {rows} has {in_row} {noun}; row 1 has {cols}")));
+            }
+            in_row = 0;
+            if closes {
+                break;
+            }
+        }
+        let (rows, cols) = if rows == 1 { (cols, 1) } else { (rows, cols) };
+        Node::over(height, Expr::Matrix { rows, cols, items })
     }
 }

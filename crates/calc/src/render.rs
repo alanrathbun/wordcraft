@@ -332,6 +332,18 @@ impl Out {
         }
     }
 
+    /// A name that a subscript index follows: in invisible brackets when it has a subscript of
+    /// its own (`〖D_o〗_i`), so the index lowers the whole name instead of extending its subscript.
+    fn index_base(&mut self, name: &str) {
+        if name.contains('_') {
+            self.text(INVISIBLE_OPEN);
+            self.name(name);
+            self.text(INVISIBLE_CLOSE);
+        } else {
+            self.name(name);
+        }
+    }
+
     /// A name with its subscripts: `σ_allow` is σ with subscript allow; each further `_`
     /// lowers the rest again, in parentheses (`a_(b_(c))`) so all of it is lowered.
     ///
@@ -374,8 +386,22 @@ enum Step<'a> {
 
 fn write_stmt(stmt: &Stmt, out: &mut Out) {
     match stmt {
-        Stmt::Define { name, params, body, .. } => {
-            out.name(name);
+        Stmt::Define { name, index, params, body, .. } => {
+            match index {
+                // `t[i] :=` shows as t with subscript i, like an index in an expression.
+                Some(i) => {
+                    out.index_base(name);
+                    if i.contains('_') {
+                        out.text("_(");
+                        out.name(i);
+                        out.text(")");
+                    } else {
+                        out.text("_");
+                        out.name(i);
+                    }
+                }
+                None => out.name(name),
+            }
             if !params.is_empty() {
                 out.text("(");
                 for (i, p) in params.iter().enumerate() {
@@ -393,15 +419,17 @@ fn write_stmt(stmt: &Stmt, out: &mut Out) {
     }
 }
 
-/// Binding strength: sums 1, products 2, negation 3, powers 4, atoms 5.
+/// Binding strength: ranges 0, sums 1, products 2, negation 3, powers 4, atoms 5 (literals and
+/// indexes among them).
 fn prec(e: &Expr) -> u8 {
     match e {
+        Expr::Range { .. } => 0,
         Expr::Binary(Op::Add | Op::Sub, ..) => 1,
         Expr::Binary(Op::Mul | Op::Div, ..) | Expr::Quantity(..) => 2,
         Expr::Unary(..) => 3,
         Expr::Binary(Op::Pow, ..) => 4,
         Expr::Binary(Op::Neg, ..) => 1,
-        Expr::Num(_) | Expr::Name(_) | Expr::Call(..) | Expr::Abs(_) => 5,
+        Expr::Num(_) | Expr::Name(_) | Expr::Call(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Index(..) => 5,
     }
 }
 
@@ -461,6 +489,21 @@ fn exponent_simple(e: &Expr) -> bool {
 /// fraction drops, so its whole application is the operand).
 fn fraction_simple(e: &Expr) -> bool {
     plain_num(e) || matches!(e, Expr::Name(_) | Expr::Abs(_))
+}
+
+/// Needs no parentheses as a subscript index: a plain number or a name without a subscript.
+fn index_simple(e: &Expr) -> bool {
+    match e {
+        Expr::Num(v) => !exponential(*v) && *v >= 0.0,
+        Expr::Name(n) => !n.contains('_') && !is_unit(n),
+        _ => false,
+    }
+}
+
+/// Needs parentheses as an end of a range: a sum (`0..(n-1)`) or a quotient, whose operand
+/// UnicodeMath could take to run on into the `..`.
+fn range_end_parens(e: &Expr) -> bool {
+    prec(e) < 2 || matches!(e, Expr::Binary(Op::Div, ..))
 }
 
 /// Push `e`, in parentheses when `parens`.
@@ -536,6 +579,7 @@ fn write_expr(root: &Expr, out: &mut Out) {
                     out.name(name);
                 }
             }
+            Expr::Matrix { .. } | Expr::Index(..) | Expr::Range { .. } => push_array_syntax(e, &mut todo, out),
             Expr::Binary(op, a, b) => match op {
                 Op::Add | Op::Sub | Op::Neg => {
                     wrap(&mut todo, b, prec(b) <= 1 || matches!(&**b, Expr::Unary(..)));
@@ -571,6 +615,52 @@ fn write_expr(root: &Expr, out: &mut Out) {
                     }
                 }
             },
+        }
+    }
+}
+
+/// Push the steps of a literal, an index or a range (`e` is one of them). The name of an index
+/// is written at once, before the steps.
+fn push_array_syntax<'a>(e: &'a Expr, todo: &mut Vec<Step<'a>>, out: &mut Out) {
+    match e {
+        // A literal is a Word matrix in brackets: `&` between columns, `@` between rows.
+        Expr::Matrix { cols, items, .. } => {
+            todo.push(Step::Text(")]"));
+            push_separated(todo, items, |k| if k.checked_rem(*cols) == Some(0) { "@" } else { "&" });
+            todo.push(Step::Text("[■("));
+        }
+        // An index is a subscript: `D_2`, `M_(i,j)`, `〖D_o〗_i`.
+        Expr::Index(name, at) => {
+            match at.as_slice() {
+                [a] if index_simple(a) => todo.push(Step::Expr(a)),
+                _ => {
+                    todo.push(Step::Text(")"));
+                    push_separated(todo, at, |_| ",");
+                    todo.push(Step::Text("("));
+                }
+            }
+            todo.push(Step::Text("_"));
+            out.index_base(name);
+        }
+        Expr::Range { first, second, last } => {
+            wrap(todo, last, range_end_parens(last));
+            todo.push(Step::Text(".."));
+            if let Some(second) = second {
+                wrap(todo, second, range_end_parens(second));
+                todo.push(Step::Text(","));
+            }
+            wrap(todo, first, range_end_parens(first));
+        }
+        _ => {}
+    }
+}
+
+/// Push `items` with `sep(k)` before each item `k` after the first.
+fn push_separated<'a>(todo: &mut Vec<Step<'a>>, items: &'a [Expr], sep: impl Fn(usize) -> &'static str) {
+    for (k, item) in items.iter().enumerate().rev() {
+        todo.push(Step::Expr(item));
+        if k > 0 {
+            todo.push(Step::Text(sep(k)));
         }
     }
 }
@@ -642,7 +732,8 @@ fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
         match node {
             MNode::Run(r) if r.text.chars().any(|c| sentinel_piece(c, pieces).is_some()) => {
                 let mut buf = String::new();
-                let mut prev: Option<char> = None;
+                // A unit straight after a bracket (`[■(…)] "in"`, `(a+b) "m"`) stands apart from it.
+                let mut prev: Option<char> = matches!(out.last(), Some(MNode::Delim { .. })).then_some(')');
                 for c in r.text.chars() {
                     match sentinel_piece(c, pieces) {
                         Some(piece) => {

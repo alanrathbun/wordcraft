@@ -596,6 +596,57 @@ fn display_renders_from_the_syntax_tree() {
 }
 
 #[test]
+fn vectors_indexes_and_ranges_display_as_matrices_and_subscripts() {
+    let shown = |src: &str| render::display(src, None, &CalcState::Fresh);
+    assert_eq!(shown("D := [0.840, 1.050] in"), "D≔[■(0.84@1.05)] \"in\"");
+    assert_eq!(shown("M := [1, 2; 3, 4]"), "M≔[■(1&2@3&4)]");
+    assert_eq!(shown("x := D[2]"), "x≔D_2");
+    assert_eq!(shown("y := M[i, j]"), "y≔M_(i,j)");
+    assert_eq!(shown("z := D_o[i]"), "z≔〖D_o〗_i");
+    assert_eq!(shown("i := 0..5"), "i≔0..5");
+    assert_eq!(shown("t[i] := D[i]"), "t_i≔D_i");
+    // Elements, indexes and range ends keep their own structure.
+    assert_eq!(shown("v := [2 in, 50 mm]"), "v≔[■(2 \"in\"@50 \"mm\")]");
+    assert_eq!(shown("v := [a + b, -c]"), "v≔[■(a+b@-c)]");
+    assert_eq!(shown("x := D[i + 1]"), "x≔D_(i+1)");
+    assert_eq!(shown("x := D[i_0]"), "x≔D_(i_0)");
+    assert_eq!(shown("x := D[i]^2"), "x≔(D_i)^2");
+    assert_eq!(shown("x := 2 D[0]"), "x≔2·D_0");
+    assert_eq!(shown("x := 1, 1.5..3"), "x≔1,1.5..3");
+    assert_eq!(shown("x := 0 in, 0.5 in..1 in"), "x≔0 \"in\",0.5 \"in\"..1 \"in\"");
+    assert_eq!(shown("x := -1..(n - 1)"), "x≔-1..(n-1)");
+    assert_eq!(shown("t_o[k] := k"), "〖t_o〗_k≔k");
+    assert_eq!(shown("t[i_0] := 1"), "t_(i_0)≔1");
+}
+
+#[test]
+fn a_literal_is_a_bracketed_matrix_and_an_index_a_subscript_in_the_math() {
+    // The evaluator doesn't take these yet; the math is drawn from the source all the same.
+    let mut d = doc_with(&["D := [0.840, 1.050] in", "z := D_o[i]"]);
+    recalc(&mut d, &no_page);
+    let (_, _, math) = region(&d, 1);
+    let bracket = math
+        .nodes
+        .iter()
+        .position(|n| matches!(n, MNode::Delim { elems, .. } if matches!(elems.as_slice(), [e] if matches!(e.as_slice(), [MNode::Matrix { .. }]))));
+    let bracket = bracket.unwrap_or_else(|| panic!("{:#?}", math.nodes));
+    // The unit after the bracket is upright and set apart from it.
+    match math.nodes.get(bracket + 1) {
+        Some(MNode::Run(r)) => assert!(r.text == "\u{2009}in" && r.sty == Some(MSty::Plain), "{r:?}"),
+        other => panic!("{other:?}"),
+    }
+    // `〖D_o〗_i`: the index lowers the whole subscripted name.
+    let (_, _, math) = region(&d, 2);
+    let script = math.nodes.iter().find_map(|n| match n {
+        MNode::Script { base, sub, .. } => Some((base, sub)),
+        _ => None,
+    });
+    let Some((base, sub)) = script else { panic!("{:#?}", math.nodes) };
+    assert!(matches!(base.as_slice(), [MNode::Script { .. }]), "{base:#?}");
+    assert!(matches!(sub.as_slice(), [MNode::Run(r)] if r.text == "i"), "{sub:#?}");
+}
+
+#[test]
 fn a_subscripted_function_keeps_its_arguments_out_of_the_subscript() {
     let mut d = doc_with(&["f_a(t) := t^2"]);
     recalc(&mut d, &no_page);

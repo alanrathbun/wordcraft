@@ -17,6 +17,15 @@ fn neg(a: Expr) -> Expr {
 fn call(n: &str, args: Vec<Expr>) -> Expr {
     Expr::Call(n.into(), args)
 }
+fn matrix(rows: usize, cols: usize, items: Vec<Expr>) -> Expr {
+    Expr::Matrix { rows, cols, items }
+}
+fn index(n: &str, at: Vec<Expr>) -> Expr {
+    Expr::Index(n.into(), at)
+}
+fn range(first: Expr, second: Option<Expr>, last: Expr) -> Expr {
+    Expr::Range { first: Box::new(first), second: second.map(Box::new), last: Box::new(last) }
+}
 fn show(unit: Option<&str>) -> Show {
     Show { unit: unit.map(str::to_string) }
 }
@@ -27,6 +36,20 @@ fn expr_of(src: &str) -> Expr {
         other => panic!("{src:?} did not parse as an Eval: {other:?}"),
     }
 }
+/// The body of a definition with no `=`.
+fn body_of(src: &str) -> Expr {
+    match parse(src) {
+        Ok(Stmt::Define { body, show: None, .. }) => body,
+        other => panic!("{src:?} did not parse as a definition: {other:?}"),
+    }
+}
+/// The message of a syntax error.
+fn syntax_msg(src: &str) -> String {
+    match parse(src) {
+        Err(CalcError::Syntax(m)) => m,
+        other => panic!("{src:?} should be a syntax error, got {other:?}"),
+    }
+}
 fn syntax(src: &str) {
     assert!(matches!(parse(src), Err(CalcError::Syntax(_))), "{src:?} should be a syntax error, got {:?}", parse(src));
 }
@@ -35,7 +58,7 @@ fn syntax(src: &str) {
 fn define_with_units() {
     assert_eq!(
         parse("P := 1500 lbf"),
-        Ok(Stmt::Define { name: "P".into(), params: vec![], body: bin(Op::Mul, num(1500.0), name("lbf")), show: None })
+        Ok(Stmt::Define { name: "P".into(), index: None, params: vec![], body: bin(Op::Mul, num(1500.0), name("lbf")), show: None })
     );
 }
 
@@ -43,13 +66,14 @@ fn define_with_units() {
 fn define_and_show() {
     assert_eq!(
         parse("σ := P/A_b ="),
-        Ok(Stmt::Define { name: "σ".into(), params: vec![], body: bin(Op::Div, name("P"), name("A_b")), show: Some(show(None)) })
+        Ok(Stmt::Define { name: "σ".into(), index: None, params: vec![], body: bin(Op::Div, name("P"), name("A_b")), show: Some(show(None)) })
     );
 }
 
 #[test]
 fn define_and_show_with_unit() {
-    let want = Stmt::Define { name: "σ".into(), params: vec![], body: bin(Op::Div, name("P"), name("A_b")), show: Some(show(Some("ksi"))) };
+    let want =
+        Stmt::Define { name: "σ".into(), index: None, params: vec![], body: bin(Op::Div, name("P"), name("A_b")), show: Some(show(Some("ksi"))) };
     assert_eq!(parse("σ := P/A_b = ? ksi"), Ok(want.clone()));
     assert_eq!(parse("σ ≔ P/A_b = ksi"), Ok(want));
 }
@@ -77,6 +101,7 @@ fn function_def() {
         parse("f(x, y) := x^2 + y"),
         Ok(Stmt::Define {
             name: "f".into(),
+            index: None,
             params: vec!["x".into(), "y".into()],
             body: bin(Op::Add, bin(Op::Pow, name("x"), num(2.0)), name("y")),
             show: None
@@ -88,7 +113,7 @@ fn function_def() {
 fn subscripted_greek() {
     assert_eq!(
         parse("σ_allow := 20 ksi"),
-        Ok(Stmt::Define { name: "σ_allow".into(), params: vec![], body: bin(Op::Mul, num(20.0), name("ksi")), show: None })
+        Ok(Stmt::Define { name: "σ_allow".into(), index: None, params: vec![], body: bin(Op::Mul, num(20.0), name("ksi")), show: None })
     );
     assert_eq!(expr_of("P_1 + A_b"), bin(Op::Add, name("P_1"), name("A_b")));
 }
@@ -373,7 +398,7 @@ fn definition_heads() {
     assert_eq!(defined_name(&parse("g(a) := a").unwrap()), Some("g"));
     // Whitespace and the ≔ spelling are fine; a define with show keeps both.
     let s = parse("  g ( a )≔a  =  ").unwrap();
-    assert_eq!(s, Stmt::Define { name: "g".into(), params: vec!["a".into()], body: name("a"), show: Some(show(None)) });
+    assert_eq!(s, Stmt::Define { name: "g".into(), index: None, params: vec!["a".into()], body: name("a"), show: Some(show(None)) });
     syntax("f() := 1");
     syntax("f(1) := 1");
     syntax("f(x, x) := 1");
@@ -417,10 +442,151 @@ fn quantity_variant_is_never_produced() {
             Expr::Num(_) | Expr::Name(_) => false,
             Expr::Unary(_, a) | Expr::Abs(a) => has_quantity(a),
             Expr::Binary(_, a, b) => has_quantity(a) || has_quantity(b),
-            Expr::Call(_, args) => args.iter().any(has_quantity),
+            Expr::Call(_, args) | Expr::Index(_, args) => args.iter().any(has_quantity),
+            Expr::Matrix { items, .. } => items.iter().any(has_quantity),
+            Expr::Range { first, second, last } => has_quantity(first) || second.as_deref().is_some_and(has_quantity) || has_quantity(last),
         }
     }
     assert!(!has_quantity(&expr_of("5 kN·m + 2 ksi")));
+}
+
+#[test]
+fn literals_parse() {
+    // A one-dimensional list is always a column.
+    assert_eq!(expr_of("[1, 2, 3]"), matrix(3, 1, vec![num(1.0), num(2.0), num(3.0)]));
+    assert_eq!(expr_of("[1, 2; 3, 4]"), matrix(2, 2, vec![num(1.0), num(2.0), num(3.0), num(4.0)]));
+    assert_eq!(expr_of("[1; 2]"), matrix(2, 1, vec![num(1.0), num(2.0)]));
+    assert_eq!(expr_of("[7]"), matrix(1, 1, vec![num(7.0)]));
+    assert_eq!(expr_of("[2 in, 50 mm]"), matrix(2, 1, vec![bin(Op::Mul, num(2.0), name("in")), bin(Op::Mul, num(50.0), name("mm"))]));
+    assert_eq!(expr_of("[0.840, 1.050] in"), bin(Op::Mul, matrix(2, 1, vec![num(0.84), num(1.05)]), name("in")));
+    assert_eq!(body_of("D := [0.840, 1.050] in"), expr_of("[0.840, 1.050] in"));
+    // Elements are whole expressions, and `|…|` and calls work inside them.
+    assert_eq!(
+        expr_of("[a + 1, |b|, f(c, d)]"),
+        matrix(3, 1, vec![bin(Op::Add, name("a"), num(1.0)), Expr::Abs(Box::new(name("b"))), call("f", vec![name("c"), name("d")])])
+    );
+    // A literal after a value is a product, like a parenthesis.
+    assert_eq!(expr_of("2 [1, 2]"), bin(Op::Mul, num(2.0), matrix(2, 1, vec![num(1.0), num(2.0)])));
+    assert_eq!(expr_of("[1] [2]"), bin(Op::Mul, matrix(1, 1, vec![num(1.0)]), matrix(1, 1, vec![num(2.0)])));
+    syntax("[1] 2 =");
+}
+
+#[test]
+fn ragged_rows_are_an_error() {
+    assert_eq!(syntax_msg("[1, 2; 3] ="), "row 2 has 1 element; row 1 has 2");
+    assert_eq!(syntax_msg("x := [1; 2, 3]"), "row 2 has 2 elements; row 1 has 1");
+}
+
+#[test]
+fn empty_and_nested_literals_are_errors() {
+    for src in ["[] =", "[[1], 2] =", "[1, [2]] =", "[([1]), 2] =", "[1, 2 =", "[1,, 2] =", "[1, 2;] =", "[; 1] =", "1, 2] ="] {
+        syntax(src);
+    }
+}
+
+#[test]
+fn indexing_needs_no_space() {
+    assert_eq!(expr_of("D[2]"), index("D", vec![num(2.0)]));
+    assert_eq!(expr_of("M[i, j]"), index("M", vec![name("i"), name("j")]));
+    assert_eq!(expr_of("D [2]"), bin(Op::Mul, name("D"), matrix(1, 1, vec![num(2.0)])));
+    assert_eq!(syntax_msg("f(x)[2] ="), "only a name can be indexed, like D[2]");
+    for src in ["(a)[2] =", "D[1][2] =", "x²[1] =", "[1][0] =", "|a|[0] ="] {
+        assert_eq!(syntax_msg(src), "only a name can be indexed, like D[2]", "{src}");
+    }
+    // An index is a whole expression; it binds like a call, tighter than `^`.
+    assert_eq!(expr_of("D_o[i + 1]^2"), bin(Op::Pow, index("D_o", vec![bin(Op::Add, name("i"), num(1.0))]), num(2.0)));
+    assert_eq!(expr_of("2 D[0]"), bin(Op::Mul, num(2.0), index("D", vec![num(0.0)])));
+    assert_eq!(expr_of("[D[0], D[1]]"), matrix(2, 1, vec![index("D", vec![num(0.0)]), index("D", vec![num(1.0)])]));
+    for src in ["D[] =", "M[1, 2, 3] =", "D[1 =", "D[1) ="] {
+        syntax(src);
+    }
+}
+
+#[test]
+fn range_dots_are_not_decimal_points() {
+    assert_eq!(body_of("i := 0..5"), range(num(0.0), None, num(5.0)));
+    assert_eq!(body_of("x := 1.5..3"), range(num(1.5), None, num(3.0)));
+    assert_eq!(body_of("x := 1, 1.5..3"), range(num(1.0), Some(num(1.5)), num(3.0)));
+    assert_eq!(body_of("y := 1.5"), num(1.5));
+    assert_eq!(body_of("x := .5..2."), range(num(0.5), None, num(2.0)));
+    assert_eq!(body_of("x := 1e2..2e2"), range(num(100.0), None, num(200.0)));
+    // The ends are signed values, with units and powers; a range may be shown.
+    assert_eq!(body_of("x := -5 .. -1"), range(neg(num(5.0)), None, neg(num(1.0))));
+    assert_eq!(
+        body_of("x := 0 in, 0.5 in..1 in"),
+        range(bin(Op::Mul, num(0.0), name("in")), Some(bin(Op::Mul, num(0.5), name("in"))), bin(Op::Mul, num(1.0), name("in")))
+    );
+    assert_eq!(body_of("x := 0..2^n"), range(num(0.0), None, bin(Op::Pow, num(2.0), name("n"))));
+    assert_eq!(body_of("x := 0..(n - 1)"), range(num(0.0), None, bin(Op::Sub, name("n"), num(1.0))));
+    assert!(matches!(parse("i := 0..5 ="), Ok(Stmt::Define { show: Some(_), .. })));
+    syntax("x := 1.5.3");
+    syntax("x := 0...5");
+    assert_eq!(syntax_msg("x := 0.."), "the expression ends too soon");
+    assert_eq!(syntax_msg("x := 0...5"), "`...` isn't valid; a range is written like 0..5");
+    syntax("x := ..5");
+    syntax("x := 1, 2");
+    syntax("x := 1, 2, 3..4");
+    syntax("x := 0..1..2");
+    syntax("x := 1 2..3");
+}
+
+#[test]
+fn ranges_are_whole_right_hand_sides() {
+    for src in ["x := (0..5)", "x := 2·0..5", "0..5 =", "f(0..5) =", "x := [0..5]", "x := 0..5 + 1", "x := D[0..1]", "x := |0..1|", "x := 1 + 0..5"]
+    {
+        assert_eq!(syntax_msg(src), "a range like 0..5 can only be the whole right side of a definition", "{src}");
+    }
+}
+
+#[test]
+fn indexed_definition_head() {
+    assert_eq!(
+        parse("t[i] := 2·D[i]"),
+        Ok(Stmt::Define {
+            name: "t".into(),
+            index: Some("i".into()),
+            params: vec![],
+            body: bin(Op::Mul, num(2.0), index("D", vec![name("i")])),
+            show: None
+        })
+    );
+    assert!(matches!(parse("t_o[k] ≔ k ="), Ok(Stmt::Define { index: Some(k), show: Some(_), .. }) if k == "k"));
+    for src in ["t[i](x) := 1", "t(x)[i] := 1", "t[0] := 1", "t[i, j] := 1", "t [i] := 1", "t[] := 1", "t[i := 1", "t[i]] := 1"] {
+        syntax(src);
+    }
+}
+
+#[test]
+fn free_names_see_new_nodes() {
+    let names = free_names(&parse("t[i] := D_o[i]·k + [a, b]").unwrap());
+    let set: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    assert_eq!(set, ["D_o", "i", "k", "a", "b"].into_iter().collect());
+    assert_eq!(names.len(), set.len(), "duplicates in {names:?}");
+    assert_eq!(free_names(&parse("x := a, b..c").unwrap()), ["a", "b", "c"]);
+    assert_eq!(free_names(&parse("M[r, c] =").unwrap()), ["M", "r", "c"]);
+}
+
+#[test]
+fn literal_and_index_limits() {
+    // Literals and indexes nest like parentheses: 64 levels deep, one more is too complex.
+    let ok = |src: String| assert!(parse(&src).is_ok(), "{} should parse", &src[..src.len().min(40)]);
+    let too_complex = |src: String| assert_eq!(parse(&src), Err(CalcError::TooComplex), "{}", &src[..src.len().min(40)]);
+    let indexes = |k: usize| format!("x := {}1{}", "D[".repeat(k), "]".repeat(k));
+    ok(indexes(64));
+    too_complex(indexes(65));
+    let literals = |k: usize| format!("x := {}1{}", "[f(".repeat(k / 2), ")]".repeat(k / 2));
+    ok(literals(64));
+    too_complex(literals(66));
+    // Their height counts towards the same limit, one level for the literal itself.
+    assert!(parse(&format!("x := [1+1]+{}1", "1+".repeat(1021))) == Err(CalcError::TooComplex));
+    assert!(parse(&format!("x := [1+1]+{}1", "1+".repeat(1020))).is_ok());
+    assert!(parse(&format!("x := D[1+1]+{}1", "1+".repeat(1021))) == Err(CalcError::TooComplex));
+    assert!(parse(&format!("x := D[1+1]+{}1", "1+".repeat(1020))).is_ok());
+    // A long literal is bounded by the token limit.
+    assert_eq!(parse(&format!("x := [{}1]", "1,".repeat(6_000))), Err(CalcError::TooComplex));
+    // A range end nests to the same depth as any other right side.
+    ok(format!("x := 0..{}1", "-".repeat(64)));
+    too_complex(format!("x := 0..{}1", "-".repeat(65)));
 }
 
 proptest! {
@@ -432,11 +598,12 @@ proptest! {
     }
 
     #[test]
-    fn operator_soup_never_panics(src in "[a-zA-Z0-9_ ().,|:=?√·×*/^+\\-≔°Δµσ]{0,300}") {
+    fn operator_soup_never_panics(src in "[a-zA-Z0-9_ ().,;|:=?√·×*/^+\\-≔°Δµσ\\[\\]]{0,300}") {
         if let Ok(s) = parse(&src) {
             let _ = free_names(&s);
             let _ = defined_name(&s);
         }
+        let _ = crate::render::display(&src, None, &wordcraft_doc::calc::CalcState::Fresh);
     }
 }
 

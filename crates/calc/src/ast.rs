@@ -7,10 +7,14 @@ use serde::{Deserialize, Serialize};
 /// One calculation statement.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Stmt {
-    /// `name := body` or `name(params) := body`, optionally followed by `=` to show the value.
+    /// `name := body`, `name(params) := body` or `name[i] := body`, optionally followed by `=` to
+    /// show the value.
     Define {
         /// The defined name.
         name: String,
+        /// The range variable of an indexed definition `name[i] := body`, which defines every
+        /// element of `name` at once; `None` otherwise.
+        index: Option<String>,
         /// Parameter names; empty for a plain variable.
         params: Vec<String>,
         /// The defining expression.
@@ -54,6 +58,28 @@ pub enum Expr {
     Call(String, Vec<Expr>),
     /// Absolute value, `|x|`.
     Abs(Box<Expr>),
+    /// A vector or matrix literal, `[1, 2; 3, 4]`: `rows × cols` items, row-major. A list with no
+    /// `;` (`[1, 2, 3]`) is a column.
+    Matrix {
+        /// Number of rows.
+        rows: usize,
+        /// Number of columns.
+        cols: usize,
+        /// The elements, row by row.
+        items: Vec<Expr>,
+    },
+    /// An element of a named vector or matrix: `D[2]` (one index) or `M[i, j]` (two).
+    Index(String, Vec<Expr>),
+    /// A range, `first..last` or `first, second..last` (the second value sets the step). The
+    /// parser only produces one as the whole right side of a definition.
+    Range {
+        /// The first value.
+        first: Box<Expr>,
+        /// The second value, when it is given.
+        second: Option<Box<Expr>>,
+        /// The last value.
+        last: Box<Expr>,
+    },
 }
 
 /// An operator.
@@ -81,16 +107,22 @@ pub fn defined_name(s: &Stmt) -> Option<&str> {
     }
 }
 
-/// The names a statement uses (variables, units, constants and called functions), minus a
-/// function's own parameters, without duplicates, in order of first use.
+/// The names a statement uses (variables, units, constants, called functions and indexed
+/// vectors), minus a function's own parameters, without duplicates, in order of first use. The
+/// range variable of an indexed definition (`i` in `t[i] := …`) is used, so it comes first.
 pub fn free_names(s: &Stmt) -> Vec<String> {
-    let (body, params): (&Expr, &[String]) = match s {
-        Stmt::Define { params, body, .. } => (body, params),
-        Stmt::Eval { expr, .. } => (expr, &[]),
+    let (body, params, index): (&Expr, &[String], Option<&String>) = match s {
+        Stmt::Define { params, body, index, .. } => (body, params, index.as_ref()),
+        Stmt::Eval { expr, .. } => (expr, &[], None),
     };
     let mut out: Vec<String> = Vec::new();
     // Names already in `out` (or parameters): one lookup each, so a long body costs linear time.
     let mut seen: HashSet<&str> = params.iter().map(String::as_str).collect();
+    if let Some(i) = index
+        && seen.insert(i)
+    {
+        out.push(i.clone());
+    }
     // An explicit stack keeps this safe on trees built by hand, deeper than the parser allows.
     let mut stack: Vec<&Expr> = vec![body];
     while let Some(e) = stack.pop() {
@@ -106,9 +138,21 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
                 stack.push(a);
                 continue;
             }
-            Expr::Call(n, args) => {
+            Expr::Call(n, args) | Expr::Index(n, args) => {
                 stack.extend(args.iter().rev());
                 n
+            }
+            Expr::Matrix { items, .. } => {
+                stack.extend(items.iter().rev());
+                continue;
+            }
+            Expr::Range { first, second, last } => {
+                stack.push(last);
+                if let Some(second) = second {
+                    stack.push(second);
+                }
+                stack.push(first);
+                continue;
             }
         };
         if seen.insert(name) {
