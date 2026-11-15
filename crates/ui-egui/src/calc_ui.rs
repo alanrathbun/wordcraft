@@ -200,17 +200,26 @@ fn calc_at_caret(app: &WordApp) -> Option<(Pos, CalcRegion)> {
     std::iter::once(focus.clone()).chain(before).find_map(|at| region_at(&app.session.doc, &at).map(|c| (at.clone(), c.clone())))
 }
 
-/// What the right-click menu adds when the caret is at a calculation: editing its source, its
-/// equation number (numbering a calculation works like numbering a plain equation) and
+/// What the right-click menu adds when the caret is at a calculation: editing its source, inline
+/// or display (inline lets text follow it on the line, e.g. a tab and a note), the alignment of a
+/// display calculation, its equation number (numbering works like numbering a plain equation) and
 /// recalculating. Empty anywhere else.
 pub fn menu_items(app: &WordApp) -> Vec<(&'static str, &'static str, Value)> {
-    let Some((_, c)) = calc_at_caret(app) else { return Vec::new() };
+    let Some((at, c)) = calc_at_caret(app) else { return Vec::new() };
+    let display = matches!(app.session.doc.para_at(&at).and_then(|p| p.object_at(at.off)), Some(InlineObject::Equation { display: true, .. }));
+    let mut items = vec![("Edit Calculation", "calc.edit", json!({}))];
+    if display {
+        items.push(("Change to Inline", "equation.display", json!({"value": false})));
+        items.push(("Align Left", "equation.justify", json!({"jc": "left"})));
+        items.push(("Align Center", "equation.justify", json!({"jc": "centerGroup"})));
+        items.push(("Align Right", "equation.justify", json!({"jc": "right"})));
+    } else {
+        items.push(("Change to Display", "equation.display", json!({"value": true})));
+    }
     let number = if c.numbered { "Remove Equation Number" } else { "Add Equation Number" };
-    vec![
-        ("Edit Calculation", "calc.edit", json!({})),
-        (number, "equation.number", json!({"value": !c.numbered})),
-        ("Recalculate", "calc.recalculate", json!({})),
-    ]
+    items.push((number, "equation.number", json!({"value": !c.numbered})));
+    items.push(("Recalculate", "calc.recalculate", json!({})));
+    items
 }
 
 /// Whether the selection is exactly one calculation (its object character, either way round).

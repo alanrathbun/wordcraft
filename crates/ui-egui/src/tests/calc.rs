@@ -481,14 +481,27 @@ fn right_click_menu_numbers_a_calculation() {
     let _ = a.session.run("insert.calculation", &serde_json::json!({"source": "P := 1500 lbf =", "display": true}));
     let (at, _) = regions(&a).remove(0);
     a.session.sel = wordcraft_engine::Selection { anchor: at.clone(), focus: at.clone() };
-    let items = calc_ui::menu_items(&a);
-    let labels: Vec<&str> = items.iter().map(|(l, _, _)| *l).collect();
-    assert_eq!(labels, ["Edit Calculation", "Add Equation Number", "Recalculate"]);
-    let (_, id, params) = items[1].clone();
+    let pick = |a: &WordApp, label: &str| {
+        calc_ui::menu_items(a).into_iter().find(|(l, _, _)| *l == label).unwrap_or_else(|| panic!("no {label} in the menu"))
+    };
+    let labels: Vec<&str> = calc_ui::menu_items(&a).iter().map(|(l, _, _)| *l).collect();
+    assert_eq!(labels, ["Edit Calculation", "Change to Inline", "Align Left", "Align Center", "Align Right", "Add Equation Number", "Recalculate"]);
+    let (_, id, params) = pick(&a, "Add Equation Number");
     a.session.run(id, &params).expect("numbering a calculation from the menu works");
     assert!(regions(&a)[0].1.numbered, "the calculation is numbered");
+    a.session.sel = wordcraft_engine::Selection { anchor: at.clone(), focus: at.clone() };
+    assert!(calc_ui::menu_items(&a).iter().any(|(l, _, _)| *l == "Remove Equation Number"));
+    let (_, id, params) = pick(&a, "Align Left");
+    a.session.run(id, &params).expect("aligning a calculation from the menu works");
+    assert!(
+        matches!(a.session.doc.para_at(&at).and_then(|p| p.object_at(at.off)), Some(InlineObject::Equation { math, .. }) if math.jc == wordcraft_doc::math::MathJc::Left)
+    );
+    a.session.sel = wordcraft_engine::Selection { anchor: at.clone(), focus: at.clone() };
+    let (_, id, params) = pick(&a, "Change to Inline");
+    a.session.run(id, &params).expect("making a calculation inline from the menu works");
     a.session.sel = wordcraft_engine::Selection { anchor: at.clone(), focus: at };
-    assert_eq!(calc_ui::menu_items(&a)[1].0, "Remove Equation Number");
+    let labels: Vec<&str> = calc_ui::menu_items(&a).iter().map(|(l, _, _)| *l).collect();
+    assert_eq!(labels, ["Edit Calculation", "Change to Display", "Add Equation Number", "Recalculate"], "inline: no alignment choices");
     // Away from a calculation the menu adds nothing.
     assert!(calc_ui::menu_items(&app()).is_empty());
 }

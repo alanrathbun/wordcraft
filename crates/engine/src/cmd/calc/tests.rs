@@ -995,3 +995,52 @@ fn a_numbered_calculation_is_cross_referenced_like_a_plain_equation() {
     assert!(listed.iter().any(|t| t.contains("Bolt stress")), "{listed:?}");
     assert!(region(&s, sigma).0.numbered, "the caption leaves the calculation as it was");
 }
+
+/// The display flag and justification of the region `id`'s equation.
+fn layout_of(doc: &Document, id: u64) -> (bool, wordcraft_doc::math::MathJc) {
+    let mut found = None;
+    for o in objects(doc) {
+        if let InlineObject::Equation { display, math, calc: Some(c), .. } = o
+            && c.id == id
+        {
+            found = Some((display, math.jc));
+        }
+    }
+    found.unwrap_or_else(|| panic!("no region {id}"))
+}
+
+#[test]
+fn a_calculation_can_be_aligned_and_made_inline() {
+    use wordcraft_doc::math::MathJc;
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    caret_after(&mut s, sigma);
+    run(&mut s, "equation.justify", json!({"jc": "left"}));
+    assert_eq!(layout_of(&s.doc, sigma), (true, MathJc::Left));
+    // Alignment survives a recalculation and the .docx round trip.
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
+    assert_eq!(layout_of(&s.doc, sigma), (true, MathJc::Left));
+    assert!(region(&s, sigma).1.ends_with("=1200 \"psi\""), "{}", region(&s, sigma).1);
+    let bytes = crate::io::save_bytes("report.docx", &s.doc).unwrap();
+    let back = Session::new(crate::io::open_bytes("report.docx", &bytes).unwrap());
+    assert_eq!(layout_of(&back.doc, sigma), (true, MathJc::Left));
+    assert_eq!(region(&back, sigma).0.state, CalcState::Fresh);
+    caret_after(&mut s, sigma);
+    run(&mut s, "equation.justify", json!({"jc": "right"}));
+    assert_eq!(layout_of(&s.doc, sigma).1, MathJc::Right);
+    // Inline, so text can follow it on the same line; a number needs display, so it goes.
+    run(&mut s, "equation.number", json!({"value": true}));
+    caret_after(&mut s, sigma);
+    run(&mut s, "equation.display", json!({"value": false}));
+    assert!(!layout_of(&s.doc, sigma).0, "inline now");
+    assert!(!region(&s, sigma).0.numbered, "an inline calculation isn't numbered");
+    caret_after(&mut s, sigma);
+    run(&mut s, "text.insert", json!({"text": "\tbearing stress, see ref. 3"}));
+    assert_eq!(region(&s, sigma).0.state, CalcState::Fresh, "text after it leaves it live");
+    caret_after(&mut s, sigma);
+    run(&mut s, "equation.display", json!({"value": true}));
+    assert!(layout_of(&s.doc, sigma).0, "display again");
+    // Undo restores the inline state.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(!layout_of(&s.doc, sigma).0);
+}

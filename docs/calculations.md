@@ -59,6 +59,13 @@ to a force is an error rather than a number.
 - `= ? unit` overrides the unit for one result.
 - To number a calculation, right-click it and choose Add Equation Number (Remove Equation Number
   takes it off). The number stays as the result changes and is saved to Word.
+- A calculation on an empty line is a display equation, on its own line. Right-click it to choose
+  Align Left, Align Center or Align Right.
+- To write notes after a calculation on the same line, right-click it and choose Change to Inline,
+  then type after it (for example a Tab and "bearing stress, see ref. 3"). The line follows the
+  paragraph's alignment and tab stops. A calculation inserted into a line that already has text is
+  inline from the start. An inline calculation can't be numbered; Change to Display puts it back on
+  its own line.
 
 ## Quoted values
 

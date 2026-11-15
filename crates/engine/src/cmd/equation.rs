@@ -707,6 +707,15 @@ fn convert(s: &mut Session, v: &Value) -> CmdResult {
 /// Toggles or sets the equation's inline or display mode.
 fn set_display(s: &mut Session, v: &Value) -> CmdResult {
     let at = equation_at_caret(s).ok_or_else(|| CmdError::Disabled("no equation at the caret".into()))?;
+    if is_calculation(s, &at) {
+        return lay_out_calculation(s, &at, |display, _, numbered| {
+            *display = p::bool(v, "value").unwrap_or(!*display);
+            // A number needs a line of its own, like a numbered plain equation.
+            if !*display {
+                *numbered = false;
+            }
+        });
+    }
     let (_, effect) = with_eq(s, &at, |_, display| *display = p::bool(v, "value").unwrap_or(!*display))?;
     apply_effect(s, effect, false);
     result(s)
@@ -722,6 +731,12 @@ fn justify(s: &mut Session, v: &Value) -> CmdResult {
         "center" => MathJc::Center,
         _ => MathJc::CenterGroup,
     };
+    if is_calculation(s, &at) {
+        return lay_out_calculation(s, &at, |display, j, _| {
+            *j = jc;
+            *display = true;
+        });
+    }
     let (_, effect) = with_eq(s, &at, |math, display| {
         math.jc = jc;
         *display = true;
@@ -767,6 +782,24 @@ fn number(s: &mut Session, v: &Value) -> CmdResult {
 /// Numbers a calculation (or takes its number away): its display is drawn from its source, so
 /// the region keeps the choice and the recalculation pass that follows draws the number, as `#`
 /// draws one on a plain equation. A numbered calculation is a display equation.
+/// Change how a calculation sits on the page (display or inline, justification, numbering)
+/// without touching its source or drawn result: recalculation keeps all three.
+fn lay_out_calculation(s: &mut Session, at: &Pos, change: impl FnOnce(&mut bool, &mut MathJc, &mut bool)) -> CmdResult {
+    let para = s.doc.para_mut(at.story, &at.path)?;
+    let Some(InlineObject::Equation { display, math, calc: Some(c), .. }) = para.object_at_mut(at.off) else {
+        return Err(CmdError::Failed("no calculation there".into()));
+    };
+    let before = (*display, math.jc, c.numbered);
+    change(display, &mut math.jc, &mut c.numbered);
+    if (*display, math.jc, c.numbered) == before {
+        classified_noop(s);
+        return result(s);
+    }
+    para.touch();
+    apply_effect(s, EquationEffect { content_changed: true, state_changed: true }, false);
+    result(s)
+}
+
 fn number_calculation(s: &mut Session, at: &Pos, v: &Value) -> CmdResult {
     let para = s.doc.para_mut(at.story, &at.path)?;
     let Some(InlineObject::Equation { display, calc: Some(c), .. }) = para.object_at_mut(at.off) else {
