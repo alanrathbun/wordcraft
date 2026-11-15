@@ -1,0 +1,350 @@
+use serde_json::{Value, json};
+use wordcraft_doc::calc::{CalcRegion, CalcState};
+use wordcraft_doc::math::Math;
+use wordcraft_doc::{Block, Document, InlineObject, Pos};
+
+use crate::{Session, catalog};
+
+fn session() -> Session {
+    let mut s = Session::new(Document::new());
+    s.run("document.setText", &json!({"text": ""})).unwrap();
+    s
+}
+
+fn run(s: &mut Session, id: &str, v: Value) -> Value {
+    s.run(id, &v).unwrap_or_else(|e| panic!("{id}: {e}"))
+}
+
+/// Every equation and field in the body, tables included, in document order.
+fn objects(doc: &Document) -> Vec<InlineObject> {
+    fn walk(blocks: &[std::sync::Arc<Block>], out: &mut Vec<InlineObject>) {
+        for b in blocks {
+            match &**b {
+                Block::Para(p) => out.extend(p.objects.iter().cloned()),
+                Block::Table(t) => {
+                    for row in &t.rows {
+                        for cell in &row.cells {
+                            walk(&cell.blocks, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&doc.body, &mut out);
+    out
+}
+
+/// (region, linear) of every calculation region in the body.
+fn regions(s: &Session) -> Vec<(CalcRegion, String)> {
+    objects(&s.doc)
+        .into_iter()
+        .filter_map(|o| match o {
+            InlineObject::Equation { linear, calc: Some(c), .. } => Some((*c, linear)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn region(s: &Session, id: u64) -> (CalcRegion, String) {
+    regions(s).into_iter().find(|(r, _)| r.id == id).unwrap_or_else(|| panic!("no region {id}"))
+}
+
+fn field_results(s: &Session) -> Vec<String> {
+    objects(&s.doc)
+        .into_iter()
+        .filter_map(|o| match o {
+            InlineObject::Field { result, .. } => Some(result),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Inserts a calculation on a line of its own; returns its id.
+fn calc(s: &mut Session, source: &str) -> u64 {
+    let r = run(s, "insert.calculation", json!({"source": source, "display": true}));
+    run(s, "text.newParagraph", json!({}));
+    r["id"].as_u64().unwrap_or_else(|| panic!("no id in {r}"))
+}
+
+/// `P`, `A_b` and `σ := P/A_b =`.
+fn sample(s: &mut Session) -> (u64, u64, u64) {
+    (calc(s, "P := 1500 lbf"), calc(s, "A_b := 2.5 in^2"), calc(s, "σ := P/A_b ="))
+}
+
+#[test]
+fn insert_and_recalculate() {
+    let mut s = session();
+    let (p, a, sigma) = sample(&mut s);
+    assert!(p < a && a < sigma, "fresh ids {p} {a} {sigma}");
+    let (r, linear) = region(&s, sigma);
+    assert_eq!(r.state, CalcState::Fresh);
+    assert!(linear.ends_with("=600 \"psi\""), "{linear}");
+}
+
+#[test]
+fn fresh_ids_never_reuse_one() {
+    let mut s = session();
+    let (p, a, _) = sample(&mut s);
+    let ids: Vec<u64> = regions(&s).iter().map(|(r, _)| r.id).collect();
+    let max = *ids.iter().max().unwrap();
+    let next = calc(&mut s, "x := 1");
+    assert_eq!(next, max + 1);
+    assert_ne!(next, p);
+    assert_ne!(next, a);
+}
+
+#[test]
+fn editing_input_updates_result() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
+    assert!(region(&s, sigma).1.ends_with("=1200 \"psi\""), "{}", region(&s, sigma).1);
+    assert_eq!(region(&s, p).0.source, "P := 3000 lbf");
+}
+
+#[test]
+fn set_source_on_an_unknown_id_is_refused() {
+    let mut s = session();
+    sample(&mut s);
+    let before = s.doc.clone();
+    assert!(s.run("calc.setSource", &json!({"id": 999, "source": "q := 1"})).is_err());
+    assert!(s.doc.same_content(&before));
+}
+
+#[test]
+fn duplicate_insert_is_refused() {
+    let mut s = session();
+    let (p, _, _) = sample(&mut s);
+    let before = s.doc.clone();
+    let e = s.run("insert.calculation", &json!({"source": "P := 2 lbf"})).unwrap_err();
+    assert!(e.to_string().contains("already defined"), "{e}");
+    assert!(s.doc.same_content(&before), "the document is unchanged");
+    // A source that doesn't parse is still inserted: it shows its error at the region.
+    let bad = calc(&mut s, "q := (");
+    assert!(matches!(region(&s, bad).0.state, CalcState::Error(_)));
+    // Renaming a region to a name another owns is refused too.
+    let e = s.run("calc.setSource", &json!({"id": bad, "source": "A_b := 1 in^2"})).unwrap_err();
+    assert!(e.to_string().contains("already defined"), "{e}");
+    // Its own name is fine.
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 1500 lbf"}));
+
+    let r = run(&mut s, "calc.checkName", json!({"name": "P"}));
+    assert_eq!(r["ok"], json!(false), "{r}");
+    assert_eq!(r["reason"], json!("duplicate"), "{r}");
+    assert_eq!(r["existing"], json!(p), "{r}");
+    assert!(r["message"].as_str().unwrap().contains("already defined"), "{r}");
+    let r = run(&mut s, "calc.checkName", json!({"name": "m"}));
+    assert_eq!(r["ok"], json!(false), "{r}");
+    assert_eq!(r["reason"], json!("reserved"), "{r}");
+    assert!(r["message"].as_str().unwrap().contains("unit, function or constant"), "{r}");
+    let r = run(&mut s, "calc.checkName", json!({"name": "a_"}));
+    assert_eq!(r["reason"], json!("reserved"), "{r}");
+    let r = run(&mut s, "calc.checkName", json!({"name": "P", "id": p}));
+    assert_eq!(r, json!({"ok": true}));
+    let r = run(&mut s, "calc.checkName", json!({"name": "brand_new"}));
+    assert_eq!(r, json!({"ok": true}));
+}
+
+#[test]
+fn duplicate_message_names_page() {
+    let mut s = session();
+    sample(&mut s);
+    // A pasted copy of P's definition (the paste bypasses the name check): put one straight into
+    // the document, then make any edit.
+    let end = s.doc.end_of(wordcraft_doc::StoryRef::Body);
+    let copy = InlineObject::Equation {
+        linear: String::new(),
+        display: true,
+        math: Math::default(),
+        calc: Some(Box::new(CalcRegion { id: 77, source: "P := 2 lbf".into(), unit: None, precision: None, state: CalcState::Fresh })),
+    };
+    s.doc.insert_object(&end, copy, &Default::default()).unwrap();
+    run(&mut s, "text.insert", json!({"text": "x"}));
+    let (r, _) = region(&s, 77);
+    match r.state {
+        CalcState::Error(m) => assert!(m.contains("already defined on page 1"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn undo_restores_results() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
+    assert!(region(&s, sigma).1.ends_with("=1200 \"psi\""));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(region(&s, p).0.source, "P := 1500 lbf");
+    assert!(region(&s, sigma).1.ends_with("=600 \"psi\""), "{}", region(&s, sigma).1);
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(region(&s, p).0.source, "P := 3000 lbf");
+    assert!(region(&s, sigma).1.ends_with("=1200 \"psi\""), "{}", region(&s, sigma).1);
+}
+
+#[test]
+fn manual_mode_marks_stale() {
+    let mut s = session();
+    let (p, _, sigma) = sample(&mut s);
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    // Switching to manual changes no result: they are still current.
+    assert_eq!(region(&s, sigma).0.state, CalcState::Fresh);
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
+    let (r, linear) = region(&s, sigma);
+    assert_eq!(r.state, CalcState::Stale);
+    assert!(linear.contains('≈'), "{linear}");
+    let report = run(&mut s, "calc.recalculate", json!({}));
+    assert_eq!(report["regions"], json!(3), "{report}");
+    assert_eq!(report["errors"], json!(0), "{report}");
+    let (r, linear) = region(&s, sigma);
+    assert_eq!(r.state, CalcState::Fresh);
+    assert!(linear.ends_with("=1200 \"psi\""), "{linear}");
+    // Undo puts the stale results back exactly; it doesn't recalculate.
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(region(&s, sigma).0.state, CalcState::Stale);
+    // Back to automatic recalculates.
+    run(&mut s, "calc.settings", json!({"manual": false}));
+    assert_eq!(region(&s, sigma).0.state, CalcState::Fresh);
+}
+
+#[test]
+fn a_command_that_changes_nothing_stays_a_no_op_in_manual_mode() {
+    let mut s = session();
+    sample(&mut s);
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    run(&mut s, "caret.docStart", json!({}));
+    let undo = s.undo_depth();
+    run(&mut s, "text.backspace", json!({}));
+    assert_eq!(s.undo_depth(), undo, "Backspace at the start adds no undo step");
+    assert!(regions(&s).iter().all(|(r, _)| r.state == CalcState::Fresh));
+}
+
+#[test]
+fn settings_change_the_display() {
+    let mut s = session();
+    let (_, _, sigma) = sample(&mut s);
+    let r = run(&mut s, "calc.settings", json!({"system": "si", "precision": 2}));
+    assert_eq!(r["system"], json!("si"), "{r}");
+    assert_eq!(r["precision"], json!(2), "{r}");
+    assert_eq!(r["manual"], json!(false), "{r}");
+    let linear = region(&s, sigma).1;
+    assert!(!linear.contains("psi"), "{linear}");
+    assert!(s.run("calc.settings", &json!({"precision": 16})).is_err());
+    assert!(s.run("calc.settings", &json!({"system": "metric"})).is_err());
+}
+
+#[test]
+fn resolve_edited_keep_word() {
+    let mut s = session();
+    let (_, a, sigma) = sample(&mut s);
+    let names = run(&mut s, "calc.names", json!({}));
+    assert!(names.to_string().contains("\"A_b\""), "{names}");
+    run(&mut s, "calc.resolveEdited", json!({"id": a, "keep": "word"}));
+    assert!(regions(&s).iter().all(|(r, _)| r.id != a), "A_b is a plain equation now");
+    let plain = objects(&s.doc).into_iter().filter(|o| matches!(o, InlineObject::Equation { calc: None, .. })).count();
+    assert_eq!(plain, 1);
+    let names = run(&mut s, "calc.names", json!({}));
+    assert!(!names.to_string().contains("\"A_b\""), "{names}");
+    // σ depends on a name that is gone now.
+    assert!(matches!(region(&s, sigma).0.state, CalcState::Error(_)));
+}
+
+#[test]
+fn resolve_edited_keep_source() {
+    let mut s = session();
+    let (p, _, _) = sample(&mut s);
+    let fresh = region(&s, p).1;
+    // Something other than the calculator rewrote P's equation.
+    let path = s.doc.para_paths(wordcraft_doc::StoryRef::Body)[0].clone();
+    let para = s.doc.para_mut(wordcraft_doc::StoryRef::Body, &path).unwrap();
+    if let Some(InlineObject::Equation { linear, calc: Some(c), .. }) = para.objects.get_mut(0) {
+        *linear = "P=1".into();
+        c.state = CalcState::EditedOutside;
+    }
+    run(&mut s, "calc.resolveEdited", json!({"id": p, "keep": "source"}));
+    let (r, linear) = region(&s, p);
+    assert_eq!(r.state, CalcState::Fresh);
+    assert_eq!(linear, fresh);
+    assert!(s.run("calc.resolveEdited", &json!({"id": p, "keep": "both"})).is_err());
+}
+
+#[test]
+fn calc_value_quotes_a_variable() {
+    let mut s = session();
+    let (p, _, _) = sample(&mut s);
+    run(&mut s, "insert.calcValue", json!({"name": "σ", "unit": "ksi", "precision": 2}));
+    assert_eq!(field_results(&s), ["0.6 ksi"]);
+    let field = objects(&s.doc).into_iter().find(|o| matches!(o, InlineObject::Field { .. })).unwrap();
+    assert!(matches!(field, InlineObject::Field { locked: true, ref instr, .. } if instr == "WCCALC σ \\u ksi \\p 2"), "{field:?}");
+    run(&mut s, "calc.setSource", json!({"id": p, "source": "P := 3000 lbf"}));
+    assert_eq!(field_results(&s), ["1.2 ksi"]);
+    // Not a variable, a precision over 15: refused, nothing inserted.
+    let e = s.run("insert.calcValue", &json!({"name": "nope"})).unwrap_err();
+    assert!(e.to_string().contains("nope isn't a defined variable"), "{e}");
+    assert!(s.run("insert.calcValue", &json!({"name": "P", "precision": 16})).is_err());
+    assert_eq!(field_results(&s).len(), 1);
+}
+
+#[test]
+fn calc_value_outside_the_body_is_refused() {
+    let mut s = session();
+    sample(&mut s);
+    run(&mut s, "insert.editHeader", json!({}));
+    let e = s.run("insert.calcValue", &json!({"name": "P"})).unwrap_err();
+    assert!(e.to_string().contains("body"), "{e}");
+}
+
+#[test]
+fn equation_commands_refuse_a_calculation() {
+    let mut s = session();
+    run(&mut s, "insert.equation", json!({"linear": "x^2", "edit": false}));
+    run(&mut s, "text.newParagraph", json!({}));
+    let p = calc(&mut s, "P := 1500 lbf");
+    let before = region(&s, p);
+    // Caret just after P's equation.
+    let path = s.doc.para_paths(wordcraft_doc::StoryRef::Body)[1].clone();
+    s.sel = crate::Selection::caret(Pos { story: wordcraft_doc::StoryRef::Body, path, off: wordcraft_doc::para::OBJ.len_utf8() });
+    for (id, v) in [("equation.set", json!({"linear": "y"})), ("equation.number", json!({})), ("equation.edit", json!({}))] {
+        let e = s.run(id, &v).unwrap_err();
+        assert!(e.to_string().contains("calculation source"), "{id}: {e}");
+    }
+    assert_eq!(region(&s, p), before);
+    // Convert All converts the plain equation and leaves the calculation alone.
+    let r = run(&mut s, "equation.convert", json!({"to": "linear", "all": true}));
+    assert_eq!(r["converted"], json!(1), "{r}");
+    assert_eq!(region(&s, p), before);
+}
+
+#[test]
+fn plain_documents_pay_nothing() {
+    let mut s = session();
+    run(&mut s, "text.insert", json!({"text": "hello"}));
+    assert!(!super::has_calc(&s.doc));
+    calc(&mut s, "x := 1");
+    assert!(super::has_calc(&s.doc));
+}
+
+#[test]
+fn hostile_parameters_are_refused() {
+    let mut s = session();
+    let huge = "x := ".to_string() + &"1+".repeat(20_000) + "1";
+    assert!(s.run("insert.calculation", &json!({"source": huge})).is_err());
+    assert!(s.run("insert.calculation", &json!({})).is_err());
+    assert!(s.run("calc.setSource", &json!({"id": "x", "source": "y := 1"})).is_err());
+    assert!(s.run("calc.checkName", &json!({})).is_err());
+    assert!(s.run("calc.resolveEdited", &json!({"id": 1})).is_err());
+}
+
+#[test]
+fn catalog_has_calc_commands() {
+    let reg = crate::cmd::registry();
+    let e = catalog::entries();
+    for id in ["insert.calculation", "insert.calcValue", "calc.recalculate", "calc.settings"] {
+        assert!(e.iter().any(|x| x.3 == id), "{id} catalogued");
+        assert!(reg.get(id).is_some(), "{id} registered");
+    }
+    for id in ["calc.setSource", "calc.names", "calc.checkName", "calc.resolveEdited"] {
+        assert!(reg.get(id).is_some(), "{id} registered");
+    }
+}

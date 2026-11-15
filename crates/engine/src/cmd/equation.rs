@@ -145,11 +145,17 @@ fn classified_noop(s: &mut Session) {
 ///
 /// The logical before-state is captured *after* lazy `nodes` materialization: an imported
 /// equation that only gets normalized is a state change, never an IME content change.
+///
+/// A calculation region is refused: its `linear` and `math` are its result, drawn from its
+/// source by the recalculation pass.
 fn with_eq<R>(s: &mut Session, at: &Pos, f: impl FnOnce(&mut Math, &mut bool) -> R) -> Result<(R, EquationEffect), CmdError> {
     let para = s.doc.para_mut(at.story, &at.path)?;
-    let Some(InlineObject::Equation { linear, display, math, .. }) = para.object_at_mut(at.off) else {
+    let Some(InlineObject::Equation { linear, display, math, calc }) = para.object_at_mut(at.off) else {
         return Err(CmdError::Failed("no equation there".into()));
     };
+    if calc.is_some() {
+        return Err(not_for_calculations());
+    }
     let normalized = math.nodes.is_empty() && !linear.is_empty() && !math.linear;
     if normalized {
         math.nodes = parse_linear(linear);
@@ -173,6 +179,16 @@ fn with_eq<R>(s: &mut Session, at: &Pos, f: impl FnOnce(&mut Math, &mut bool) ->
     math.omml.clear();
     para.touch();
     Ok((r, EquationEffect { content_changed, state_changed }))
+}
+
+/// The refusal for an equation command on a calculation region.
+fn not_for_calculations() -> CmdError {
+    CmdError::Disabled("this equation is a calculation: edit the calculation source instead".into())
+}
+
+/// Whether the equation at `at` is a calculation region.
+fn is_calculation(s: &Session, at: &Pos) -> bool {
+    matches!(s.doc.para_at(at).and_then(|p| p.object_at(at.off)), Some(InlineObject::Equation { calc: Some(_), .. }))
 }
 
 /// All the text of an equation's runs (its linear form while shown linear).
@@ -262,6 +278,9 @@ fn insert_nodes_as_equation(s: &mut Session, nodes: Arg, v: &Value) -> CmdResult
 /// position, and returns the equation and caret.
 fn edit(s: &mut Session, v: &Value) -> CmdResult {
     let at = equation_at_caret(s).ok_or_else(|| CmdError::Disabled("no equation at the caret".into()))?;
+    if is_calculation(s, &at) {
+        return Err(not_for_calculations());
+    }
     let nodes = match s.doc.para_at(&at).and_then(|p| p.object_at(at.off)) {
         Some(InlineObject::Equation { math, linear, .. }) => {
             if math.nodes.is_empty() && !math.linear {
@@ -650,7 +669,12 @@ fn convert(s: &mut Session, v: &Value) -> CmdResult {
                 let offs: Vec<usize> = s
                     .doc
                     .para(story, &path)
-                    .map(|p| p.object_offsets().into_iter().filter(|o| matches!(p.object_at(*o), Some(InlineObject::Equation { .. }))).collect())
+                    .map(|p| {
+                        p.object_offsets()
+                            .into_iter()
+                            .filter(|o| matches!(p.object_at(*o), Some(InlineObject::Equation { calc: None, .. })))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 for off in offs {
                     let at = Pos { story, path: path.clone(), off };
