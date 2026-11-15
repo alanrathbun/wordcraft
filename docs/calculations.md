@@ -2,7 +2,14 @@
 
 WordCraft can calculate inside a document the way Mathcad does: you write an equation with
 units, and the result is worked out and shown beside it. Change an input and every result that
-depends on it, anywhere in the document, updates. Insert one from Insert › Calculation.
+depends on it, anywhere in the document, updates. Insert one from Insert › Calculation
+(Ctrl+Alt+=, ⌘⌥= on a Mac). To change one, double-click it, press F2 with the caret beside it, or
+select it and press Enter.
+
+Calculations work in the main text and its tables. A calculation pasted or moved anywhere else (a
+text box, header, footer, footnote or comment) stops being one: it becomes a plain equation
+showing its calculation with no result, marked ⚠ "not calculated here". A quoted value there shows
+`?`.
 
 ## Notation
 
@@ -32,6 +39,11 @@ to a force is an error rather than a number.
 
 - `°C` and `°F` can only be the unit of a whole value. Temperatures on an offset scale can't be
   added together; use `Δ°F` for a difference.
+- A result is shown in `°C` or `°F` only when it is an absolute temperature: a `°C`/`°F` value, a
+  `K`/`°R` value, or one of those plus or minus a difference (`T_1 + 5 Δ°C`). A difference
+  (`T_2 - T_1`, `20 Δ°C`) or anything else made from temperatures (`2 T`, `(T_1 + T_2)/2`) shown
+  in `°C` is an error: "°C shows an absolute temperature; use Δ°C for a difference". Show it in
+  `Δ°C`, `Δ°F` or `K` instead. For an average temperature write `T_1 + (T_2 - T_1)/2`.
 - `J/mol K` is refused as ambiguous. Write `J/(mol·K)`.
 - Thousands separators written as spaces (`1 500`) are refused, because a space is multiplication.
   Write `1500`.
@@ -39,21 +51,31 @@ to a force is an error rather than a number.
 ## How results are shown
 
 - Three decimal places, trailing zeros trimmed.
-- Exponential form (`6×10^6`) when the value is 1 000 000 or more, below 0.0001, or would
-  otherwise round to 0.
+- Exponential form (`6×10^6`) when the value is 1 000 000 or more, or too small to show at least
+  two significant digits at the chosen precision: at three places that is below 0.01, so 0.0005
+  shows as `5×10^-4`, not `0.001`. (The threshold is `10^(1 − places)`, never above 1 and never
+  below 0.0001.)
 - The default unit system is US customary. Choose SI in References › Calculation Options.
 - `= ? unit` overrides the unit for one result.
+- A calculation can be numbered like any display equation (Equation › Equation Number); the number
+  stays as the result changes and is saved to Word.
 
 ## Quoted values
 
 Insert › Calculated Value puts a variable's value into a sentence ("each bolt carries 45.271 ksi").
-It shows only the body of the result (no name, no `=`) and follows the variable. It shows `?` while
-the value isn't available (an error, or a name that's gone).
+It shows only the body of the result (no name, no `=`) and follows the variable, with an exponent
+written in superscript (`2.9×10⁷ psi`). It shows `?` while the value isn't available (an error, or
+a name that's gone). A unit the variable can't be shown in is refused when the value is inserted.
 
 ## Recalculation
 
 Results update automatically. In manual mode (References › Calculation Options) they are marked
-`≈` when they're out of date, until you choose References › Recalculate.
+`≈` when an input changes, until you choose References › Recalculate. Typing ordinary text marks
+nothing out of date.
+
+A document whose calculations together need too much work (deeply recursive functions, say) is
+calculated up to a fixed limit; the calculations past it show the error "too complex to
+calculate" rather than a result.
 
 ## Word
 
@@ -61,9 +83,13 @@ Saving as `.docx` writes each calculation as an ordinary Word equation, so Word 
 plus hidden calculation source. Opening that file in WordCraft makes the calculations live again.
 Quoted values are written the same way.
 
-If an equation is edited in Word, WordCraft notices when you open the file and flags it with two
-choices: "Restore from calculation" brings back what the calculation says, and "Keep Word's
-equation" keeps what was typed in Word and stops it being a calculation. Calculations inside
+If an equation is edited in Word, WordCraft notices when you open the file: the status bar says how
+many were edited, and each one keeps Word's version with an amber ⚠ after it. Until you resolve it,
+it defines nothing: every calculation that uses its name shows the error "depends on a calculation
+edited in Word — resolve it" instead of a result, and quoted values of them show `?`. Hover over it
+(or put the caret beside it) for two choices: "Restore from calculation" brings back what the
+calculation says, and "Keep Word's equation" keeps what was typed in Word and stops it being a
+calculation. The ⚠ is WordCraft's: it isn't saved into the Word equation. Calculations inside
 tracked deletions are kept when you save and reopen.
 
 ## Example
