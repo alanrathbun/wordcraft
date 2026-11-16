@@ -191,3 +191,21 @@ fn origin_round_trips_and_defaults() {
     assert!(json.contains("\"origin\":1"), "{json}");
     assert_eq!(serde_json::from_str::<CalcSettings>(&json).unwrap(), one);
 }
+
+#[test]
+fn store_tables_default_empty_and_are_skipped_when_empty() {
+    // A Stage 1 store has no tables: still valid, and saved again as it was.
+    let stage1 =
+        r#"{"settings":{"system":"UsCustomary","precision":3,"manual":false,"g":"gravity"},"regions":[{"id":1,"source":"a := 1","fingerprint":7}]}"#;
+    let store: CalcStore = serde_json::from_str(stage1).unwrap();
+    assert!(store.tables.is_empty());
+    assert_eq!(serde_json::to_string(&store).unwrap(), stage1);
+    // Tables are written when there are any, and count against emptiness.
+    let with = CalcStore { tables: vec![StoredTable { id: 2, fingerprint: 9 }], ..CalcStore::default() };
+    assert!(!with.is_empty());
+    let json = serde_json::to_string(&with).unwrap();
+    assert!(json.contains(r#""tables":[{"id":2,"fingerprint":9}]"#), "{json}");
+    assert_eq!(serde_json::from_str::<CalcStore>(&json).unwrap(), with);
+    assert!(CalcStore::default().is_empty());
+    assert!(CALC_TABLE_TAG_PREFIX.strip_prefix(CALC_TAG_PREFIX).is_none() && CALC_TAG_PREFIX.strip_prefix(CALC_TABLE_TAG_PREFIX).is_none());
+}

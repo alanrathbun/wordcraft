@@ -31,7 +31,7 @@ pub(crate) fn write(store: &CalcStore) -> Result<Vec<u8>, DocxError> {
 
 /// Read the store from a custom XML part's bytes, if it is ours and sound: `None` for another
 /// part, malformed XML or JSON, a part over [`MAX_STORE_BYTES`] or a store of more than
-/// [`MAX_STORED_REGIONS`] regions.
+/// [`MAX_STORED_REGIONS`] entries (regions and tables together).
 pub(crate) fn read_from_bytes(bytes: &[u8]) -> Option<CalcStore> {
     if bytes.len() > MAX_STORE_BYTES {
         return None;
@@ -53,7 +53,7 @@ pub(crate) fn read_from_bytes(bytes: &[u8]) -> Option<CalcStore> {
                     let s = std::str::from_utf8(text.as_ref()).ok()?;
                     let unescaped = quick_xml::escape::unescape(s).ok()?;
                     let store: CalcStore = serde_json::from_str(&unescaped).ok()?;
-                    return (store.regions.len() <= MAX_STORED_REGIONS).then_some(store);
+                    return (store.regions.len().saturating_add(store.tables.len()) <= MAX_STORED_REGIONS).then_some(store);
                 } else if !is_our_kind {
                     // The root is something else.
                     return None;
@@ -70,7 +70,7 @@ pub(crate) fn read_from_bytes(bytes: &[u8]) -> Option<CalcStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wordcraft_doc::calc::StoredRegion;
+    use wordcraft_doc::calc::{StoredRegion, StoredTable};
 
     fn store() -> CalcStore {
         CalcStore {
@@ -83,6 +83,7 @@ mod tests {
                 numbered: true,
                 fingerprint: u64::MAX,
             }],
+            tables: vec![StoredTable { id: 2, fingerprint: 7 }],
         }
     }
 

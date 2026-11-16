@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
 use wordcraft_calc::docx::{export, import};
-use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, QuoteSpec, UnitSystem, calc_field_instr};
+use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, CalcTable, ColumnError, QuoteSpec, UnitSystem, calc_field_instr};
 use wordcraft_doc::math::Math;
 use wordcraft_doc::{Block, CharProps, Document, InlineObject, Paragraph, para_block};
 
@@ -717,4 +717,252 @@ fn vector_results_round_trip_as_word_matrices() {
         assert_eq!(r.state, CalcState::Fresh, "{} came back as {:?} ({linear})", sources[i], r.state);
         assert_eq!(linear, &region(&doc, i as u64 + 1).1);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Calculation data tables
+// ---------------------------------------------------------------------------------------------
+
+/// The B31.3 pipe table: headings, then three rows of values.
+const PIPES: [[&str; 3]; 4] = [["NPS (in)", "D_o (in)", "t_nom (in)"], ["1/2", "0.840", "0.109"], ["3/4", "1.050", "0.113"], ["1", "1.315", "0.133"]];
+
+/// The id the pipe table is marked with: not 1, so it can't pass for a region's id by chance.
+const PIPE_TABLE: u64 = 7;
+
+/// The B31.3 example: the pipe table marked as calculation data (block 0), then regions 1 to 7
+/// (blocks 1 to 7), recalculated. The margin is `margin`, not `m`: `m` is the metre.
+fn pipe_doc() -> Document {
+    let sources =
+        ["P := 1000 psi", "S := 20000 psi", "E := 1", "Y := 0.4", "t_min := P·D_o/(2·(S·E + P·Y)) =", "margin := t_nom - t_min =", "min(margin) ="];
+    let table = wordcraft_doc::Table {
+        rows: PIPES
+            .iter()
+            .map(|r| wordcraft_doc::Row { cells: r.iter().map(|t| wordcraft_doc::Cell::with_text(t)).collect(), ..Default::default() })
+            .collect(),
+        grid: vec![100.0; 3],
+        calc: Some(Box::new(CalcTable { id: PIPE_TABLE, errors: Vec::new() })),
+        ..Default::default()
+    };
+    let mut d = Document::new();
+    d.body = vec![std::sync::Arc::new(Block::Table(table))];
+    for (i, s) in sources.iter().enumerate() {
+        let mut p = Paragraph::with_text("", CharProps::default());
+        p.insert_object(0, calc_eq(i as u64 + 1, s, false), &CharProps::default()).unwrap();
+        d.body.push(para_block(p));
+    }
+    wordcraft_calc::recalc(&mut d, &|_| None);
+    d
+}
+
+/// The table at body block `at`.
+fn table_at(doc: &Document, at: usize) -> &wordcraft_doc::Table {
+    doc.body[at].as_table().unwrap_or_else(|| panic!("block {at} isn't a table"))
+}
+
+/// Each cell's text (its paragraphs' text, trimmed), row by row.
+fn cell_texts(t: &wordcraft_doc::Table) -> Vec<Vec<String>> {
+    t.rows
+        .iter()
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| c.blocks.iter().filter_map(|b| b.as_para()).map(|p| p.final_text()).collect::<Vec<_>>().join("\n").trim().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// The `w:tbl` … `</w:tbl>` of the first table in `xml`.
+fn first_tbl(xml: &str) -> &str {
+    let start = xml.find("<w:tbl>").expect("a table");
+    let end = start + xml[start..].find("</w:tbl>").unwrap() + "</w:tbl>".len();
+    &xml[start..end]
+}
+
+/// `bytes` opened in WordCraft, with the report of bringing its calculations back.
+fn open_with_report(bytes: &[u8]) -> (Document, wordcraft_calc::RecalcReport) {
+    let mut doc = wordcraft_docx::read(bytes).unwrap();
+    let store = doc.calc_store.take();
+    let report = import(&mut doc, store);
+    (doc, report)
+}
+
+#[test]
+fn data_table_round_trips_through_docx() {
+    let doc = pipe_doc();
+    assert!(region(&doc, 7).1.ends_with("=0.087 \"in\""), "{}", region(&doc, 7).1);
+    let before = doc.clone();
+    let bytes = save(&doc);
+    assert_eq!(doc, before, "saving changes nothing in the live document");
+
+    // Word gets the table in a content control tagged with its id, holding exactly the typed text.
+    let xml = document_xml(&bytes);
+    let tag = format!(r#"<w:tag w:val="wordcraft-calc-table:{PIPE_TABLE}"/>"#);
+    let at = xml.find(&tag).unwrap_or_else(|| panic!("no {tag}"));
+    let sdt_start = xml[..at].rfind("<w:sdt>").unwrap();
+    let content = at + xml[at..].find("<w:sdtContent>").unwrap() + "<w:sdtContent>".len();
+    assert!(xml[content..].starts_with("<w:tbl>"), "the control's content starts with the table: {}", &xml[sdt_start..content + 40]);
+    let tbl = first_tbl(&xml);
+    assert!(xml[content + tbl.len()..].starts_with("</w:sdtContent></w:sdt>"), "and ends with it");
+    for text in PIPES.iter().flatten() {
+        assert!(tbl.contains(&format!(">{text}<")), "{text} in {tbl}");
+    }
+    let p = parts(&bytes);
+    let store = String::from_utf8(p[&store_part(&p)].clone()).unwrap().replace("&quot;", "\"");
+    assert!(store.contains(&format!(r#""tables":[{{"id":{PIPE_TABLE},"fingerprint":"#)), "{store}");
+
+    let (back, report) = open_with_report(&bytes);
+    assert_eq!(report.tables_edited, 0);
+    let t = table_at(&back, 0);
+    assert_eq!(t.calc.as_deref(), Some(&CalcTable { id: PIPE_TABLE, errors: Vec::new() }), "marked again with the same id");
+    assert!(t.controls.is_empty(), "the control is WordCraft's bookkeeping: gone once read");
+    assert!(!has_markers(&back));
+    assert_eq!(cell_texts(t), PIPES.map(|r| r.map(String::from).to_vec()).to_vec());
+    let got: Vec<(u64, CalcState, String)> = regions(&back).into_iter().map(|(r, l)| (r.id, r.state, l)).collect();
+    let want: Vec<(u64, CalcState, String)> = regions(&doc).into_iter().map(|(r, l)| (r.id, r.state, l)).collect();
+    assert_eq!(got, want, "the results are the same");
+    assert!(want.iter().all(|(_, s, _)| *s == CalcState::Fresh));
+    // A second round trip is just as clean.
+    let (again, report) = open_with_report(&save(&back));
+    assert_eq!(report.tables_edited, 0);
+    assert_eq!(table_at(&again, 0).calc, t.calc);
+    assert_eq!(regions(&again), regions(&back));
+}
+
+#[test]
+fn word_sees_a_plain_table() {
+    let marked = pipe_doc();
+    let mut plain = marked.clone();
+    if let Block::Table(t) = std::sync::Arc::make_mut(&mut plain.body[0]) {
+        t.calc = None;
+    }
+    let marked_xml = document_xml(&save(&marked));
+    let plain_xml = document_xml(&save(&plain));
+    assert!(!plain_xml.contains("wordcraft-calc-table:"));
+    // The table itself is written exactly as an unmarked one: no field codes, no extra runs.
+    let tbl = first_tbl(&marked_xml);
+    assert_eq!(tbl, first_tbl(&plain_xml));
+    for code in ["w:fldChar", "w:instrText", "w:fldSimple", "<w:sdt>", "WCCALC", "<m:oMath"] {
+        assert!(!tbl.contains(code), "{code} in {tbl}");
+    }
+    // The only addition is the control around it, which reviewers may edit.
+    let at = marked_xml.find(tbl).unwrap();
+    let sdt = &marked_xml[marked_xml[..at].rfind("<w:sdt>").unwrap()..at];
+    assert!(sdt.ends_with("</w:sdtPr><w:sdtContent>"), "{sdt}");
+    assert!(sdt.contains("wordcraft-calc-table:") && !sdt.contains("<w:lock"), "{sdt}");
+    assert!(marked_xml[at + tbl.len()..].starts_with("</w:sdtContent></w:sdt>"));
+    let (before, after) = (&marked_xml[..at], &marked_xml[at + tbl.len()..]);
+    let (plain_at, _) = plain_xml.match_indices(tbl).next().unwrap();
+    assert_eq!(
+        format!("{}{}", &before[..before.len() - sdt.len()], &after["</w:sdtContent></w:sdt>".len()..]),
+        format!("{}{}", &plain_xml[..plain_at], &plain_xml[plain_at + tbl.len()..]),
+        "nothing else differs"
+    );
+}
+
+#[test]
+fn table_edited_in_word_is_used_and_noticed() {
+    let bytes = save(&pipe_doc());
+    // A reviewer changes t_nom of the 3/4 pipe.
+    let edited = edit_document(&bytes, |xml| {
+        assert_eq!(xml.matches(">0.113<").count(), 1);
+        xml.replace(">0.113<", ">0.120<")
+    });
+    let (back, report) = open_with_report(&edited);
+    assert_eq!(report.tables_edited, 1);
+    assert_eq!(report.edited, 0, "no equation was edited");
+    let t = table_at(&back, 0);
+    assert_eq!(t.calc.as_deref(), Some(&CalcTable { id: PIPE_TABLE, errors: Vec::new() }), "still data: the new value is an input");
+    assert_eq!(cell_texts(t)[2][2], "0.120");
+    let (min, linear) = region(&back, 7);
+    assert_eq!(min.state, CalcState::Fresh, "{linear}");
+    assert!(linear.ends_with("=0.088 \"in\""), "the new value is used: {linear}");
+    // Saved again, the edit is WordCraft's own data now: not noticed a second time.
+    assert_eq!(open_with_report(&save(&back)).1.tables_edited, 0);
+
+    // A reviewer adds a row and leaves it empty: an error naming the row, never a 0.
+    let empty_row = "<w:tr><w:tc><w:p/></w:tc><w:tc><w:p/></w:tc><w:tc><w:p/></w:tc></w:tr>";
+    let edited = edit_document(&bytes, |xml| xml.replacen("</w:tbl>", &format!("{empty_row}</w:tbl>"), 1));
+    let (back, report) = open_with_report(&edited);
+    assert_eq!(report.tables_edited, 1);
+    let t = table_at(&back, 0);
+    assert_eq!(t.rows.len(), 5);
+    let errors = &t.calc.as_deref().expect("still data").errors;
+    assert!(errors.contains(&ColumnError { col: Some(2), message: "t_nom row 4 isn't a number".into() }), "{errors:?}");
+    let (min, linear) = region(&back, 7);
+    assert!(matches!(min.state, CalcState::Error(_)), "{linear}");
+    assert!(!linear.contains("0.08"), "no number from the table in error: {linear}");
+}
+
+#[test]
+fn table_without_store_stays_plain() {
+    let (copy, _) = export(&pipe_doc());
+    // The control is written, the store isn't.
+    let bytes = wordcraft_docx::write(&copy).unwrap();
+    assert!(document_xml(&bytes).contains(&format!("wordcraft-calc-table:{PIPE_TABLE}")));
+    let (back, report) = open_with_report(&bytes);
+    assert_eq!(report.tables_edited, 0);
+    let t = table_at(&back, 0);
+    assert_eq!(t.calc, None, "a plain table");
+    assert!(t.controls.is_empty(), "with its control removed");
+    assert_eq!(cell_texts(t), PIPES.map(|r| r.map(String::from).to_vec()).to_vec());
+    assert!(!has_markers(&back));
+}
+
+#[test]
+fn hostile_table_entries_leave_tables_plain() {
+    let doc = pipe_doc();
+    let bytes = save(&doc);
+    let (_, store) = export(&doc);
+    let regions_json = serde_json::to_value(&store.regions).unwrap();
+    let table = serde_json::to_value(store.tables[0]).unwrap();
+    // The table's id stored twice: which entry is right can't be known.
+    let twice = serde_json::json!({ "settings": store.settings, "regions": regions_json, "tables": [table, table] }).to_string();
+    // Tables count toward the bound on stored entries.
+    let over = {
+        let entries: Vec<String> = (0..100_000u64).map(|i| format!(r#"{{"id":{},"source":"a","fingerprint":0}}"#, i + 100)).collect();
+        format!(r#"{{"settings":{{}},"regions":[{}],"tables":[{table}]}}"#, entries.join(","))
+    };
+    // A fingerprint is only ever "edited or not": a wrong one is no reason to drop the table.
+    let mut wrong = table.clone();
+    wrong["fingerprint"] = 0.into();
+    let wrong = serde_json::json!({ "settings": store.settings, "regions": regions_json, "tables": [wrong] }).to_string();
+    for (json, marked) in [(twice.as_str(), false), (over.as_str(), false), (wrong.as_str(), true), (r#"{"tables": 7}"#, false)] {
+        let (back, report) = open_with_report(&with_store_json(&bytes, json));
+        let t = table_at(&back, 0);
+        assert_eq!(t.calc.is_some(), marked, "store {json:.60}");
+        assert!(t.controls.is_empty() && !has_markers(&back), "store {json:.60}");
+        assert_eq!(report.tables_edited, usize::from(marked), "store {json:.60}");
+    }
+}
+
+#[test]
+fn text_typed_inside_the_table_control_in_word_is_kept() {
+    // Word lets a reviewer type a paragraph after the table, inside its control.
+    let edited = edit_document(&save(&pipe_doc()), |xml| {
+        assert_eq!(xml.matches("</w:tbl></w:sdtContent>").count(), 1);
+        xml.replace("</w:tbl></w:sdtContent>", "</w:tbl><w:p><w:r><w:t>Checked</w:t></w:r></w:p></w:sdtContent>")
+    });
+    let (back, report) = open_with_report(&edited);
+    assert_eq!(report.tables_edited, 0);
+    let t = table_at(&back, 0);
+    assert_eq!(t.calc.as_deref().map(|c| c.id), Some(PIPE_TABLE));
+    assert!(t.controls.is_empty() && !has_markers(&back), "{:?}", t.controls);
+    assert!(back.body[1].as_para().is_some_and(|p| p.final_text() == "Checked"));
+    assert!(region(&back, 7).1.ends_with("=0.087 \"in\""));
+    assert!(!back.has_unbalanced_controls());
+}
+
+#[test]
+fn origin_round_trips_through_the_store() {
+    let mut doc = pipe_doc();
+    doc.calc_settings = Some(CalcSettings { origin: 1, ..CalcSettings::default() });
+    let mut p = Paragraph::with_text("", CharProps::default());
+    p.insert_object(0, calc_eq(8, "D_o[1] =", false), &CharProps::default()).unwrap();
+    doc.body.push(para_block(p));
+    wordcraft_calc::recalc(&mut doc, &|_| None);
+    assert!(region(&doc, 8).1.ends_with("=0.84 \"in\""), "{}", region(&doc, 8).1);
+    let back = open(&save(&doc));
+    assert_eq!(back.calc_settings.as_ref().map(|s| s.origin), Some(1));
+    assert_eq!(region(&back, 8).1, region(&doc, 8).1);
 }

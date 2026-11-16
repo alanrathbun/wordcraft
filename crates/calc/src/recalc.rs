@@ -38,6 +38,9 @@ pub struct RecalcReport {
     pub reassigned_ids: usize,
     /// Regions edited outside WordCraft ([`CalcState::EditedOutside`]) waiting to be resolved.
     pub edited: usize,
+    /// Calculation data tables whose cells were edited outside WordCraft (found when a `.docx` is
+    /// read back: [`crate::docx::import`]); their new values are used. Always 0 from [`recalc`].
+    pub tables_edited: usize,
 }
 
 /// Most names a circular-definition message lists.
@@ -114,7 +117,7 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
     let table_edits = table_changes(&found.tables, &table_ids, &tables, &index, &outcomes);
     apply(&mut doc.body, edits);
     apply_tables(&mut doc.body, table_edits);
-    RecalcReport { regions: regions.len(), errors, reassigned_ids, edited }
+    RecalcReport { regions: regions.len(), errors, reassigned_ids, edited, tables_edited: 0 }
 }
 
 /// Every live calculation data table of the body (tables in table cells too, tracked deletions
@@ -332,8 +335,9 @@ pub(crate) struct Found {
     pub(crate) deleted: Vec<(At, u64)>,
     /// Calculation data tables, in document order (a table before anything inside it).
     pub(crate) tables: Vec<FoundTable>,
-    /// Ids of tracked-deleted data tables: never reused for a reassigned id.
-    deleted_table_ids: Vec<u64>,
+    /// Where each tracked-deleted data table is, with its id (in document order): its id is never
+    /// reused for a reassigned one.
+    pub(crate) deleted_tables: Vec<(Vec<u32>, u64)>,
 }
 
 /// The calculation regions, quoted values and calculation data tables of the body, in document
@@ -359,7 +363,7 @@ fn walk_paras<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&[u32], &'a Paragraph)) 
 
 /// Every paragraph and table of `blocks` in document order (a table, then its cells row by row,
 /// to any depth), with its path: block index, then row, cell and block index for each table level.
-fn walk_blocks<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&[u32], &'a Block)) {
+pub(crate) fn walk_blocks<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&[u32], &'a Block)) {
     for (i, b) in blocks.iter().enumerate() {
         let top = u32::try_from(i).unwrap_or(u32::MAX);
         match &**b {
@@ -391,7 +395,7 @@ fn walk_blocks<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&[u32], &'a Block)) {
 fn visit_table(path: &[u32], t: &Table, found: &mut Found) {
     let Some(c) = &t.calc else { return };
     if inside_deletion(t) {
-        found.deleted_table_ids.push(c.id);
+        found.deleted_tables.push((path.to_vec(), c.id));
     } else {
         found.tables.push(FoundTable { path: path.to_vec(), id: c.id, errors: c.errors.clone() });
     }
@@ -633,9 +637,10 @@ pub(crate) fn assign_ids(found: &Found) -> (Vec<u64>, usize) {
 
 /// Each data table's id, as [`assign_ids`] gives regions theirs. Tables have an id space of
 /// their own.
-fn assign_table_ids(found: &Found) -> Vec<u64> {
+pub(crate) fn assign_table_ids(found: &Found) -> Vec<u64> {
     let ids: Vec<u64> = found.tables.iter().map(|t| t.id).collect();
-    unique_ids(&ids, &found.deleted_table_ids).0
+    let deleted: Vec<u64> = found.deleted_tables.iter().map(|&(_, id)| id).collect();
+    unique_ids(&ids, &deleted).0
 }
 
 /// `ids` with the first of any repeated id kept and the rest given the next one above the
@@ -1268,7 +1273,7 @@ fn set_nodes(math: &mut wordcraft_doc::math::Math, nodes: Arg) {
 }
 
 /// The table at `path`, if there is one.
-fn table_at<'a>(body: &'a Blocks, path: &[u32]) -> Option<&'a Table> {
+pub(crate) fn table_at<'a>(body: &'a Blocks, path: &[u32]) -> Option<&'a Table> {
     let (&first, mut rest) = path.split_first()?;
     let mut block: &Block = body.get(first as usize)?;
     loop {
@@ -1280,7 +1285,7 @@ fn table_at<'a>(body: &'a Blocks, path: &[u32]) -> Option<&'a Table> {
 }
 
 /// The table at `path`, to change: only the blocks on the way to it are copied when shared.
-fn table_mut<'a>(body: &'a mut Blocks, path: &[u32]) -> Option<&'a mut Table> {
+pub(crate) fn table_mut<'a>(body: &'a mut Blocks, path: &[u32]) -> Option<&'a mut Table> {
     let (&first, mut rest) = path.split_first()?;
     let mut block: &mut Block = Arc::make_mut(body.get_mut(first as usize)?);
     loop {

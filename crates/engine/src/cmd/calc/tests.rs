@@ -1257,3 +1257,50 @@ fn has_calc_counts_data_tables() {
     // Saving takes the calculations' path to Word now; it still saves.
     assert!(crate::io::save_bytes("report.docx", &s.doc).is_ok());
 }
+
+#[test]
+fn edited_table_notice() {
+    let mut s = session();
+    let pipes: &[&[&str]] =
+        &[&["NPS (in)", "D_o (in)", "t_nom (in)"], &["1/2", "0.840", "0.109"], &["3/4", "1.050", "0.113"], &["1", "1.315", "0.133"]];
+    let t = typed_table(&mut s, pipes);
+    caret_in_cell(&mut s, t, 0, 0, 0);
+    run(&mut s, "calc.dataTable", json!({"on": true}));
+    run(&mut s, "caret.docEnd", json!({}));
+    let p = calc(&mut s, "P := 1000 psi");
+    for source in ["S := 20000 psi", "E := 1", "Y := 0.4", "t_min := P·D_o/(2·(S·E + P·Y))", "margin := t_nom - t_min"] {
+        calc(&mut s, source);
+    }
+    let min = calc(&mut s, "min(margin) =");
+    shows(&s, min, "=0.087 \"in\"");
+    let other = typed_table(&mut s, &[&["L (ft)"], &["12"]]);
+    caret_in_cell(&mut s, other, 0, 0, 0);
+    run(&mut s, "calc.dataTable", json!({"on": true}));
+    let bytes = crate::io::save_bytes("pipes.docx", &s.doc).unwrap();
+    let open = |edited: &[u8]| {
+        let mut back = Session::new(Document::new());
+        run(&mut back, "file.open", json!({"path": "pipes.docx", "data": crate::cmd::insert::base64_encode(edited)}));
+        back
+    };
+    // Untouched: nothing to say.
+    let back = open(&bytes);
+    assert!(!back.status.contains("edited in Word"), "{}", back.status);
+    // One table edited: its new value is used, and the status line says so.
+    let back = open(&edit_in_word(&bytes, |xml| xml.replace(">0.113<", ">0.120<")));
+    assert_eq!(back.status, "Calculation data was edited in Word in 1 table; results were recalculated");
+    shows(&back, min, "=0.088 \"in\"");
+    // Two tables.
+    let back = open(&edit_in_word(&bytes, |xml| xml.replace(">0.113<", ">0.120<").replace(">12<", ">14<")));
+    assert_eq!(back.status, "Calculation data was edited in Word in 2 tables; results were recalculated");
+    // An equation too: the table notice follows the equations one.
+    let back = open(&edit_in_word(&bytes, |xml| {
+        assert!(xml.contains(">P≔1000<"));
+        xml.replace(">0.113<", ">0.120<").replace(">P≔1000<", ">P≔1100<")
+    }));
+    assert_eq!(region(&back, p).0.state, CalcState::EditedOutside);
+    assert_eq!(
+        back.status,
+        "1 calculation was edited in Word: it is marked ⚠, and calculations that use it show an error until you resolve it. \
+         Calculation data was edited in Word in 1 table; results were recalculated"
+    );
+}

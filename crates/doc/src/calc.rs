@@ -129,27 +129,48 @@ impl Default for CalcSettings {
 /// follows (`wordcraft-calc:7`). WordCraft's own bookkeeping, never shown as a form field.
 pub const CALC_TAG_PREFIX: &str = "wordcraft-calc:";
 
-/// Most regions a [`CalcStore`] read from a file may hold; a larger one is ignored.
+/// The tag prefix of the content control a calculation data table is saved in (`.docx`): the
+/// table's id follows (`wordcraft-calc-table:2`). Table ids are an id space of their own, so the
+/// prefix differs from [`CALC_TAG_PREFIX`] (neither starts with the other).
+pub const CALC_TABLE_TAG_PREFIX: &str = "wordcraft-calc-table:";
+
+/// Most entries (regions and tables together) a [`CalcStore`] read from a file may hold; a larger
+/// one is ignored.
 pub const MAX_STORED_REGIONS: usize = 100_000;
 
 /// Largest serialized [`CalcStore`] read from a file, bytes; a larger one is ignored.
 pub const MAX_STORE_BYTES: usize = 16 * 1024 * 1024;
 
-/// What a saved file (`.docx`) keeps of its calculations beside the ordinary equations Word
-/// shows: the document's settings and each region's source, keyed by the id in its content
-/// control's tag ([`CALC_TAG_PREFIX`]).
+/// What a saved file (`.docx`) keeps of its calculations beside the ordinary equations and tables
+/// Word shows: the document's settings, each region's source, keyed by the id in its content
+/// control's tag ([`CALC_TAG_PREFIX`]), and each calculation data table's id and fingerprint
+/// ([`CALC_TABLE_TAG_PREFIX`]).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CalcStore {
     pub settings: CalcSettings,
     pub regions: Vec<StoredRegion>,
+    /// Not written when empty, so a document without data tables saves as it did before tables
+    /// could be data (and a store without it is still valid).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<StoredTable>,
 }
 
 impl CalcStore {
-    /// Nothing worth saving: no regions and the default settings.
+    /// Nothing worth saving: no regions, no tables and the default settings.
     pub fn is_empty(&self) -> bool {
-        self.regions.is_empty() && self.settings == CalcSettings::default()
+        self.regions.is_empty() && self.tables.is_empty() && self.settings == CalcSettings::default()
     }
+}
+
+/// One calculation data table of a [`CalcStore`]. A table's values are its cells' text, which Word
+/// keeps, so nothing else is stored: the table comes back as data whatever its cells hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTable {
+    pub id: u64,
+    /// Hash of the table's cell text as saved: when the table read back hashes differently, its
+    /// data was edited outside WordCraft (it is used all the same: cells are inputs).
+    pub fingerprint: u64,
 }
 
 /// One region of a [`CalcStore`].

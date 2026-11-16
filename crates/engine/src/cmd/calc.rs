@@ -163,7 +163,8 @@ pub(crate) fn take_open_notice() -> Option<String> {
 /// After a document is opened (any format): calculations saved in a `.docx` come back live from
 /// the store read with it (`wordcraft_calc::docx::import`), and every calculation is
 /// recalculated so the results are current; regions edited outside WordCraft keep what they
-/// show. A document with no calculations is left as it was read.
+/// show, and data tables edited outside it are used as they are (both are told in the status line:
+/// [`take_open_notice`]). A document with no calculations is left as it was read.
 ///
 /// The pass reads file content, so it runs inside `catch_unwind` like [`after_command`]: a panic
 /// puts the document back as read, greys every result so none looks current, and leaves a
@@ -183,7 +184,7 @@ pub(crate) fn after_open(doc: &mut Document) {
     }));
     let panic = match pass {
         Ok(report) => {
-            if let Some(notice) = edited_notice(report.edited) {
+            if let Some(notice) = edited_notice(report.edited, report.tables_edited) {
                 OPEN_NOTICE.with(|n| *n.borrow_mut() = Some(notice));
             }
             return;
@@ -203,14 +204,25 @@ pub(crate) fn after_open(doc: &mut Document) {
     OPEN_NOTICE.with(|n| *n.borrow_mut() = Some(notice));
 }
 
-/// What opening tells about calculations edited in Word, when there are any.
-fn edited_notice(edited: usize) -> Option<String> {
-    match edited {
+/// What opening tells about calculations (`edited`) and calculation data tables
+/// (`tables_edited`) edited in Word, when there are any: the tables' notice after the
+/// calculations'.
+fn edited_notice(edited: usize, tables_edited: usize) -> Option<String> {
+    let calculations = match edited {
         0 => None,
         1 => Some("1 calculation was edited in Word: it is marked ⚠, and calculations that use it show an error until you resolve it.".to_string()),
         n => Some(format!(
             "{n} calculations were edited in Word: they are marked ⚠, and calculations that use them show an error until you resolve them."
         )),
+    };
+    let tables = match tables_edited {
+        0 => None,
+        1 => Some("Calculation data was edited in Word in 1 table; results were recalculated".to_string()),
+        n => Some(format!("Calculation data was edited in Word in {n} tables; results were recalculated")),
+    };
+    match (calculations, tables) {
+        (Some(c), Some(t)) => Some(format!("{c} {t}")),
+        (c, t) => c.or(t),
     }
 }
 
