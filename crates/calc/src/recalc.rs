@@ -22,7 +22,7 @@ use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph, Row, Table};
 
 use crate::array::{self, Data};
-use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, check_element, run_stmt_in, text_use};
+use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, check_element, run_stmt_in};
 use crate::render::{self, MAX_SHOWN_COLS, MAX_SHOWN_ROWS, Rendered, Shown, rendered, shown_result, shows_value};
 use crate::tables;
 use crate::{CalcError, Env, Stmt, check_name, defined_name, free_names, parse};
@@ -1084,7 +1084,7 @@ fn format_value(q: Quantity, unit: Option<&str>, sys: UnitSystem, p: Precision) 
     Ok(format(q, scale.as_ref(), sys, p)?)
 }
 
-/// A result as it is shown: one value, or a vector or matrix of its first [`MAX_SHOWN_ROWS`] rows
+/// A result as it is shown: one value or text, or a vector or matrix of its first [`MAX_SHOWN_ROWS`] rows
 /// and [`MAX_SHOWN_COLS`] columns (each element in `unit` when given); only those are formatted.
 /// An element that can't be formatted is named, counted from `origin`.
 fn format_data(d: &Data, unit: Option<&str>, sys: UnitSystem, p: Precision, origin: u8) -> Result<Shown, CalcError> {
@@ -1101,8 +1101,12 @@ fn format_data(d: &Data, unit: Option<&str>, sys: UnitSystem, p: Precision, orig
             })?;
             Ok(Shown::Grid { rows, cols, items, unit, total_rows: g.rows, total_cols: g.cols })
         }
-        // Showing text is a later step.
-        Data::Text(_) | Data::TextGrid(_) => Err(text_use(d.text().unwrap_or_default(), "in a display")),
+        Data::Text(t) => Ok(Shown::Text(t.clone())),
+        Data::TextGrid(g) => {
+            let (rows, cols) = (g.rows.min(MAX_SHOWN_ROWS), g.cols.min(MAX_SHOWN_COLS));
+            let items: Vec<String> = (0..rows).filter_map(|r| g.items.get(r.saturating_mul(g.cols)..)?.get(..cols)).flatten().cloned().collect();
+            Ok(Shown::TextGrid { rows, cols, items, total_rows: g.rows, total_cols: g.cols })
+        }
     }
 }
 
@@ -1140,6 +1144,7 @@ fn field_result(f: &FoundField, index: &Index, env: &Env, failed: &[bool], setti
     let data = match (env.data(&spec.name), spec.index) {
         _ if !valid => None,
         (Some(Data::Grid(g)), Some(at)) => array::element_at(g, env.origin(), at).map(|v| Cow::Owned(Data::One(v))),
+        (Some(Data::TextGrid(g)), Some(at)) => array::element_at(g, env.origin(), at).map(|t| Cow::Owned(Data::Text(t))),
         (Some(d), None) => Some(Cow::Borrowed(d)),
         _ => None,
     };
@@ -1157,9 +1162,29 @@ fn field_result(f: &FoundField, index: &Index, env: &Env, failed: &[bool], setti
             Err(_) => "?".to_string(),
         },
         Data::Grid(g) => quoted_list(g, unit, sys, p).unwrap_or_else(|| "?".to_string()),
-        // Showing text is a later step.
-        Data::Text(_) | Data::TextGrid(_) => "?".to_string(),
+        // A text is quoted as it is (a unit was refused above).
+        Data::Text(t) => t.clone(),
+        Data::TextGrid(g) => quoted_texts(g),
     }
+}
+
+/// A vector or matrix of texts as a quoted list, laid out as [`quoted_list`] does numbers: the
+/// first [`MAX_QUOTED_VALUES`] texts row by row, `, ` between them (`; ` between a matrix's rows),
+/// then `, … (N values)` when there are more.
+fn quoted_texts(g: &array::Grid<String>) -> String {
+    let shown = g.items.get(..MAX_QUOTED_VALUES).unwrap_or(&g.items);
+    let matrix = g.rows > 1 && g.cols > 1;
+    let mut text = String::new();
+    for (k, t) in shown.iter().enumerate() {
+        if k > 0 {
+            text.push_str(if matrix && k.checked_rem(g.cols) == Some(0) { "; " } else { ", " });
+        }
+        text.push_str(t);
+    }
+    if g.items.len() > shown.len() {
+        text.push_str(&format!(", … ({} values)", g.items.len()));
+    }
+    text
 }
 
 /// A vector or matrix as a quoted list: its first [`MAX_QUOTED_VALUES`] values row by row, `, `

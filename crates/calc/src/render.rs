@@ -22,7 +22,7 @@ use wordcraft_doc::calc::CalcState;
 use wordcraft_doc::math::{Arg, FUNCTION_NAMES, MNode, MRun, MSty, Math, parse_linear};
 use wordcraft_doc::math_linear::map_args;
 
-use crate::array::MAX_ELEMENTS;
+use crate::array::{MAX_ELEMENTS, MAX_TEXT_CHARS};
 use crate::{CalcError, Expr, Op, Stmt, funcs, parse};
 
 /// Colour of the error marker.
@@ -74,6 +74,10 @@ pub(crate) enum Shown {
     /// `unit` is `Some` when every element shares it (never empty), and the items then carry an
     /// empty unit.
     Grid { rows: usize, cols: usize, items: Vec<Formatted>, unit: Option<String>, total_rows: usize, total_cols: usize },
+    /// One text.
+    Text(String),
+    /// A vector or matrix of texts, cut as [`Shown::Grid`] is.
+    TextGrid { rows: usize, cols: usize, items: Vec<String>, total_rows: usize, total_cols: usize },
 }
 
 /// The linear-format text shown for the calculation `stmt_src`, with its result `shown` (when
@@ -129,7 +133,8 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
         match shown {
             None => push_value(&Formatted { number: "?".into(), unit: String::new() }, &mut linear, &mut result),
             Some(Shown::One(f)) => push_value(f, &mut linear, &mut result),
-            Some(grid @ Shown::Grid { .. }) => push_grid(grid, &mut linear, &mut result),
+            Some(Shown::Text(t)) => push_text(t, &mut linear, &mut result),
+            Some(grid @ (Shown::Grid { .. } | Shown::TextGrid { .. })) => push_grid(grid, &mut linear, &mut result),
         }
         if stale {
             result = paint(result, STALE_GREY);
@@ -155,16 +160,55 @@ fn push_unit(text: &str, linear: &mut String, math: &mut Arg) {
     }
 }
 
-/// A vector or matrix result ([`Shown::Grid`]): a bracketed matrix of its items, `cols` to a row;
-/// a [`COL_CUT`] cell after each row when columns were cut, a [`CUT`] row when rows were (with a
-/// [`CORNER`] under the column cut); then the shared unit and, when cut, the full size.
+/// A text in straight quotes, as linear text and as one upright run: the quote marks are part of
+/// the run, so the text reads as text and is never read as mathematics.
+fn push_text(text: &str, linear: &mut String, math: &mut Arg) {
+    linear.push_str(&format!("\"{text}\""));
+    math.push(MNode::Run(text_run(text)));
+}
+
+/// A vector or matrix result ([`Shown::Grid`], or [`Shown::TextGrid`] of texts): a bracketed matrix
+/// of its items, `cols` to a row; a [`COL_CUT`] cell after each row when columns were cut, a
+/// [`CUT`] row when rows were (with a [`CORNER`] under the column cut); then the shared unit and,
+/// when cut, the full size.
 ///
 /// The tree is built cell by cell rather than parsed from the whole linear text, so every cell
 /// shown is drawn (the linear parser stops at a bound on its work) and each costs the same.
 fn push_grid(shown: &Shown, linear: &mut String, math: &mut Arg) {
-    let Shown::Grid { rows, cols, items, unit, total_rows, total_cols } = shown else { return };
-    let (rows, cols, total_rows, total_cols) = (*rows, (*cols).max(1), *total_rows, *total_cols);
-    let (cut_rows, cut_cols) = (total_rows > rows, total_cols > cols);
+    let (rows, cols, total_rows, total_cols) = match shown {
+        Shown::Grid { rows, cols, items, unit, total_rows, total_cols } => {
+            push_cells(items, (*rows, *cols), (*total_rows, *total_cols), push_value, linear, math);
+            push_unit(unit.as_deref().unwrap_or_default(), linear, math);
+            (*rows, *cols, *total_rows, *total_cols)
+        }
+        Shown::TextGrid { rows, cols, items, total_rows, total_cols } => {
+            push_cells(items, (*rows, *cols), (*total_rows, *total_cols), |t: &String, l: &mut String, m: &mut Arg| push_text(t, l, m), linear, math);
+            (*rows, *cols, *total_rows, *total_cols)
+        }
+        Shown::One(_) | Shown::Text(_) => return,
+    };
+    let cols = cols.max(1);
+    let size = match (total_rows > rows, total_cols > cols) {
+        (true, true) => format!("({total_rows} rows × {total_cols} columns)"),
+        (true, false) => format!("({total_rows} rows)"),
+        (false, true) => format!("({total_cols} columns)"),
+        (false, false) => String::new(),
+    };
+    push_unit(&size, linear, math);
+}
+
+/// The bracketed matrix of `items` (`shape` is the rows and columns shown, `total` those of the
+/// whole result), each item written by `put`; the cut row and column when `total` is larger.
+fn push_cells<T>(
+    items: &[T],
+    shape: (usize, usize),
+    total: (usize, usize),
+    put: impl Fn(&T, &mut String, &mut Arg),
+    linear: &mut String,
+    math: &mut Arg,
+) {
+    let (rows, cols) = (shape.0, shape.1.max(1));
+    let (cut_rows, cut_cols) = (total.0 > rows, total.1 > cols);
     let mark = |text: &str| vec![MNode::Run(MRun::new(text))];
     let mut matrix: Vec<Vec<Arg>> = Vec::with_capacity(rows.saturating_add(1));
     linear.push_str("[■(");
@@ -178,7 +222,7 @@ fn push_grid(shown: &Shown, linear: &mut String, math: &mut Arg) {
                 linear.push('&');
             }
             let mut cell = Vec::new();
-            push_value(item, linear, &mut cell);
+            put(item, linear, &mut cell);
             cells.push(cell);
         }
         if cut_cols {
@@ -201,14 +245,6 @@ fn push_grid(shown: &Shown, linear: &mut String, math: &mut Arg) {
     }
     linear.push_str(")]");
     math.push(bracketed(matrix));
-    push_unit(unit.as_deref().unwrap_or_default(), linear, math);
-    let size = match (cut_rows, cut_cols) {
-        (true, true) => format!("({total_rows} rows × {total_cols} columns)"),
-        (true, false) => format!("({total_rows} rows)"),
-        (false, true) => format!("({total_cols} columns)"),
-        (false, false) => String::new(),
-    };
-    push_unit(&size, linear, math);
 }
 
 /// A matrix of `rows` of cells in square brackets, as Word's linear format builds `[■(…)]`.
@@ -301,20 +337,43 @@ pub(crate) fn unnumbered(nodes: &[MNode]) -> Option<Arg> {
     Some(out)
 }
 
-/// The result shown in a display made by [`rendered`] (`…=600 "psi"`, `…=[■(0.84@1.05)] "in"`),
-/// read back from its linear text; `None` when the text doesn't end in a result [`rendered`]
-/// could have written. The text comes from files, so the work is bounded by its length, and a
-/// result longer than any [`rendered`] writes is no result.
+/// The result shown in a display made by [`rendered`] (`…=600 "psi"`, `…=[■(0.84@1.05)] "in"`,
+/// `…="OK"`, `…=[■("OK"@"NG")]`), read back from its linear text; `None` when the text doesn't end
+/// in a result [`rendered`] could have written. The text comes from files, so the work is bounded
+/// by its length, and a result longer than any [`rendered`] writes is no result.
+///
+/// The result follows the last `=` or `≈` outside quotes: units and texts are quoted and have no
+/// quote inside, so a text holding an `=` (or an `&`, `@`, `)`) is never taken for the result's
+/// start or end.
 pub(crate) fn shown_result(linear: &str) -> Option<Shown> {
     let linear = linear.strip_suffix('#').unwrap_or(linear);
-    let (_, tail) = linear.rsplit_once('=')?;
+    let mut quoted = false;
+    let mut start = None;
+    for (i, c) in linear.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '=' | '≈' if !quoted => start = Some(i + c.len_utf8()),
+            _ => {}
+        }
+    }
+    let tail = linear.get(start?..)?;
     if tail.len() > MAX_RESULT_BYTES {
         return None;
     }
-    match tail.strip_prefix("[■(") {
-        Some(grid) => grid_result(grid),
-        None => value_result(tail).map(Shown::One),
+    if let Some(grid) = tail.strip_prefix("[■(") {
+        return grid_result(grid);
     }
+    if tail.starts_with('"') {
+        return quoted_text(tail).map(|t| Shown::Text(t.to_string()));
+    }
+    value_result(tail).map(Shown::One)
+}
+
+/// A text in straight quotes (`"OK"`), without them; `None` when there is anything else, or a
+/// quote or more characters inside than a text holds.
+fn quoted_text(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+    (!inner.contains('"') && inner.chars().take(MAX_TEXT_CHARS + 1).count() <= MAX_TEXT_CHARS).then_some(inner)
 }
 
 /// A number and its unit (`600 "psi"`, `1.5×〖10〗^(-5)`) read back.
@@ -410,6 +469,14 @@ fn grid_result(text: &str) -> Option<Shown> {
     if total_rows.checked_mul(total_cols).is_none_or(|all| all > MAX_ELEMENTS) {
         return None;
     }
+    // Cells of text (quoted) take no unit; cells of numbers are all numbers.
+    if rows.first().and_then(|r| r.first()).is_some_and(|c| c.starts_with('"')) {
+        if unit.is_some() {
+            return None;
+        }
+        let items = rows.into_iter().flatten().map(|c| quoted_text(c).map(str::to_string)).collect::<Option<Vec<_>>>()?;
+        return Some(Shown::TextGrid { rows: shown, cols, items, total_rows, total_cols });
+    }
     let items = rows.into_iter().flatten().map(value_result).collect::<Option<Vec<_>>>()?;
     if unit.is_some() && items.iter().any(|f| !f.unit.is_empty()) {
         return None;
@@ -482,6 +549,11 @@ pub(crate) fn text_number(number: &str) -> String {
     }
 }
 
+/// A text in straight quotes as one upright run.
+fn text_run(text: &str) -> MRun {
+    unit_run(format!("\"{text}\""))
+}
+
 /// An upright run of unit text.
 fn unit_run(text: String) -> MRun {
     MRun { text, sty: Some(MSty::Plain), ..MRun::default() }
@@ -516,6 +588,8 @@ enum Kind {
     /// A subtree built apart (a matrix literal, cell by cell): the index of its node in
     /// [`Out::nodes`].
     Node(usize),
+    /// A text literal, quotes included: upright, and never read as mathematics.
+    Text,
 }
 
 /// A piece of text a sentinel stands for.
@@ -549,6 +623,14 @@ impl Out {
     fn unit(&mut self, unit: &str) {
         self.linear.push_str(&format!("\"{unit}\""));
         self.sentinel(Piece { text: unit.to_string(), kind: Kind::Unit }, &format!("\"{unit}\""));
+    }
+
+    /// A text literal: in straight quotes, one atom for the linear parser so nothing inside it is
+    /// read as mathematics.
+    fn text_literal(&mut self, text: &str) {
+        let quoted = format!("\"{text}\"");
+        self.linear.push_str(&quoted);
+        self.sentinel(Piece { text: text.to_string(), kind: Kind::Text }, &quoted);
     }
 
     /// Name text: a sentinel when UnicodeMath could read part of it as a function name.
@@ -842,8 +924,7 @@ fn write_expr(root: &Expr, out: &mut Out) {
         };
         match e {
             Expr::Num(v) => out.text(&num_text(*v)),
-            // Plainly quoted for now; the display of text is a later step.
-            Expr::Text(s) => out.text(&format!("“{s}”")),
+            Expr::Text(s) => out.text_literal(s),
             Expr::Name(n) if is_unit(n) => out.unit(n),
             Expr::Name(n) => out.name(n),
             Expr::Quantity(v, unit) => {
@@ -1034,6 +1115,7 @@ fn piece_run(piece: &Piece, prev: Option<char>, pieces: &[Piece], template: &MRu
         Kind::Upright => MRun { text: piece.text.clone(), sty: Some(MSty::Plain), ..template.clone() },
         // Replaced by its node in `restore_pieces`; never a run.
         Kind::Node(_) => MRun { text: String::new(), ..template.clone() },
+        Kind::Text => MRun { color: template.color, ..text_run(&piece.text) },
     }
 }
 

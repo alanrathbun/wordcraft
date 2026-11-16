@@ -173,3 +173,55 @@ proptest! {
         let _ = shown_result(&s);
     }
 }
+
+fn display_of(src: &str, shown: Option<&Shown>) -> Rendered {
+    rendered(&parse(src), src, shown, &CalcState::Fresh)
+}
+
+/// Every run in a math tree, at any depth.
+fn runs(nodes: &[MNode]) -> Vec<MRun> {
+    let mut out = Vec::new();
+    let mut todo: Vec<&MNode> = nodes.iter().collect();
+    while let Some(n) = todo.pop() {
+        match n {
+            MNode::Run(r) => out.push(r.clone()),
+            MNode::Frac { num, den, .. } => todo.extend(num.iter().chain(den.iter())),
+            MNode::Script { base, sub, sup, .. } => todo.extend(base.iter().chain(sub.iter()).chain(sup.iter())),
+            MNode::Rad { deg, e, .. } => todo.extend(deg.iter().chain(e.iter())),
+            MNode::Delim { elems, .. } => todo.extend(elems.iter().flatten()),
+            MNode::Func { name, e } => todo.extend(name.iter().chain(e.iter())),
+            MNode::Matrix { rows, .. } => todo.extend(rows.iter().flatten().flatten()),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn text_results_round_trip() {
+    for shown in [
+        Shown::Text("OK".into()),
+        Shown::Text("Use t = 0.2 in (min) & check @ site".into()),
+        Shown::TextGrid { rows: 3, cols: 1, items: vec!["OK".into(), "a = b".into(), "x)]".into()], total_rows: 3, total_cols: 1 },
+        Shown::TextGrid { rows: 50, cols: 1, items: vec!["NG".into(); 50], total_rows: 60, total_cols: 1 },
+    ] {
+        assert_eq!(shown_result(&shown_linear(&shown)), Some(shown));
+    }
+}
+
+#[test]
+fn text_shows_in_quotes() {
+    let d = display_of("c := \"OK\" =", Some(&Shown::Text("OK".into())));
+    assert!(d.linear.ends_with("=\"OK\""), "{}", d.linear);
+    assert!(runs(&d.math).iter().any(|r| r.text == "\"OK\"" && r.sty == Some(MSty::Plain)));
+}
+
+#[test]
+fn malformed_text_results_read_back_as_nothing() {
+    for linear in
+        ["x=\"", "x=\"a\"b\"", "x=\"a\" \"in\"", "x=[■(\"a\"@1)]", "x=[■(1@\"a\")]", "x=[■(\"a\")] \"in\"", "x=[■(\"a\"", "x=[■(\"a)]", "x=\"a\"=\"b"]
+    {
+        assert_eq!(shown_result(linear), None, "{linear}");
+    }
+    assert_eq!(shown_result("x≔\"a=b\"≈\"c\""), Some(Shown::Text("c".into())));
+}

@@ -1890,3 +1890,27 @@ fn a_quoted_index_must_pick_an_element() {
     // No value now: checked when it has one.
     assert_eq!(check_quote_index(&d, "bad", (0, None)), Ok(()));
 }
+
+#[test]
+fn text_results_show_and_quote() {
+    let mut d = doc_with(&["c := \"OK\" =", "v := [\"OK\", \"NG\", \"OK\"] ="]);
+    d.body.push(para_block(para(vec![
+        field(&quote("c", None, None, None)),
+        field(&quote("v", None, None, None)),
+        field(&quote("v", None, None, Some((1, None)))),
+    ])));
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 1).1.ends_with("=\"OK\""));
+    assert!(region(&d, 2).1.ends_with("=[■(\"OK\"@\"NG\"@\"OK\")]"), "{}", region(&d, 2).1);
+    assert_eq!(field_results(&d), ["OK", "OK, NG, OK", "NG"]);
+    assert!(check_quote_unit(&d, "c", "in").unwrap_err().to_string().contains("can't be used with a unit"));
+    // Stale: the text result is read back and shown with ≈.
+    mark_stale(&mut d);
+    assert!(region(&d, 1).1.ends_with("≈\"OK\""));
+
+    // A text with `=` and `&` in it reads back too.
+    let mut d = doc_with(&["c := \"t = 0.2 & up\" ="]);
+    recalc(&mut d, &no_page);
+    mark_stale(&mut d);
+    assert!(region(&d, 1).1.ends_with("≈\"t = 0.2 & up\""), "{}", region(&d, 1).1);
+}
