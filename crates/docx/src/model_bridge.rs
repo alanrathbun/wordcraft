@@ -120,6 +120,8 @@ fn table_value_from_shared(source: craft_wordmodel::table::Table, graphics: &mut
         grid: source.grid,
         rows: source.rows.into_iter().map(|r| row_value_from_shared(r, graphics)).collect::<Result<_, _>>()?,
         controls: convert(source.controls)?,
+        // The calculation-data mark is read from the content control and store, not from the table.
+        calc: None,
     })
 }
 

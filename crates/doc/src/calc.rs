@@ -40,6 +40,28 @@ impl CalcRegion {
     }
 }
 
+/// A document table marked as calculation data: each column defines a global column vector named
+/// by its heading (`D_o (in)`), of the values in the rows below it. What a table carries when it is
+/// marked; the recalculation pass rewrites `errors`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CalcTable {
+    /// Stable within the document, in an id space of its own (separate from regions' ids).
+    pub id: u64,
+    /// What is wrong with the table's data as of the last recalculation; empty when every column
+    /// reads. Never written into the table's text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ColumnError>,
+}
+
+/// One error of a [`CalcTable`]: about the column `col` (counted from 0), or the whole table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnError {
+    /// The column, counted from 0; `None` for an error about the whole table.
+    pub col: Option<u32>,
+    /// What is wrong, written for the author (`D_o row 2 isn't a number`).
+    pub message: String,
+}
+
 /// Where a [`CalcRegion`] stands with respect to its displayed result.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum CalcState {

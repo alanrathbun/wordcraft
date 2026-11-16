@@ -5,20 +5,26 @@
 //! and text boxes are skipped, as is tracked-deleted content. The pass reads the whole document
 //! first and changes only the objects whose display, state or id actually changes, so plain
 //! equations and untouched paragraphs stay exactly as they were (and shared, for undo).
+//!
+//! A body table marked as calculation data ([`CalcTable`]) defines one column vector per column
+//! (see [`crate::tables`]). Its columns are definitions like regions', placed at the table's
+//! position in the document (before anything inside it); what is wrong with them is written to
+//! the table's [`CalcTable::errors`], never into its text.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use craft_units::{Formatted, Precision, Quantity, Scale, UnitError, UnitSystem, format, parse_unit};
-use wordcraft_doc::calc::{self, CalcSettings, CalcState, QuoteSpec, parse_calc_field};
+use wordcraft_doc::calc::{self, CalcSettings, CalcState, CalcTable, ColumnError, GMeans, QuoteSpec, parse_calc_field};
 use wordcraft_doc::math::Arg;
 use wordcraft_doc::para::OBJ;
-use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph};
+use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph, Row, Table};
 
 use crate::array::{self, Data};
 use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, run_stmt_in};
 use crate::render::{self, MAX_SHOWN_COLS, MAX_SHOWN_ROWS, Rendered, Shown, rendered, shown_result, shows_value};
+use crate::tables;
 use crate::{CalcError, Env, Stmt, check_name, defined_name, free_names, parse};
 
 /// What a [`recalc`] pass did.
@@ -55,14 +61,20 @@ const MAX_QUOTED_VALUES: usize = 50;
 ///    and every quoted value of it shows `?`.
 /// 6. Rewrites the result of every `WCCALC` field quoting a value; one with no valid value
 ///    shows `?`.
+/// 7. Writes each data table's errors to its [`CalcTable`] (and a fresh id to a pasted copy), only
+///    when they change. A data table's columns take part in steps 3 and 4 like regions defining
+///    their names, at the table's place; a calculation using a column in error is an upstream
+///    table error ("depends on table data with an error").
 ///
 /// Never panics; any document, however malformed, gives a report.
 pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> RecalcReport {
     let settings = doc.calc_settings.clone().unwrap_or_default();
     let found = collect(&doc.body);
     let (ids, reassigned_ids) = assign_ids(&found);
+    let table_ids = assign_table_ids(&found);
     let regions = &found.regions;
-    let index = Index::build(regions, &ids, page_of);
+    let tables = read_tables(&doc.body, &found.tables, &settings);
+    let index = Index::build(regions, &ids, &tables, page_of);
     let (env, outcomes, failed) = evaluate(&index, &settings);
 
     let mut errors = 0;
@@ -99,8 +111,20 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
         let result = field_result(f, &index, &env, &failed, &settings);
         edits.push(Edit { at: f.at.clone(), change: Change::Field { result } });
     }
+    let table_edits = table_changes(&found.tables, &table_ids, &tables, &index, &outcomes);
     apply(&mut doc.body, edits);
+    apply_tables(&mut doc.body, table_edits);
     RecalcReport { regions: regions.len(), errors, reassigned_ids, edited }
+}
+
+/// Every live calculation data table of the body (tables in table cells too, tracked deletions
+/// left out) in document order: the path of its block (body block index, then row, cell and block
+/// index for each table level) and the id [`recalc`] gives it (a repeated id, from a pasted copy,
+/// already replaced by the next id above the largest). Table ids are an id space of their own.
+pub fn data_tables(doc: &Document) -> Vec<(Vec<u32>, u64)> {
+    let found = collect(&doc.body);
+    let ids = assign_table_ids(&found);
+    found.tables.into_iter().zip(ids).map(|(t, id)| (t.path, id)).collect()
 }
 
 /// Every live calculation region of the body (table cells to any depth, tracked deletions left
@@ -128,21 +152,25 @@ pub fn body_regions(doc: &Document) -> Vec<(Vec<u32>, usize, calc::CalcRegion)> 
 /// single value); ids are the ones [`recalc`] gives, a repeated id already replaced.
 pub fn defined_names(doc: &Document) -> Vec<(String, u64)> {
     let (ids, index) = names_of(doc);
+    // A data table's columns have no region's id: they are left out here.
     let mut names: Vec<(String, u64)> = index
         .owners
         .iter()
-        .filter(|&(_, &i)| matches!(index.parsed.get(i), Some(Ok(Stmt::Define { params, .. })) if params.is_empty()))
+        .filter(|&(_, &i)| index.is_region(i) && matches!(index.parsed.get(i), Some(Ok(Stmt::Define { params, .. })) if params.is_empty()))
         .map(|(name, &i)| (name.clone(), ids.get(i).copied().unwrap_or(0)))
         .collect();
     names.sort();
     names
 }
 
-/// The regions' ids as [`recalc`] gives them (a repeated id replaced) and who owns each name.
+/// The regions' ids as [`recalc`] gives them (a repeated id replaced) and who owns each name
+/// (data table columns included).
 fn names_of(doc: &Document) -> (Vec<u64>, Index) {
     let found = collect(&doc.body);
     let (ids, _) = assign_ids(&found);
-    let index = Index::build(&found.regions, &ids, &|_| None);
+    let settings = doc.calc_settings.clone().unwrap_or_default();
+    let tables = read_tables(&doc.body, &found.tables, &settings);
+    let index = Index::build(&found.regions, &ids, &tables, &|_| None);
     (ids, index)
 }
 
@@ -152,9 +180,7 @@ fn names_of(doc: &Document) -> (Vec<u64>, Index) {
 /// value now (an error) is checked when it has one; until then the quoted value shows `?`.
 pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), CalcError> {
     parse_unit(unit)?;
-    let found = collect(&doc.body);
-    let (ids, _) = assign_ids(&found);
-    let index = Index::build(&found.regions, &ids, &|_| None);
+    let (_, index) = names_of(doc);
     let settings = doc.calc_settings.clone().unwrap_or_default();
     let (env, _, _) = evaluate(&index, &settings);
     env.check_display_unit(unit)?;
@@ -167,14 +193,19 @@ pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), Ca
 /// Whether `name` may be given to a new calculation, or to the region `editing` (whose own
 /// definition of the name doesn't count): [`CalcError::ReservedName`] for a unit, function or
 /// constant name, [`CalcError::Duplicate`] when another region already owns it (a variable or a
-/// function).
+/// function) or a data table's column does.
 pub fn check_new_name(doc: &Document, name: &str, editing: Option<u64>) -> Result<(), CalcError> {
     check_name(name)?;
     // Ids as recalculation gives them, so a pasted copy's repeated id can't stand for its owner.
     let (ids, index) = names_of(doc);
-    match index.owners.get(name).and_then(|&i| ids.get(i)) {
-        Some(&owner) if Some(owner) != editing => Err(CalcError::Duplicate { name: name.to_string(), page: None }),
-        _ => Ok(()),
+    let duplicate = || Err(CalcError::Duplicate { name: name.to_string(), page: None });
+    match index.owners.get(name) {
+        Some(&i) if !index.is_region(i) => duplicate(),
+        Some(&i) => match ids.get(i) {
+            Some(&owner) if Some(owner) != editing => duplicate(),
+            _ => Ok(()),
+        },
+        None => Ok(()),
     }
 }
 
@@ -246,6 +277,15 @@ struct FoundField {
     spec: QuoteSpec,
 }
 
+/// A live calculation data table of the body.
+pub(crate) struct FoundTable {
+    /// The path of its block: body block index, then row, cell and block index for each table level.
+    pub(crate) path: Vec<u32>,
+    pub(crate) id: u64,
+    /// The errors it carries now.
+    errors: Vec<ColumnError>,
+}
+
 #[derive(Default)]
 pub(crate) struct Found {
     pub(crate) regions: Vec<FoundRegion>,
@@ -254,36 +294,52 @@ pub(crate) struct Found {
     deleted_ids: Vec<u64>,
     /// Where each tracked-deleted region is, with its id (in document order).
     pub(crate) deleted: Vec<(At, u64)>,
+    /// Calculation data tables, in document order (a table before anything inside it).
+    pub(crate) tables: Vec<FoundTable>,
+    /// Ids of tracked-deleted data tables: never reused for a reassigned id.
+    deleted_table_ids: Vec<u64>,
 }
 
-/// The calculation regions and quoted values of the body, in document order.
+/// The calculation regions, quoted values and calculation data tables of the body, in document
+/// order.
 pub(crate) fn collect(body: &Blocks) -> Found {
     let mut found = Found::default();
-    walk_paras(body, &mut |path, p| visit(path, p, &mut found));
+    walk_blocks(body, &mut |path, b| match b {
+        Block::Para(p) => visit(path, p, &mut found),
+        Block::Table(t) => visit_table(path, t, &mut found),
+    });
     found
 }
 
 /// Every paragraph of `blocks` in document order (table cells row by row, to any depth), with its
 /// path: block index, then row, cell and block index for each table level.
 fn walk_paras<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&[u32], &'a Paragraph)) {
+    walk_blocks(blocks, &mut |path, b| {
+        if let Block::Para(p) = b {
+            f(path, p);
+        }
+    });
+}
+
+/// Every paragraph and table of `blocks` in document order (a table, then its cells row by row,
+/// to any depth), with its path: block index, then row, cell and block index for each table level.
+fn walk_blocks<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&[u32], &'a Block)) {
     for (i, b) in blocks.iter().enumerate() {
         let top = u32::try_from(i).unwrap_or(u32::MAX);
         match &**b {
-            Block::Para(p) => f(&[top], p),
+            Block::Para(_) => f(&[top], b),
             Block::Table(_) => {
                 // An explicit stack, last first, so cells come off it row by row.
                 let mut todo: Vec<(&Block, Vec<u32>)> = vec![(&**b, vec![top])];
                 while let Some((b, path)) = todo.pop() {
-                    match b {
-                        Block::Para(p) => f(&path, p),
-                        Block::Table(t) => {
-                            for (r, row) in t.rows.iter().enumerate().rev() {
-                                for (c, cell) in row.cells.iter().enumerate().rev() {
-                                    for (j, cb) in cell.blocks.iter().enumerate().rev() {
-                                        let mut inner = path.clone();
-                                        inner.extend([r, c, j].map(|k| u32::try_from(k).unwrap_or(u32::MAX)));
-                                        todo.push((&**cb, inner));
-                                    }
+                    f(&path, b);
+                    if let Block::Table(t) = b {
+                        for (r, row) in t.rows.iter().enumerate().rev() {
+                            for (c, cell) in row.cells.iter().enumerate().rev() {
+                                for (j, cb) in cell.blocks.iter().enumerate().rev() {
+                                    let mut inner = path.clone();
+                                    inner.extend([r, c, j].map(|k| u32::try_from(k).unwrap_or(u32::MAX)));
+                                    todo.push((&**cb, inner));
                                 }
                             }
                         }
@@ -292,6 +348,42 @@ fn walk_paras<'a>(blocks: &'a Blocks, f: &mut dyn FnMut(&[u32], &'a Paragraph)) 
             }
         }
     }
+}
+
+/// Note `t` when it is calculation data: live, or (its text all tracked-deleted) its id kept from
+/// reuse.
+fn visit_table(path: &[u32], t: &Table, found: &mut Found) {
+    let Some(c) = &t.calc else { return };
+    if inside_deletion(t) {
+        found.deleted_table_ids.push(c.id);
+    } else {
+        found.tables.push(FoundTable { path: path.to_vec(), id: c.id, errors: c.errors.clone() });
+    }
+}
+
+/// Whether `t` sits inside a tracked deletion: it has text and all of it, at any depth, is
+/// tracked-deleted (the model has no tracked table deletion; deleting a table with tracking on
+/// marks its text deleted).
+fn inside_deletion(t: &Table) -> bool {
+    let (mut live, mut deleted) = (false, false);
+    for cell in t.rows.iter().flat_map(|r| &r.cells) {
+        walk_paras(&cell.blocks, &mut |_, p| {
+            for (range, props) in p.run_ranges() {
+                if range.is_empty() {
+                    continue;
+                }
+                if props.del.is_some() {
+                    deleted = true;
+                } else {
+                    live = true;
+                }
+            }
+        });
+        if live {
+            return false;
+        }
+    }
+    deleted
 }
 
 /// Whether `o` is a calculation region or a quoted value (`WCCALC` field; the field type is the
@@ -312,16 +404,62 @@ pub fn is_calc_object(o: &InlineObject) -> bool {
 /// it writes (so a display or quoted value changed by anything else is drawn again).
 #[derive(PartialEq)]
 enum Item<'a> {
-    Region { story: Option<u32>, deleted: bool, region: &'a calc::CalcRegion, linear: &'a str },
-    Field { story: Option<u32>, deleted: bool, instr: &'a str, result: &'a str, dirty: bool },
+    Region {
+        story: Option<u32>,
+        deleted: bool,
+        region: &'a calc::CalcRegion,
+        linear: &'a str,
+    },
+    Field {
+        story: Option<u32>,
+        deleted: bool,
+        instr: &'a str,
+        result: &'a str,
+        dirty: bool,
+    },
+    /// A calculation data table: what it reads (its rows) and what the pass writes (its errors).
+    Table {
+        story: Option<u32>,
+        data: &'a CalcTable,
+        rows: Rows<'a>,
+    },
 }
 
-/// Every calculation object of `doc` in document order: the body's, then each other story's.
+/// A data table's rows as [`calc_unchanged`] compares them: each cell's blocks by address first
+/// (an edit copies only the blocks it changes), then by value.
+struct Rows<'a>(&'a [Row]);
+
+impl PartialEq for Rows<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().zip(other.0).all(|(a, b)| {
+                a.props == b.props
+                    && a.cells.len() == b.cells.len()
+                    && a.cells.iter().zip(&b.cells).all(|(x, y)| {
+                        x.props == y.props
+                            && x.blocks.len() == y.blocks.len()
+                            && x.blocks.iter().zip(&y.blocks).all(|(p, q)| Arc::ptr_eq(p, q) || p == q)
+                    })
+            })
+    }
+}
+
+/// Every calculation object and data table of `doc` in document order (a table before its
+/// cells): the body's, then each other story's.
 fn items(doc: &Document) -> Vec<Item<'_>> {
     let mut out = Vec::new();
     let stories = std::iter::once((None, &doc.body)).chain(doc.parts.iter().map(|(&k, part)| (Some(k), &part.blocks)));
     for (story, blocks) in stories {
-        walk_paras(blocks, &mut |_, p| {
+        walk_blocks(blocks, &mut |_, b| {
+            let p = match b {
+                Block::Para(p) => p,
+                Block::Table(t) => {
+                    if let Some(data) = &t.calc {
+                        out.push(Item::Table { story, data, rows: Rows(&t.rows) });
+                    }
+                    return;
+                }
+            };
             if !p.objects.iter().any(is_calc_object) {
                 return;
             }
@@ -343,11 +481,12 @@ fn items(doc: &Document) -> Vec<Item<'_>> {
 }
 
 /// Whether the pass has nothing to do after a command turned `before` into `after`: the same
-/// calculation settings and the same calculation objects in the same order (each region's id,
-/// source, unit, precision, state and display; each quoted value's code and result; whether
-/// each is tracked-deleted and which story it is in), and, in automatic mode, no result out of
-/// date. Typing ordinary text leaves all of that alone, so it costs no recalculation (and in
-/// manual mode marks nothing stale).
+/// calculation settings and the same calculation objects and data tables in the same order (each
+/// region's id, source, unit, precision, state and display; each quoted value's code and result;
+/// whether each is tracked-deleted and which story it is in; each data table's id, errors and
+/// rows), and, in automatic mode, no result out of date. Typing ordinary text outside data
+/// tables leaves all of that alone, so it costs no recalculation (and in manual mode marks
+/// nothing stale).
 pub fn calc_unchanged(before: &Document, after: &Document) -> bool {
     if before.calc_settings != after.calc_settings {
         return false;
@@ -470,17 +609,31 @@ fn visit(path: &[u32], p: &Paragraph, found: &mut Found) {
 /// Each region's id, the first of any repeated id kept and the rest given the next unused one;
 /// and how many were reassigned.
 pub(crate) fn assign_ids(found: &Found) -> (Vec<u64>, usize) {
-    let mut used: HashSet<u64> = found.regions.iter().map(|r| r.id).chain(found.deleted_ids.iter().copied()).collect();
+    let ids: Vec<u64> = found.regions.iter().map(|r| r.id).collect();
+    unique_ids(&ids, &found.deleted_ids)
+}
+
+/// Each data table's id, as [`assign_ids`] gives regions theirs. Tables have an id space of
+/// their own.
+fn assign_table_ids(found: &Found) -> Vec<u64> {
+    let ids: Vec<u64> = found.tables.iter().map(|t| t.id).collect();
+    unique_ids(&ids, &found.deleted_table_ids).0
+}
+
+/// `ids` with the first of any repeated id kept and the rest given the next one above the
+/// largest (of `ids` and `reserved`), or the lowest unused when the top of the range is taken;
+/// and how many were reassigned.
+fn unique_ids(ids: &[u64], reserved: &[u64]) -> (Vec<u64>, usize) {
+    let mut used: HashSet<u64> = ids.iter().chain(reserved).copied().collect();
     let mut next = used.iter().max().and_then(|m| m.checked_add(1));
     let mut probe: u64 = 0;
     let mut seen: HashSet<u64> = HashSet::new();
     let mut reassigned = 0;
-    let ids = found
-        .regions
+    let ids = ids
         .iter()
-        .map(|r| {
-            if seen.insert(r.id) {
-                return r.id;
+        .map(|&old| {
+            if seen.insert(old) {
+                return old;
             }
             reassigned += 1;
             let id = match next {
@@ -509,46 +662,125 @@ pub(crate) fn assign_ids(found: &Found) -> (Vec<u64>, usize) {
 // Names and evaluation
 // ---------------------------------------------------------------------------------------------
 
-/// Parsed regions and who owns each name.
+/// The definitions one live data table makes.
+struct TableDefs {
+    /// The path of the table's block.
+    path: Vec<u32>,
+    /// Each column (counted from 0): the name its heading gives, when it reads (also when the
+    /// values don't, so the name is owned and its users are told the table has an error), and
+    /// its definition.
+    cols: Vec<(u32, Option<String>, Result<Stmt, CalcError>)>,
+    /// An error for the whole table.
+    error: Option<CalcError>,
+}
+
+/// The definitions each live data table of `body` makes, read with the document's meaning of `g`.
+fn read_tables(body: &Blocks, tables: &[FoundTable], settings: &CalcSettings) -> Vec<TableDefs> {
+    let g_is_gravity = settings.g == GMeans::Gravity;
+    tables
+        .iter()
+        .map(|ft| {
+            let Some(t) = table_at(body, &ft.path) else { return TableDefs { path: ft.path.clone(), cols: Vec::new(), error: None } };
+            let (stmts, error) = tables::column_stmts(t, g_is_gravity);
+            let cols = stmts
+                .into_iter()
+                .map(|(col, stmt)| {
+                    let name = match &stmt {
+                        Ok(stmt) => defined_name(stmt).map(str::to_string),
+                        Err(_) => tables::column_name(t, col),
+                    };
+                    (col, name, stmt)
+                })
+                .collect();
+            TableDefs { path: ft.path.clone(), cols, error }
+        })
+        .collect()
+}
+
+/// Every definition, parsed, and who owns each name. The definitions are the regions, in
+/// document order, then the data tables' columns, table by table; `order` lists them all in
+/// document order, a table's columns at the table's place (before anything inside it).
 struct Index {
     parsed: Vec<Result<Stmt, CalcError>>,
-    /// An error found before evaluation: parse, reserved name or duplicate.
+    /// An error found before evaluation: parse, reserved name, duplicate, or a column whose
+    /// values don't read.
     early: Vec<Option<CalcError>>,
-    /// Name → index of the region that owns it.
+    /// Name → index of the definition that owns it.
     owners: HashMap<String, usize>,
     /// Regions edited outside the calculator: they keep owning their name but define nothing.
     edited: Vec<bool>,
     /// Each region's own precision.
     precision: Vec<Option<u8>>,
+    /// The name each definition defines: a region's, or a column's heading (also when the
+    /// column's values don't read).
+    names: Vec<Option<String>>,
+    /// How many definitions are regions (the first ones).
+    regions: usize,
+    /// Each column definition (index `regions + k`): its table (index into the tables read) and
+    /// column.
+    columns: Vec<(usize, u32)>,
+    /// Every definition, in document order.
+    order: Vec<usize>,
 }
 
 impl Index {
-    fn build(regions: &[FoundRegion], ids: &[u64], page_of: &dyn Fn(u64) -> Option<u32>) -> Index {
-        let parsed: Vec<Result<Stmt, CalcError>> = regions.iter().map(|r| parse(&r.source)).collect();
+    fn build(regions: &[FoundRegion], ids: &[u64], tables: &[TableDefs], page_of: &dyn Fn(u64) -> Option<u32>) -> Index {
+        let mut parsed: Vec<Result<Stmt, CalcError>> = regions.iter().map(|r| parse(&r.source)).collect();
+        let mut names: Vec<Option<String>> = parsed.iter().map(|s| s.as_ref().ok().and_then(defined_name).map(str::to_string)).collect();
+        let mut columns = Vec::new();
+        // Where each definition is: its paragraph's path and object, or its table's path and column.
+        let mut places: Vec<(&[u32], usize, usize)> = regions.iter().enumerate().map(|(i, r)| (r.at.path.as_slice(), r.at.obj, i)).collect();
+        for (t, defs) in tables.iter().enumerate() {
+            for (col, name, stmt) in &defs.cols {
+                places.push((&defs.path, usize::try_from(*col).unwrap_or(usize::MAX), parsed.len()));
+                columns.push((t, *col));
+                names.push(name.clone());
+                parsed.push(stmt.clone());
+            }
+        }
+        // A table's path is a prefix of (so sorts before) every path inside it. Regions are in
+        // document order already; the sort is stable.
+        if !columns.is_empty() {
+            places.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        }
+        let order: Vec<usize> = places.into_iter().map(|(_, _, i)| i).collect();
         let mut owners: HashMap<String, usize> = HashMap::new();
-        let early = parsed
-            .iter()
-            .enumerate()
-            .map(|(i, stmt)| {
-                let stmt = match stmt {
-                    Ok(stmt) => stmt,
-                    Err(e) => return Some(e.clone()),
-                };
-                let name = defined_name(stmt)?;
-                if let Err(e) = check_name(name) {
-                    return Some(e);
+        let mut early: Vec<Option<CalcError>> = vec![None; parsed.len()];
+        // The first definition of a name in document order owns it.
+        for &i in &order {
+            let region = i < regions.len();
+            let own = match parsed.get(i) {
+                Some(Err(e)) => Some(e.clone()),
+                _ => None,
+            };
+            // A region with a parse error defines nothing; a column whose values don't read still
+            // owns its heading's name.
+            let name = match names.get(i).and_then(Option::as_deref) {
+                Some(name) if !(region && own.is_some()) => name,
+                _ => {
+                    if let Some(slot) = early.get_mut(i) {
+                        *slot = own;
+                    }
+                    continue;
                 }
-                if let Some(&owner) = owners.get(name) {
-                    let page = ids.get(owner).and_then(|&id| page_of(id));
-                    return Some(CalcError::Duplicate { name: name.to_string(), page });
-                }
+            };
+            let error = if let Err(e) = check_name(name) {
+                Some(e)
+            } else if let Some(&owner) = owners.get(name) {
+                // A column has no page of its own to name.
+                let page = if owner < regions.len() { ids.get(owner).and_then(|&id| page_of(id)) } else { None };
+                Some(CalcError::Duplicate { name: name.to_string(), page })
+            } else {
                 owners.insert(name.to_string(), i);
-                None
-            })
-            .collect();
-        let edited = regions.iter().map(|r| r.state == CalcState::EditedOutside).collect();
-        let precision = regions.iter().map(|r| r.precision).collect();
-        let mut index = Index { parsed, early, owners, edited, precision };
+                own
+            };
+            if let Some(slot) = early.get_mut(i) {
+                *slot = error;
+            }
+        }
+        let edited = regions.iter().map(|r| r.state == CalcState::EditedOutside).chain(columns.iter().map(|_| false)).collect();
+        let precision = regions.iter().map(|r| r.precision).chain(columns.iter().map(|_| None)).collect();
+        let mut index = Index { parsed, early, owners, edited, precision, names, regions: regions.len(), columns, order };
         // A region's own display unit applies when its source names none.
         for (stmt, r) in index.parsed.iter_mut().zip(regions) {
             if let (Ok(stmt), Some(unit)) = (stmt, r.unit.as_deref().filter(|u| !u.trim().is_empty())) {
@@ -559,6 +791,11 @@ impl Index {
             }
         }
         index
+    }
+
+    /// Whether definition `i` is a region (rather than a data table's column).
+    fn is_region(&self, i: usize) -> bool {
+        i < self.regions
     }
 }
 
@@ -573,6 +810,8 @@ struct Node {
     failed: bool,
     /// Failed because it, or a region it depends on (at any distance), was edited outside.
     edited: bool,
+    /// Failed because it is a data table's column in error, or depends on one (at any distance).
+    table: bool,
     /// Regions owning a name this one uses (itself, for `x := x + 1`).
     deps: Vec<usize>,
     /// Regions using the name this one owns.
@@ -589,22 +828,26 @@ struct Node {
 /// error (nothing is defined unless the whole statement succeeds).
 fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<bool>) {
     let mut nodes: Vec<Node> = index.early.iter().map(|e| Node { outcome: e.clone().map(Err), ..Node::default() }).collect();
-    // Edges run from the region owning a name to each region using it. Only owned names count:
-    // anything else (a unit, constant, built-in, or nothing) is left for the evaluator.
-    for (i, stmt) in index.parsed.iter().enumerate() {
-        let Ok(stmt) = stmt else { continue };
+    // Edges run from the definition owning a name to each region using it. Only owned names
+    // count: anything else (a unit, constant, built-in, or nothing) is left for the evaluator. An
+    // owner that has already failed (a data table's column in error) is waited for by nobody.
+    for &i in &index.order {
+        let Some(Ok(stmt)) = index.parsed.get(i) else { continue };
         // An edited region uses nothing: it fails on its own, whatever its source says.
         if nodes.get(i).is_none_or(|n| n.outcome.is_some()) || index.edited.get(i).copied().unwrap_or(false) {
             continue;
         }
         for name in free_names(stmt) {
             let Some(&owner) = index.owners.get(&name) else { continue };
-            if let Some(o) = nodes.get_mut(owner) {
+            let waits = nodes.get(owner).is_some_and(|o| o.outcome.is_none());
+            if waits && let Some(o) = nodes.get_mut(owner) {
                 o.users.push(i);
             }
             if let Some(node) = nodes.get_mut(i) {
                 node.deps.push(owner);
-                node.pending += 1;
+                if waits {
+                    node.pending += 1;
+                }
             }
         }
     }
@@ -614,26 +857,35 @@ fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<b
     env.set_display(unit_system(settings), Precision::new(settings.precision));
     // One budget for the whole pass: a hostile document errors instead of taking seconds.
     let pass = Pass::new(MAX_PASS_STEPS);
-    // Record that region `i` failed: using its name is then an upstream error.
+    // Record that definition `i` failed: using its name is then an upstream error.
     let fail = |env: &mut Env, node: &mut Node, i: usize| {
         node.failed = true;
-        if let Some(Ok(stmt)) = index.parsed.get(i)
-            && let Some(name) = defined_name(stmt)
+        if let Some(Some(name)) = index.names.get(i)
             && index.owners.get(name) == Some(&i)
         {
             env.mark_failed(name);
         }
     };
-    // Kahn's algorithm, in document order among the ready regions.
-    let mut ready: VecDeque<usize> = nodes.iter().enumerate().filter(|(_, n)| n.outcome.is_none() && n.pending == 0).map(|(i, _)| i).collect();
+    // A data table's column whose values don't read, but which owns its name, has failed already.
+    for (i, node) in nodes.iter_mut().enumerate().skip(index.regions) {
+        if node.outcome.is_some() {
+            node.table = true;
+            fail(&mut env, node, i);
+        }
+    }
+    // Kahn's algorithm, in document order among the ready definitions.
+    let mut ready: VecDeque<usize> =
+        index.order.iter().copied().filter(|&i| nodes.get(i).is_some_and(|n| n.outcome.is_none() && n.pending == 0)).collect();
     while let Some(i) = ready.pop_front() {
         let failed_dep =
             |edited: bool| nodes.get(i).is_some_and(|n| n.deps.iter().any(|&d| nodes.get(d).is_some_and(|dn| dn.failed && (dn.edited || !edited))));
         let (upstream, upstream_edited) = (failed_dep(false), failed_dep(true));
+        let upstream_table = nodes.get(i).is_some_and(|n| n.deps.iter().any(|&d| nodes.get(d).is_some_and(|dn| dn.failed && dn.table)));
         let own_edit = index.edited.get(i).copied().unwrap_or(false);
         let outcome = match index.parsed.get(i) {
             _ if own_edit => Err(CalcError::EditedOutside),
             _ if upstream_edited => Err(CalcError::UpstreamEdited),
+            _ if upstream_table => Err(CalcError::UpstreamTable),
             _ if upstream => Err(CalcError::Upstream),
             Some(Ok(stmt)) => run_stmt_in(&mut env, stmt, &pass).and_then(|data| {
                 let p = precision(index.precision.get(i).copied().flatten(), settings);
@@ -645,6 +897,7 @@ fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<b
         let Some(node) = nodes.get_mut(i) else { continue };
         if outcome.is_err() {
             node.edited = own_edit || upstream_edited;
+            node.table = !node.edited && (!index.is_region(i) || upstream_table);
             fail(&mut env, node, i);
         }
         node.outcome = Some(outcome);
@@ -994,6 +1247,67 @@ fn change_object(o: &mut InlineObject, change: Change) {
 fn set_nodes(math: &mut wordcraft_doc::math::Math, nodes: Arg) {
     math.nodes = nodes;
     math.omml.clear();
+}
+
+/// The table at `path`, if there is one.
+fn table_at<'a>(body: &'a Blocks, path: &[u32]) -> Option<&'a Table> {
+    let (&first, mut rest) = path.split_first()?;
+    let mut block: &Block = body.get(first as usize)?;
+    loop {
+        let Block::Table(t) = block else { return None };
+        let [r, c, j, tail @ ..] = rest else { return Some(t) };
+        block = t.rows.get(*r as usize)?.cells.get(*c as usize)?.blocks.get(*j as usize)?;
+        rest = tail;
+    }
+}
+
+/// The table at `path`, to change: only the blocks on the way to it are copied when shared.
+fn table_mut<'a>(body: &'a mut Blocks, path: &[u32]) -> Option<&'a mut Table> {
+    let (&first, mut rest) = path.split_first()?;
+    let mut block: &mut Block = Arc::make_mut(body.get_mut(first as usize)?);
+    loop {
+        let Block::Table(t) = block else { return None };
+        let [r, c, j, tail @ ..] = rest else { return Some(t) };
+        block = Arc::make_mut(t.rows.get_mut(*r as usize)?.cells.get_mut(*c as usize)?.blocks.get_mut(*j as usize)?);
+        rest = tail;
+    }
+}
+
+/// The data tables whose id or errors change, with what they become: the error for the whole
+/// table first, then each column's in order. A column left undefined by the whole table's error
+/// adds nothing of its own.
+fn table_changes(found: &[FoundTable], ids: &[u64], tables: &[TableDefs], index: &Index, outcomes: &[Outcome]) -> Vec<(Vec<u32>, CalcTable)> {
+    let mut errors: Vec<Vec<ColumnError>> =
+        tables.iter().map(|t| t.error.iter().map(|e| ColumnError { col: None, message: e.to_string() }).collect()).collect();
+    for (k, &(t, col)) in index.columns.iter().enumerate() {
+        if let Some(Err(e)) = outcomes.get(index.regions.saturating_add(k))
+            && *e != CalcError::UpstreamTable
+            && let Some(list) = errors.get_mut(t)
+        {
+            list.push(ColumnError { col: Some(col), message: e.to_string() });
+        }
+    }
+    found
+        .iter()
+        .zip(errors)
+        .enumerate()
+        .filter_map(|(k, (ft, errors))| {
+            let id = ids.get(k).copied().unwrap_or(ft.id);
+            (id != ft.id || errors != ft.errors).then(|| (ft.path.clone(), CalcTable { id, errors }))
+        })
+        .collect()
+}
+
+/// Write each data table's new id and errors (from [`table_changes`]), copying only the blocks on
+/// the way to it. The table's text is never touched.
+fn apply_tables(body: &mut Blocks, changes: Vec<(Vec<u32>, CalcTable)>) {
+    for (path, data) in changes {
+        if let Some(t) = table_mut(body, &path)
+            && t.calc.is_some()
+        {
+            t.calc = Some(Box::new(data));
+        }
+    }
 }
 
 /// Apply the edits that change something, copying only the paragraphs they touch.

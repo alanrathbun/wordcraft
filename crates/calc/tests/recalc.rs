@@ -4,9 +4,10 @@
 use craft_units::Formatted;
 use std::sync::Arc;
 use std::time::Instant;
-use wordcraft_calc::{CalcError, check_new_name, check_quote_unit, defined_names, mark_stale, recalc, render};
-use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, QuoteSpec, calc_field_instr};
+use wordcraft_calc::{CalcError, calc_unchanged, check_new_name, check_quote_unit, data_tables, defined_names, mark_stale, recalc, render};
+use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, CalcTable, ColumnError, GMeans, QuoteSpec, calc_field_instr};
 use wordcraft_doc::math::{MNode, MRun, MSty, Math};
+use wordcraft_doc::props::VMerge;
 use wordcraft_doc::{Block, Cell, CharProps, Document, InlineObject, Paragraph, Rgb, Row, Table, para_block};
 
 const ERROR_RED: Rgb = Rgb(0xC0, 0x00, 0x00);
@@ -918,7 +919,6 @@ fn one_budget_bounds_the_whole_pass() {
 
 #[test]
 fn unchanged_calculations_need_no_pass() {
-    use wordcraft_calc::calc_unchanged;
     let mut d = doc_with(&["x := 1 =", "y := x + 1 ="]);
     recalc(&mut d, &no_page);
     // Typing ordinary text.
@@ -1383,4 +1383,334 @@ fn a_long_source_keeps_all_its_text() {
             assert_eq!(text.matches(n).count(), want, "{n} in {}", &src[..40]);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Data tables
+// ---------------------------------------------------------------------------------------------
+
+/// A table marked as calculation data with id `id`, one cell per text, one paragraph per cell.
+fn data_table(id: u64, rows: &[&[&str]]) -> Table {
+    Table {
+        rows: rows.iter().map(|r| Row { cells: r.iter().map(|t| Cell::with_text(t)).collect(), ..Default::default() }).collect(),
+        grid: vec![100.0; rows.first().map_or(1, |r| r.len())],
+        calc: Some(Box::new(CalcTable { id, errors: Vec::new() })),
+        ..Default::default()
+    }
+}
+
+fn table_block(t: Table) -> Arc<Block> {
+    Arc::new(Block::Table(t))
+}
+
+/// The table at body index `at`.
+fn table_at(d: &Document, at: usize) -> &Table {
+    match &*d.body[at] {
+        Block::Table(t) => t,
+        Block::Para(_) => panic!("block {at} isn't a table"),
+    }
+}
+
+fn table_mut(d: &mut Document, at: usize) -> &mut Table {
+    match Arc::make_mut(&mut d.body[at]) {
+        Block::Table(t) => t,
+        Block::Para(_) => panic!("block {at} isn't a table"),
+    }
+}
+
+/// The calculation data of the table at body index `at`.
+fn table_calc(d: &Document, at: usize) -> CalcTable {
+    *table_at(d, at).calc.clone().unwrap()
+}
+
+/// Replace the text of cell (`r`, `c`) of the table at body index `at`.
+fn set_cell(d: &mut Document, at: usize, r: usize, c: usize, text: &str) {
+    table_mut(d, at).rows[r].cells[c].blocks = vec![para_block(Paragraph::with_text(text, CharProps::default()))];
+}
+
+fn cell_text(d: &Document, at: usize, r: usize, c: usize) -> String {
+    match &*table_at(d, at).rows[r].cells[c].blocks[0] {
+        Block::Para(p) => p.text.clone(),
+        Block::Table(_) => panic!("a nested table"),
+    }
+}
+
+const PIPES: &[&[&str]] =
+    &[&["NPS (in)", "D_o (in)", "t_nom (in)"], &["1/2", "0.840", "0.109"], &["3/4", "1.050", "0.113"], &["1", "1.315", "0.133"]];
+
+/// The B31.3 example: the pipe table (block 0), then regions 1 to 7 (blocks 1 to 7). The margin
+/// is `margin`, not `m`: `m` is the metre.
+fn pipe_doc(rows: &[&[&str]]) -> Document {
+    let sources =
+        ["P := 1000 psi", "S := 20000 psi", "E := 1", "Y := 0.4", "t_min := P·D_o/(2·(S·E + P·Y)) =", "margin := t_nom - t_min =", "min(margin) ="];
+    let mut blocks = vec![table_block(data_table(1, rows))];
+    blocks.extend(sources.iter().enumerate().map(|(i, s)| para_block(para(vec![calc_eq(i as u64 + 1, s)]))));
+    doc_of(blocks)
+}
+
+#[test]
+fn table_columns_define_vectors() {
+    let mut d = pipe_doc(PIPES);
+    let report = recalc(&mut d, &no_page);
+    assert_eq!(report.errors, 0, "{:?}", regions(&d).iter().map(|(r, ..)| r.state.clone()).collect::<Vec<_>>());
+    assert!(region(&d, 5).1.ends_with("=[■(0.021@0.026@0.032)] \"in\""), "{}", region(&d, 5).1);
+    assert!(region(&d, 6).1.ends_with("=[■(0.088@0.087@0.101)] \"in\""), "{}", region(&d, 6).1);
+    assert!(region(&d, 7).1.ends_with("=0.087 \"in\""), "{}", region(&d, 7).1);
+    assert_eq!(table_calc(&d, 0), CalcTable { id: 1, errors: Vec::new() });
+    // A table whose errors don't change is left alone (and shared, for undo).
+    let before = d.body[0].clone();
+    recalc(&mut d, &no_page);
+    assert!(Arc::ptr_eq(&before, &d.body[0]));
+}
+
+#[test]
+fn editing_a_cell_recalculates() {
+    let mut d = pipe_doc(PIPES);
+    recalc(&mut d, &no_page);
+    set_cell(&mut d, 0, 2, 2, "0.120");
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 7).1.ends_with("=0.088 \"in\""), "{}", region(&d, 7).1);
+}
+
+#[test]
+fn bad_cell_names_column_and_row() {
+    let rows: &[&[&str]] = &[PIPES[0], PIPES[1], &["3/4", "", "0.113"], PIPES[3]];
+    let mut d = pipe_doc(rows);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 5).0.state, CalcState::Error("depends on table data with an error".into()));
+    // Through another calculation too.
+    assert_eq!(region(&d, 6).0.state, err(CalcError::UpstreamTable));
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(1), message: "D_o row 2 isn't a number".into() }]);
+    assert_eq!(cell_text(&d, 0, 2, 1), "", "the table's text is never written");
+    // Fixing the cell clears the error.
+    set_cell(&mut d, 0, 2, 1, "1.050");
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, []);
+    assert_eq!(region(&d, 5).0.state, CalcState::Fresh);
+}
+
+#[test]
+fn cell_unit_must_match_heading() {
+    let wrong: &[&[&str]] = &[&["D_o (in)"], &["50 lbf"]];
+    let mut d = doc_of(vec![table_block(data_table(1, wrong)), para_block(para(vec![calc_eq(1, "D_o[0] = ? in")]))]);
+    recalc(&mut d, &no_page);
+    let errors = table_calc(&d, 0).errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].col, Some(0));
+    assert!(errors[0].message.starts_with("D_o row 1") && errors[0].message.contains("lbf"), "{errors:?}");
+    assert_eq!(region(&d, 1).0.state, err(CalcError::UpstreamTable));
+
+    let metric: &[&[&str]] = &[&["D_o (in)"], &["21.3 mm"]];
+    let mut d = doc_of(vec![table_block(data_table(1, metric)), para_block(para(vec![calc_eq(1, "D_o[0] = ? in")]))]);
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, []);
+    assert_eq!(region(&d, 1).1, "〖D_o〗_0=0.839 \"in\"");
+}
+
+#[test]
+fn table_g_unit_follows_the_g_setting() {
+    // `m (g)` would be refused whatever g means: m is the metre. `mass` is free.
+    let heading: &[&[&str]] = &[&["mass (g)"], &["5"]];
+    let cell: &[&[&str]] = &[&["mass_2 (kg)"], &["5 g"]];
+    let doc = || {
+        doc_of(vec![
+            table_block(data_table(1, heading)),
+            table_block(data_table(2, cell)),
+            para_block(para(vec![calc_eq(1, "mass[0] = ? mg"), calc_eq(2, "mass_2[0] = ? mg")])),
+        ])
+    };
+    // g is gravity (the default): both are errors naming gm.
+    let mut d = doc();
+    recalc(&mut d, &no_page);
+    for at in [0, 1] {
+        let errors = table_calc(&d, at).errors;
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].col, Some(0));
+        assert!(errors[0].message.contains("gm"), "{errors:?}");
+    }
+    assert_eq!(region(&d, 1).0.state, err(CalcError::UpstreamTable));
+    // g is the gram: both read as grams.
+    let mut d = doc();
+    d.calc_settings = Some(CalcSettings { g: GMeans::Gram, ..CalcSettings::default() });
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, []);
+    assert_eq!(table_calc(&d, 1).errors, []);
+    assert_eq!(region(&d, 1).1, "mass_0=5000 \"mg\"");
+    assert_eq!(region(&d, 2).1, "〖mass_2〗_0=5000 \"mg\"");
+}
+
+#[test]
+fn merged_cells_are_an_error() {
+    let merged = ColumnError { col: None, message: "a calculation data table can't have merged cells".into() };
+    // Across: a data cell spans two columns.
+    let mut d = pipe_doc(PIPES);
+    {
+        let t = table_mut(&mut d, 0);
+        t.rows[2].cells.remove(2);
+        t.rows[2].cells[1].props.span = 2;
+    }
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, std::slice::from_ref(&merged));
+    assert_eq!(region(&d, 5).0.state, err(CalcError::UpstreamTable));
+    // Down: two cells of a column merged.
+    let mut d = pipe_doc(PIPES);
+    {
+        let t = table_mut(&mut d, 0);
+        t.rows[1].cells[0].props.vmerge = VMerge::Restart;
+        t.rows[2].cells[0].props.vmerge = VMerge::Continue;
+    }
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, [merged]);
+    assert_eq!(region(&d, 5).0.state, err(CalcError::UpstreamTable));
+}
+
+#[test]
+fn duplicate_names_follow_document_order() {
+    let rows: &[&[&str]] = &[&["D_o (in)", "t (in)"], &["0.840", "0.109"]];
+    // The table comes first: it owns D_o.
+    let mut d = doc_of(vec![table_block(data_table(1, rows)), para_block(para(vec![calc_eq(1, "D_o := 1 in")]))]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, err(CalcError::Duplicate { name: "D_o".into(), page: None }));
+    assert_eq!(table_calc(&d, 0).errors, []);
+    // The region comes first: the column is in error, the other column still reads.
+    let mut d = doc_of(vec![
+        para_block(para(vec![calc_eq(1, "D_o := 1 in")])),
+        table_block(data_table(1, rows)),
+        para_block(para(vec![calc_eq(2, "t[0] = ? in")])),
+    ]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, CalcState::Fresh);
+    let duplicate = CalcError::Duplicate { name: "D_o".into(), page: None }.to_string();
+    assert_eq!(table_calc(&d, 1).errors, [ColumnError { col: Some(0), message: duplicate }]);
+    assert_eq!(region(&d, 2).1, "t_0=0.109 \"in\"");
+    // A name a function has is taken too.
+    let rows: &[&[&str]] = &[&["f"], &["1"]];
+    let mut d = doc_of(vec![para_block(para(vec![calc_eq(1, "f(x) := 2·x")])), table_block(data_table(1, rows))]);
+    recalc(&mut d, &no_page);
+    let duplicate = CalcError::Duplicate { name: "f".into(), page: None }.to_string();
+    assert_eq!(table_calc(&d, 1).errors, [ColumnError { col: Some(0), message: duplicate }]);
+    // A new calculation can't take a column's name either.
+    let mut d = doc_of(vec![table_block(data_table(1, rows))]);
+    recalc(&mut d, &no_page);
+    assert_eq!(check_new_name(&d, "f", None), Err(CalcError::Duplicate { name: "f".into(), page: None }));
+}
+
+#[test]
+fn copied_data_table_is_a_duplicate() {
+    let rows: &[&[&str]] = &[&["D_o (in)", "t (in)"], &["0.840", "0.109"]];
+    let mut d =
+        doc_of(vec![table_block(data_table(4, rows)), table_block(data_table(4, rows)), para_block(para(vec![calc_eq(1, "x := D_o + t =")]))]);
+    assert_eq!(data_tables(&d), [(vec![0], 4), (vec![1], 5)]);
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0), CalcTable { id: 4, errors: Vec::new() });
+    let copy = table_calc(&d, 1);
+    assert_eq!(copy.id, 5, "the copy gets the next id above the largest");
+    let duplicate = |name: &str| CalcError::Duplicate { name: name.into(), page: None }.to_string();
+    assert_eq!(copy.errors, [ColumnError { col: Some(0), message: duplicate("D_o") }, ColumnError { col: Some(1), message: duplicate("t") }]);
+    assert_eq!(region(&d, 1).0.state, CalcState::Fresh);
+    assert!(region(&d, 1).1.ends_with("=[■(0.949)] \"in\""), "{}", region(&d, 1).1);
+    // Nothing left to fix.
+    assert_eq!(data_tables(&d), [(vec![0], 4), (vec![1], 5)]);
+}
+
+#[test]
+fn tracked_deleted_cells_are_skipped() {
+    let mut d = doc_of(vec![table_block(data_table(1, &[&["D_o (in)"], &["0.840"]])), para_block(para(vec![calc_eq(1, "D_o[0] = ? in")]))]);
+    d.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Delete, "me", "2026-11-15T00:00:00Z"));
+    let deleted = CharProps { del: Some(0), ..Default::default() };
+    let mut p = Paragraph::with_text("0.840", deleted.clone());
+    p.insert_text(p.text.len(), "0.850", &CharProps::default()).unwrap();
+    table_mut(&mut d, 0).rows[1].cells[0].blocks = vec![para_block(p)];
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, []);
+    assert_eq!(region(&d, 1).1, "〖D_o〗_0=0.85 \"in\"");
+    // A whole table in a tracked deletion defines nothing.
+    for row in &mut table_mut(&mut d, 0).rows {
+        for cell in &mut row.cells {
+            let text = match &*cell.blocks[0] {
+                Block::Para(p) => p.final_text(),
+                Block::Table(_) => unreachable!(),
+            };
+            cell.blocks = vec![para_block(Paragraph::with_text(&text, deleted.clone()))];
+        }
+    }
+    assert_eq!(data_tables(&d), []);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, err(CalcError::Undefined("D_o".into())));
+    // Its id isn't reused: a pasted copy of a live table skips it.
+    table_mut(&mut d, 0).calc = Some(Box::new(CalcTable { id: 7, errors: Vec::new() }));
+    let live: &[&[&str]] = &[&["D_o (in)"], &["0.840"]];
+    d.body.push(table_block(data_table(6, live)));
+    d.body.push(table_block(data_table(6, live)));
+    assert_eq!(data_tables(&d), [(vec![2], 6), (vec![3], 8)]);
+}
+
+#[test]
+fn typing_outside_tables_skips_the_pass() {
+    let mut d = pipe_doc(PIPES);
+    recalc(&mut d, &no_page);
+    let mut typed = d.clone();
+    if let Block::Para(p) = Arc::make_mut(&mut typed.body[1]) {
+        p.insert_text(0, "More ", &CharProps::default()).unwrap();
+    }
+    assert!(calc_unchanged(&d, &typed));
+    let mut cell = d.clone();
+    set_cell(&mut cell, 0, 2, 2, "0.120");
+    assert!(!calc_unchanged(&d, &cell));
+    let mut heading = d.clone();
+    set_cell(&mut heading, 0, 0, 2, "t_n (in)");
+    assert!(!calc_unchanged(&d, &heading));
+    // Moving a calculation from after the table to before it changes who owns a name.
+    let mut moved = d.clone();
+    moved.body.swap(0, 1);
+    assert!(!calc_unchanged(&d, &moved));
+}
+
+#[test]
+fn data_cells_hold_numbers_only() {
+    // A calculation in a data cell: an error for its column, though the calculation still works.
+    let mut t = data_table(1, &[&["a", "b"], &["1", "2"]]);
+    t.rows[1].cells[1].blocks = vec![para_block(para(vec![calc_eq(1, "z := 3 =")]))];
+    // A table nested in a data cell.
+    let mut u = data_table(2, &[&["c"], &["1"]]);
+    u.rows[1].cells[0].blocks.push(Arc::new(Block::Table(Table::new(1, 1, 100.0))));
+    let mut d = doc_of(vec![table_block(t), table_block(u), para_block(para(vec![calc_eq(2, "a + z =")]))]);
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(1), message: "b row 1 holds an object — a data cell holds a number only".into() }]);
+    assert_eq!(table_calc(&d, 1).errors, [ColumnError { col: Some(0), message: "c row 1 holds a table — a data cell holds a number only".into() }]);
+    assert_eq!(region(&d, 1).0.state, CalcState::Fresh);
+    assert!(region(&d, 2).1.ends_with("=[■(4)]"), "{}", region(&d, 2).1);
+    // A column of more than 10,000 values.
+    let values = vec!["1"; 10_001];
+    let mut rows: Vec<&[&str]> = vec![&["x"]];
+    rows.extend(values.iter().map(std::slice::from_ref));
+    let mut d = doc_of(vec![table_block(data_table(1, &rows)), para_block(para(vec![calc_eq(1, "x =")]))]);
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message: CalcError::TooLarge.to_string() }]);
+    assert_eq!(region(&d, 1).0.state, err(CalcError::UpstreamTable));
+}
+
+#[test]
+#[ignore = "timing: run with --release -- --ignored perf_1000_element_vector_chain"]
+fn perf_1000_element_vector_chain() {
+    let values: Vec<String> = (0..1000).map(|i| format!("{}.5", i % 37)).collect();
+    let mut rows: Vec<Vec<&str>> = vec![vec!["x (in)"]];
+    rows.extend(values.iter().map(|v| vec![v.as_str()]));
+    let rows: Vec<&[&str]> = rows.iter().map(Vec::as_slice).collect();
+    let mut sources = vec!["y_0 := x".to_string()];
+    sources.extend((1..200).map(|k| format!("y_{k} := y_{}·1.001 + x", k - 1)));
+    let mut blocks = vec![table_block(data_table(1, &rows))];
+    blocks.extend(sources.iter().enumerate().map(|(i, s)| para_block(para(vec![calc_eq(i as u64 + 1, s)]))));
+    let mut d = doc_of(blocks);
+    recalc(&mut d, &no_page);
+    let _snapshot = d.clone();
+    set_cell(&mut d, 0, 1, 0, "2 in");
+    let start = Instant::now();
+    let report = recalc(&mut d, &no_page);
+    let took = start.elapsed();
+    println!("perf_1000_element_vector_chain: {took:?}");
+    assert_eq!(report.regions, 200);
+    assert_eq!(report.errors, 0);
+    assert_eq!(table_calc(&d, 0).errors, []);
+    assert!(took.as_millis() < 100, "recalc took {took:?}");
 }
