@@ -231,16 +231,16 @@ fn transpose(args: &[Data], cx: &Ctx<'_>) -> Result<Data, CalcError> {
     let [a] = args else {
         return Err(CalcError::Arity("transpose".to_string(), 1));
     };
+    cx.pass.charge(a.copy_work())?;
     match a {
-        Data::Grid(g) => transposed(g, cx).map(Data::Grid),
-        Data::TextGrid(g) => transposed(g, cx).map(Data::TextGrid),
+        Data::Grid(g) => transposed(g).map(Data::Grid),
+        Data::TextGrid(g) => transposed(g).map(Data::TextGrid),
         Data::One(_) | Data::Text(_) => Ok(a.clone()),
     }
 }
 
-/// `g` with its rows as columns.
-fn transposed<T: Clone>(g: &Grid<T>, cx: &Ctx<'_>) -> Result<Grid<T>, CalcError> {
-    charge(cx, g.items.len())?;
+/// `g` with its rows as columns. The caller has charged for the copy.
+fn transposed<T: Clone>(g: &Grid<T>) -> Result<Grid<T>, CalcError> {
     let items = (0..g.cols)
         .flat_map(|j| (0..g.rows).map(move |i| g.items.get(i * g.cols + j).cloned()))
         .collect::<Option<Vec<_>>>()

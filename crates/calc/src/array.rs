@@ -87,6 +87,19 @@ impl Data {
         }
     }
 
+    /// The work of building or copying this value, in steps: one per element of a grid, plus one
+    /// per 32 bytes of text, so copying text costs in proportion to the memory it takes (a text is
+    /// up to [`MAX_TEXT_CHARS`] characters, several times a number's size).
+    pub(crate) fn copy_work(&self) -> u64 {
+        let elements = |rows: usize, cols: usize| u64::try_from(rows.saturating_mul(cols)).unwrap_or(u64::MAX);
+        match self {
+            Data::One(_) => 0,
+            Data::Grid(g) => elements(g.rows, g.cols),
+            Data::Text(s) => text_steps(s),
+            Data::TextGrid(g) => g.items.iter().fold(elements(g.rows, g.cols), |n, s| n.saturating_add(text_steps(s))),
+        }
+    }
+
     /// The text itself, or a text grid's first element; `None` for numbers.
     pub(crate) fn text(&self) -> Option<&str> {
         match self {
@@ -95,6 +108,11 @@ impl Data {
             Data::One(_) | Data::Grid(_) => None,
         }
     }
+}
+
+/// The steps of work a text costs to copy: one per 32 bytes (UTF-8).
+pub(crate) fn text_steps(text: &str) -> u64 {
+    u64::try_from(text.len() / 32).unwrap_or(u64::MAX)
 }
 
 /// The error for a `rows` × `cols` grid that would hold both texts and numbers: it names the later

@@ -1170,3 +1170,28 @@ fn text_in_vectors_and_other_places() {
     assert_eq!(crate::array::mixed(2, 1, 1, 0, 1).to_string(), "element 2 is text but element 1 is a number");
     assert_eq!(crate::array::mixed(2, 1, 0, 1, 0).to_string(), "element 1 is a number but element 0 is text");
 }
+
+#[test]
+fn text_is_charged_by_size() {
+    let long = "é".repeat(1000); // 2000 bytes: 62 steps each at one per 32 bytes
+    let stmt = |src: &str| parse(src).unwrap_or_else(|e| panic!("{src:?} did not parse: {e}"));
+    let spent = |env: &mut Env, src: &str| {
+        let pass = Pass::new(u64::MAX);
+        run_stmt_in(env, &stmt(src), &pass).unwrap();
+        pass.spent.get()
+    };
+    let mut env = Env::new();
+    spent(&mut env, "i := 0..99");
+    spent(&mut env, &format!("t[i] := \"{long}\""));
+    spent(&mut env, "v[i] := 1");
+    // Copying a name: its elements, plus the text's bytes; the name itself is one step.
+    assert_eq!(spent(&mut env, "a := v"), 100 + 1);
+    assert_eq!(spent(&mut env, "b := t"), 100 + 100 * 62 + 1);
+    assert_eq!(spent(&mut env, "c := t[3]"), 62 + 1 + 1);
+    assert_eq!(spent(&mut env, "d := transpose(t)"), 2 * (100 + 100 * 62) + 2); // the copy of `t`, and the transposed copy
+    // So repeated copies of the text exhaust a budget that the same number of number copies doesn't.
+    let (numbers, texts) = (Pass::new(10_000), Pass::new(10_000));
+    let mut copies = |name: &str, pass: &Pass| (0..60).try_for_each(|k| run_stmt_in(&mut env, &stmt(&format!("x_{k} := {name}")), pass).map(|_| ()));
+    assert_eq!(copies("v", &numbers), Ok(()));
+    assert_eq!(copies("t", &texts), Err(CalcError::TooMuchWork));
+}

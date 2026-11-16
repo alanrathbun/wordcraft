@@ -413,7 +413,10 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
     tick(cx)?;
     match e {
         Expr::Num(v) => finite(*v).map(|q| Data::One(Val::plain(q))),
-        Expr::Text(s) => Ok(Data::Text(s.clone())),
+        Expr::Text(s) => {
+            cx.pass.charge(array::text_steps(s))?;
+            Ok(Data::Text(s.clone()))
+        }
         Expr::Name(n) => resolve(cx, fr, n),
         Expr::Quantity(v, text) => {
             let scale = parse_unit(text).map_err(unit)?;
@@ -492,7 +495,8 @@ const WHOLE: f64 = 1e-9;
 const MAX_RANGE_SLACK: f64 = 0.05;
 
 /// A literal `[…]` of `rows` × `cols` items, row by row. Each item is one value, and they are all
-/// numbers or all texts.
+/// numbers or all texts. A text item is moved in, not copied: whatever evaluated it (a literal, a
+/// name, an index) already charged for it by size.
 // Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
 fn matrix(cx: &Cx<'_>, fr: &Frame<'_>, rows: usize, cols: usize, items: &[Expr], depth: usize) -> Result<Data, CalcError> {
@@ -527,7 +531,11 @@ fn index(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, at: &[Expr], depth: usize) -> 
     let idx = idx.get(..at.len()).unwrap_or_default();
     match target {
         Data::Grid(g) => element(g, name, cx.env.origin, idx).map(Data::One),
-        Data::TextGrid(g) => element(g, name, cx.env.origin, idx).map(Data::Text),
+        Data::TextGrid(g) => {
+            let text = element(g, name, cx.env.origin, idx)?;
+            cx.pass.charge(array::text_steps(&text))?;
+            Ok(Data::Text(text))
+        }
         Data::One(_) | Data::Text(_) => Err(not_a_vector(name)),
     }
 }
@@ -964,12 +972,11 @@ fn resolve(cx: &Cx<'_>, fr: &Frame<'_>, name: &str) -> Result<Data, CalcError> {
     Err(CalcError::Undefined(name.to_string()))
 }
 
-/// A copy of a name's value. Copying a grid is work: each element counts as a step, so a hostile
-/// calculation can't copy large grids for free.
+/// A copy of a name's value. Copying is work ([`Data::copy_work`]): each element of a grid counts
+/// as a step, and each 32 bytes of text, so a hostile calculation can't copy large grids or long
+/// texts for free.
 fn copy(cx: &Cx<'_>, v: &Data) -> Result<Data, CalcError> {
-    if let Some((rows, cols)) = v.shape() {
-        charge_elements(cx, rows.saturating_mul(cols))?;
-    }
+    cx.pass.charge(v.copy_work())?;
     Ok(v.clone())
 }
 
