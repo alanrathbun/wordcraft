@@ -9,7 +9,7 @@ fn f(number: &str, unit: &str) -> Formatted {
 }
 
 fn grid(rows: usize, cols: usize, items: Vec<Formatted>, unit: Option<&str>, total_rows: usize) -> Shown {
-    Shown::Grid { rows, cols, items, unit: unit.map(str::to_string), total_rows }
+    Shown::Grid { rows, cols, items, unit: unit.map(str::to_string), total_rows, total_cols: cols }
 }
 
 fn shown_linear(shown: &Shown) -> String {
@@ -35,15 +35,41 @@ fn a_cut_matrix_has_a_dots_row_under_every_column() {
 }
 
 #[test]
+fn a_wide_result_has_a_dots_column_after_its_first_fifty() {
+    let items: Vec<Formatted> = (0..50).map(|k| f(&k.to_string(), "")).collect();
+    let wide = Shown::Grid { rows: 1, cols: 50, items: items.clone(), unit: Some("in".into()), total_rows: 1, total_cols: 10_000 };
+    let linear = shown_linear(&wide);
+    assert!(linear.ends_with("&48&49&⋯)] \"in\" \"(10000 columns)\""), "{linear}");
+    assert_eq!(shown_result(&linear), Some(wide));
+    // Both cut: the dots meet in a corner, and the size names both.
+    let both = Shown::Grid { rows: 2, cols: 25, items, unit: None, total_rows: 60, total_cols: 60 };
+    let linear = shown_linear(&both);
+    let cut_row = format!("{}&⋱", vec!["⋮"; 25].join("&"));
+    assert!(linear.contains("&24&⋯@25&") && linear.ends_with(&format!("&49&⋯@{cut_row})] \"(60 rows × 60 columns)\"")), "{linear}");
+    assert_eq!(shown_result(&linear), Some(both.clone()));
+    let math = rendered(&parse("x ="), "x =", Some(&both), &CalcState::Fresh).math;
+    let Some(MNode::Delim { elems, .. }) = math.iter().rfind(|n| matches!(n, MNode::Delim { .. })) else { panic!("{math:?}") };
+    let Some(MNode::Matrix { rows, .. }) = elems.first().and_then(|e| e.first()) else { panic!("{elems:?}") };
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.len() == 26), "{rows:?}");
+    let text = |cell: &Arg| match cell.as_slice() {
+        [MNode::Run(r)] => r.text.clone(),
+        other => format!("{other:?}"),
+    };
+    assert_eq!(rows.iter().map(|r| r.last().map(text)).collect::<Vec<_>>(), [Some("⋯".into()), Some("⋯".into()), Some("⋱".into())]);
+}
+
+#[test]
 fn the_cells_are_built_whole_however_many() {
-    // Far more cells than the linear parser reads in one go: each is drawn all the same.
-    let items: Vec<Formatted> = (0..10_000).map(|k| f(&format!("-1.235×10^-{}", k % 20 + 1), if k % 2 == 0 { "kN·m" } else { "°F" })).collect();
-    let shown = grid(1, 10_000, items, None, 1);
+    // The most cells ever shown, each as long as a cell gets: far more than the linear parser reads
+    // in one go (it keeps 20 of these 50 rows), and each is drawn all the same.
+    let items: Vec<Formatted> = (0..2_500).map(|k| f(&format!("-1.235×10^-{}", k % 20 + 1), if k % 2 == 0 { "kN·m" } else { "°F" })).collect();
+    let shown = grid(50, 50, items, None, 50);
     let math = rendered(&parse("x ="), "x =", Some(&shown), &CalcState::Fresh).math;
     let Some(MNode::Delim { elems, .. }) = math.iter().rfind(|n| matches!(n, MNode::Delim { .. })) else { panic!("{math:?}") };
     let Some(MNode::Matrix { rows, .. }) = elems.first().and_then(|e| e.first()) else { panic!("{elems:?}") };
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows.first().map(Vec::len), Some(10_000));
+    assert_eq!(rows.len(), 50);
+    assert!(rows.iter().all(|r| r.len() == 50));
     assert_eq!(shown_result(&shown_linear(&shown)), Some(shown));
 }
 
@@ -55,7 +81,7 @@ fn the_result_matrix_is_the_one_the_linear_text_describes() {
     {
         let shown = grid(2, 1, items, None, 2);
         let math = rendered(&parse("x ="), "x =", Some(&shown), &CalcState::Fresh).math;
-        assert_eq!(math.last(), restore_pieces(parse_linear(text), &[]).first(), "{text}");
+        assert_eq!(math.last(), restore_pieces(parse_linear(text), &[], &[]).first(), "{text}");
     }
 }
 
@@ -77,12 +103,23 @@ fn what_rendered_never_writes_reads_as_nothing() {
         "x=[■(1@2)] \"in",
         "x=[■(1 \"in@2)]",
         "x=[■(1@2)] \"in\" \"lbf\"",
+        "x=[■(1&⋯)] \"(5 rows)\"",
+        "x=[■(1&⋯)]",
+        "x=[■(1&2)] \"(5 columns)\"",
+        "x=[■(1&⋯)] \"(1 columns)\"",
+        "x=[■(1&⋯@⋮&⋮)] \"(5 rows × 5 columns)\"",
+        "x=[■(1&⋯@⋮&⋱)] \"(5 rows)\"",
+        "x=[■(1&⋯@⋮&⋱)] \"(5 rows × 5 cols)\"",
+        "x=[■(1&⋯@⋮&⋱)] \"(200 rows × 200 columns)\"",
+        "x=[■(⋯)] \"(5 columns)\"",
+        "x=[■(1)] \"(5 rows × 5 columns)\" \"in\"",
     ] {
         assert_eq!(shown_result(bad), None, "{bad}");
     }
     // More rows than are ever shown, or more cells than a grid holds.
     assert_eq!(shown_result(&format!("x=[■({}1)]", "1@".repeat(50))), None);
     assert_eq!(shown_result(&format!("x=[■({}1)]", "1&".repeat(MAX_ELEMENTS))), None);
+    assert_eq!(shown_result(&format!("x=[■({}1)]", "1&".repeat(MAX_SHOWN_COLS))), None);
     assert_eq!(shown_result(&format!("x=[■({}1)]", "1@".repeat(1_000_000))), None);
 }
 
@@ -94,11 +131,16 @@ fn number() -> impl Strategy<Value = String> {
 
 const UNITS: [&str; 10] = ["", "in", "lbf", "kN·m", "J/(mol·K)", "ft^2", "°F", "Δ°C", "kN m", "1/s"];
 
-/// A grid as [`rendered`] is given one: at most 50 rows shown of `total_rows`, and a shared unit
-/// (never empty) only when the cells carry none.
+/// A grid as [`rendered`] is given one: at most 50 rows and 50 columns shown of `total_rows` ×
+/// `total_cols`, and a shared unit (never empty) only when the cells carry none.
 fn shown_grid() -> impl Strategy<Value = Shown> {
-    (1usize..=MAX_SHOWN_ROWS, 1usize..=4, any::<bool>(), any::<bool>(), any::<u16>()).prop_flat_map(|(rows, cols, shared, cut, extra)| {
-        let total_rows = if cut { rows + 1 + usize::from(extra) % (MAX_ELEMENTS / cols - rows) } else { rows };
+    let cols = prop_oneof![1usize..=4, 1usize..=MAX_SHOWN_COLS];
+    let cuts = (any::<bool>(), any::<bool>(), any::<u16>(), any::<u16>());
+    (1usize..=MAX_SHOWN_ROWS, cols, any::<bool>(), cuts).prop_flat_map(|(rows, cols, shared, (cut_rows, cut_cols, more_rows, more_cols))| {
+        // A cut grid holds more than it shows, and no more than any grid holds.
+        let least_cols = cols + usize::from(cut_cols);
+        let total_rows = if cut_rows { rows + 1 + usize::from(more_rows) % (MAX_ELEMENTS / least_cols - rows) } else { rows };
+        let total_cols = if cut_cols { cols + 1 + usize::from(more_cols) % (MAX_ELEMENTS / total_rows - cols) } else { cols };
         let cells = prop::collection::vec((number(), 0..UNITS.len()), rows * cols);
         let unit = if shared { (1..UNITS.len()).prop_map(Some).boxed() } else { Just(None).boxed() };
         (cells, unit).prop_map(move |(cells, unit)| {
@@ -110,7 +152,7 @@ fn shown_grid() -> impl Strategy<Value = Shown> {
                     unit: if unit.is_some() { String::new() } else { UNITS.get(k).copied().unwrap_or("").to_string() },
                 })
                 .collect();
-            Shown::Grid { rows, cols, items, unit, total_rows }
+            Shown::Grid { rows, cols, items, unit, total_rows, total_cols }
         })
     })
 }
@@ -127,7 +169,7 @@ proptest! {
     }
 
     #[test]
-    fn hostile_results_never_panic(s in "[\\[■(@&)\\]\" 0-9.⋮×〖〗^\\-=a-z#]{0,300}") {
+    fn hostile_results_never_panic(s in "[\\[■(@&)\\]\" 0-9.⋮⋯⋱×〖〗^\\-=a-z#]{0,300}") {
         let _ = shown_result(&s);
     }
 }

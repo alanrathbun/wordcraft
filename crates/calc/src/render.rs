@@ -9,8 +9,10 @@
 //!
 //! A vector or matrix result is a bracketed Word matrix of its formatted elements, with their one
 //! shared unit after the bracket (`=[■(0.84@1.05)] "in"`) or each element's own unit inside it
-//! (`=[■(2 "in"@3 "lbf")]`). Past [`MAX_SHOWN_ROWS`] rows it is cut, never silently: a `⋮` row and
-//! the row count follow the rows shown (`=[■(0@…@49@⋮)] "(60 rows)"`).
+//! (`=[■(2 "in"@3 "lbf")]`). Past [`MAX_SHOWN_ROWS`] rows or [`MAX_SHOWN_COLS`] columns it is cut,
+//! never silently: a `⋮` row after the rows shown, a `⋯` column after the columns shown (`⋱` where
+//! they meet), and the full size after the bracket (`=[■(0@…@49@⋮)] "(60 rows)"`,
+//! `"(10000 columns)"`, `"(60 rows × 60 columns)"`).
 
 use std::collections::HashMap;
 
@@ -46,11 +48,18 @@ const INVISIBLE_CLOSE: &str = "〗";
 const TEN: &str = "〖10〗";
 /// Separates a number from the unit after it in the math tree (spaces in linear text are dropped).
 const THIN_SPACE: char = '\u{2009}';
-/// Most rows of a vector or matrix result shown; the rest are cut, with a [`CUT`] row and the row
-/// count after the rows shown.
+/// Most rows of a vector or matrix result shown; the rest are cut, with a [`CUT`] row after the
+/// rows shown and the full size after the bracket.
 pub(crate) const MAX_SHOWN_ROWS: usize = 50;
+/// Most columns of a result shown; the rest are cut, with a [`COL_CUT`] column after the columns
+/// shown and the full size after the bracket.
+pub(crate) const MAX_SHOWN_COLS: usize = 50;
 /// Each cell of the row standing for the rows cut from a long result.
 const CUT: &str = "⋮";
+/// Each cell of the column standing for the columns cut from a wide result.
+const COL_CUT: &str = "⋯";
+/// Where the cut row and the cut column meet.
+const CORNER: &str = "⋱";
 /// Longest result text [`shown_result`] reads back, bytes: well over what [`rendered`] writes for
 /// the largest grid, so anything longer came from somewhere else.
 const MAX_RESULT_BYTES: usize = 4 << 20;
@@ -60,10 +69,11 @@ const MAX_RESULT_BYTES: usize = 4 << 20;
 pub(crate) enum Shown {
     /// One value.
     One(Formatted),
-    /// A vector or matrix: its first `rows` rows (at most [`MAX_SHOWN_ROWS`]) of `cols` elements,
-    /// row by row, of `total_rows` in all. `unit` is `Some` when every element shares it (never
-    /// empty), and the items then carry an empty unit.
-    Grid { rows: usize, cols: usize, items: Vec<Formatted>, unit: Option<String>, total_rows: usize },
+    /// A vector or matrix: its first `rows` rows (at most [`MAX_SHOWN_ROWS`]) of its first `cols`
+    /// columns (at most [`MAX_SHOWN_COLS`]), row by row, of `total_rows` × `total_cols` in all.
+    /// `unit` is `Some` when every element shares it (never empty), and the items then carry an
+    /// empty unit.
+    Grid { rows: usize, cols: usize, items: Vec<Formatted>, unit: Option<String>, total_rows: usize, total_cols: usize },
 }
 
 /// The linear-format text shown for the calculation `stmt_src`, with its result `shown` (when
@@ -106,7 +116,7 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
         }
     };
     let mut linear = out.linear;
-    let mut math = restore_pieces(parse_linear(&out.parsed), &out.pieces);
+    let mut math = restore_pieces(parse_linear(&out.parsed), &out.pieces, &out.nodes);
     if stmt.is_err() || matches!(state, CalcState::Error(_)) {
         linear.push(' ');
         linear.push_str(ERROR_MARK);
@@ -119,9 +129,7 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
         match shown {
             None => push_value(&Formatted { number: "?".into(), unit: String::new() }, &mut linear, &mut result),
             Some(Shown::One(f)) => push_value(f, &mut linear, &mut result),
-            Some(Shown::Grid { rows, cols, items, unit, total_rows }) => {
-                push_grid(*rows, *cols, items, unit.as_deref(), *total_rows, &mut linear, &mut result);
-            }
+            Some(grid @ Shown::Grid { .. }) => push_grid(grid, &mut linear, &mut result),
         }
         if stale {
             result = paint(result, STALE_GREY);
@@ -134,7 +142,7 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
 /// A formatted number and its unit, as linear text (`600 "psi"`) and math nodes.
 fn push_value(f: &Formatted, linear: &mut String, math: &mut Arg) {
     let number = linear_number(&f.number);
-    math.extend(restore_pieces(parse_linear(&number), &[]));
+    math.extend(restore_pieces(parse_linear(&number), &[], &[]));
     linear.push_str(&number);
     push_unit(&f.unit, linear, math);
 }
@@ -147,21 +155,24 @@ fn push_unit(text: &str, linear: &mut String, math: &mut Arg) {
     }
 }
 
-/// A vector or matrix result ([`Shown::Grid`]): a bracketed matrix of `items`, `cols` to a row,
-/// then a [`CUT`] row when rows were cut; then the shared `unit` and, when cut, the row count.
+/// A vector or matrix result ([`Shown::Grid`]): a bracketed matrix of its items, `cols` to a row;
+/// a [`COL_CUT`] cell after each row when columns were cut, a [`CUT`] row when rows were (with a
+/// [`CORNER`] under the column cut); then the shared unit and, when cut, the full size.
 ///
-/// The tree is built cell by cell rather than parsed from the whole linear text, so a large grid
-/// is drawn whole (the linear parser stops at a bound on its work) and each cell costs the same.
-fn push_grid(rows: usize, cols: usize, items: &[Formatted], unit: Option<&str>, total_rows: usize, linear: &mut String, math: &mut Arg) {
-    let cols = cols.max(1);
-    let cut = total_rows > rows;
+/// The tree is built cell by cell rather than parsed from the whole linear text, so every cell
+/// shown is drawn (the linear parser stops at a bound on its work) and each costs the same.
+fn push_grid(shown: &Shown, linear: &mut String, math: &mut Arg) {
+    let Shown::Grid { rows, cols, items, unit, total_rows, total_cols } = shown else { return };
+    let (rows, cols, total_rows, total_cols) = (*rows, (*cols).max(1), *total_rows, *total_cols);
+    let (cut_rows, cut_cols) = (total_rows > rows, total_cols > cols);
+    let mark = |text: &str| vec![MNode::Run(MRun::new(text))];
     let mut matrix: Vec<Vec<Arg>> = Vec::with_capacity(rows.saturating_add(1));
     linear.push_str("[■(");
     for (r, row) in items.chunks(cols).enumerate() {
         if r > 0 {
             linear.push('@');
         }
-        let mut cells = Vec::with_capacity(cols);
+        let mut cells = Vec::with_capacity(cols.saturating_add(1));
         for (c, item) in row.iter().enumerate() {
             if c > 0 {
                 linear.push('&');
@@ -170,20 +181,40 @@ fn push_grid(rows: usize, cols: usize, items: &[Formatted], unit: Option<&str>, 
             push_value(item, linear, &mut cell);
             cells.push(cell);
         }
+        if cut_cols {
+            linear.push('&');
+            linear.push_str(COL_CUT);
+            cells.push(mark(COL_CUT));
+        }
         matrix.push(cells);
     }
-    if cut {
+    if cut_rows {
         linear.push('@');
         linear.push_str(&vec![CUT; cols].join("&"));
-        matrix.push(vec![vec![MNode::Run(MRun::new(CUT))]; cols]);
+        let mut cells = vec![mark(CUT); cols];
+        if cut_cols {
+            linear.push('&');
+            linear.push_str(CORNER);
+            cells.push(mark(CORNER));
+        }
+        matrix.push(cells);
     }
     linear.push_str(")]");
-    let matrix = MNode::Matrix { rows: matrix, col_jc: Vec::new() };
-    math.push(MNode::Delim { beg: Some('['), end: Some(']'), sep: None, grow: true, shp_match: false, elems: vec![vec![matrix]] });
-    push_unit(unit.unwrap_or_default(), linear, math);
-    if cut {
-        push_unit(&format!("({total_rows} rows)"), linear, math);
-    }
+    math.push(bracketed(matrix));
+    push_unit(unit.as_deref().unwrap_or_default(), linear, math);
+    let size = match (cut_rows, cut_cols) {
+        (true, true) => format!("({total_rows} rows × {total_cols} columns)"),
+        (true, false) => format!("({total_rows} rows)"),
+        (false, true) => format!("({total_cols} columns)"),
+        (false, false) => String::new(),
+    };
+    push_unit(&size, linear, math);
+}
+
+/// A matrix of `rows` of cells in square brackets, as Word's linear format builds `[■(…)]`.
+fn bracketed(rows: Vec<Vec<Arg>>) -> MNode {
+    let matrix = MNode::Matrix { rows, col_jc: Vec::new() };
+    MNode::Delim { beg: Some('['), end: Some(']'), sep: None, grow: true, shp_match: false, elems: vec![vec![matrix]] }
 }
 
 /// A short red note after a display, upright (`⚠ not calculated here`).
@@ -303,9 +334,12 @@ fn value_result(text: &str) -> Option<Formatted> {
 }
 
 /// A vector or matrix result read back from the text after its `[■(`: the cells to the first `)]`
-/// outside a quoted unit (`@` between rows, `&` between cells), then the shared unit and the row
-/// count, each quoted. Stops as soon as there are more rows or cells than [`rendered`] writes.
+/// outside a quoted unit (`@` between rows, `&` between cells), then the shared unit and the full
+/// size of a cut result, each quoted. Stops as soon as there are more rows or cells than
+/// [`rendered`] writes.
 fn grid_result(text: &str) -> Option<Shown> {
+    // The cells shown, the cut row and the cut column.
+    let max_cells = (MAX_SHOWN_ROWS + 1) * (MAX_SHOWN_COLS + 1);
     let mut rows: Vec<Vec<&str>> = vec![Vec::new()];
     let (mut start, mut cells, mut quoted, mut end) = (0, 0usize, false, None);
     for (i, c) in text.char_indices() {
@@ -319,7 +353,7 @@ fn grid_result(text: &str) -> Option<Shown> {
                 }
                 rows.last_mut()?.push(text.get(start..i)?);
                 cells += 1;
-                if cells > MAX_ELEMENTS {
+                if cells > max_cells {
                     return None;
                 }
                 start = i + c.len_utf8();
@@ -328,7 +362,6 @@ fn grid_result(text: &str) -> Option<Shown> {
                     break;
                 }
                 if c == '@' {
-                    // The rows shown and the cut row.
                     if rows.len() > MAX_SHOWN_ROWS {
                         return None;
                     }
@@ -339,38 +372,69 @@ fn grid_result(text: &str) -> Option<Shown> {
         }
     }
     let notes = quoted_words(text.get(end?..)?)?;
-    let rows_note = |w: &str| w.strip_prefix('(')?.strip_suffix(" rows)").filter(|n| n.bytes().all(|b| b.is_ascii_digit()))?.parse::<usize>().ok();
-    let (unit, total) = match notes.as_slice() {
-        [] => (None, None),
-        [only] => rows_note(only).map_or((Some(*only), None), |n| (None, Some(n))),
-        [unit, count] => (Some(*unit), Some(rows_note(count)?)),
+    let (unit, (total_rows, total_cols)) = match notes.as_slice() {
+        [] => (None, (None, None)),
+        [only] => size_note(only).map_or((Some(*only), (None, None)), |n| (None, n)),
+        [unit, size] => (Some(*unit), size_note(size)?),
         _ => return None,
     };
-    if unit.is_some_and(|u| u.is_empty() || rows_note(u).is_some()) {
+    if unit.is_some_and(|u| u.is_empty() || size_note(u).is_some()) {
         return None;
     }
-    let cols = rows.first()?.len();
-    if rows.iter().any(|r| r.len() != cols) {
+    let width = rows.first()?.len();
+    if rows.iter().any(|r| r.len() != width) {
         return None;
     }
-    let cut = rows.last().is_some_and(|r| r.iter().all(|&c| c == CUT));
-    if cut {
-        rows.pop();
+    // The cut row and column are exactly where the size says.
+    let cols = width.checked_sub(usize::from(total_cols.is_some()))?;
+    if total_rows.is_some() {
+        let cut = rows.pop()?;
+        let (marks, corner) = cut.split_at_checked(cols)?;
+        if marks.iter().any(|&c| c != CUT) || corner.iter().any(|&c| c != CORNER) {
+            return None;
+        }
+    }
+    if total_cols.is_some() {
+        for row in &mut rows {
+            if row.pop()? != COL_CUT {
+                return None;
+            }
+        }
     }
     let shown = rows.len();
-    let total_rows = match total {
-        Some(n) if cut && n > shown && n.checked_mul(cols).is_some_and(|all| all <= MAX_ELEMENTS) => n,
-        None if !cut => shown,
-        _ => return None,
-    };
-    if shown == 0 || shown > MAX_SHOWN_ROWS {
+    if shown == 0 || shown > MAX_SHOWN_ROWS || cols == 0 || cols > MAX_SHOWN_COLS {
+        return None;
+    }
+    let total_rows = total_rows.map_or(Some(shown), |n| (n > shown).then_some(n))?;
+    let total_cols = total_cols.map_or(Some(cols), |n| (n > cols).then_some(n))?;
+    if total_rows.checked_mul(total_cols).is_none_or(|all| all > MAX_ELEMENTS) {
         return None;
     }
     let items = rows.into_iter().flatten().map(value_result).collect::<Option<Vec<_>>>()?;
     if unit.is_some() && items.iter().any(|f| !f.unit.is_empty()) {
         return None;
     }
-    Some(Shown::Grid { rows: shown, cols, items, unit: unit.map(str::to_string), total_rows })
+    Some(Shown::Grid { rows: shown, cols, items, unit: unit.map(str::to_string), total_rows, total_cols })
+}
+
+/// The full size of a cut result: `(60 rows)`, `(10000 columns)` or `(60 rows × 60 columns)`, as
+/// (rows, columns), each `None` when not cut. `None` for anything else.
+fn size_note(text: &str) -> Option<(Option<usize>, Option<usize>)> {
+    let inner = text.strip_prefix('(')?.strip_suffix(')')?;
+    let count = |t: &str, what: &str| {
+        let n = t.strip_suffix(what)?;
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        n.parse::<usize>().ok()
+    };
+    match inner.split_once(" × ") {
+        Some((r, c)) => Some((Some(count(r, " rows")?), Some(count(c, " columns")?))),
+        None => match count(inner, " rows") {
+            Some(n) => Some((Some(n), None)),
+            None => Some((None, Some(count(inner, " columns")?))),
+        },
+    }
 }
 
 /// The quoted words of ` "a" "b"`: `None` for anything else, or more than two.
@@ -449,6 +513,9 @@ enum Kind {
     Name,
     /// A built-in function name or a multi-letter subscript: upright.
     Upright,
+    /// A subtree built apart (a matrix literal, cell by cell): the index of its node in
+    /// [`Out::nodes`].
+    Node(usize),
 }
 
 /// A piece of text a sentinel stands for.
@@ -469,6 +536,8 @@ struct Out {
     parsed: String,
     pieces: Vec<Piece>,
     sentinels: HashMap<Piece, char>,
+    /// Subtrees built apart, each standing in `parsed` as one [`Kind::Node`] sentinel.
+    nodes: Vec<MNode>,
 }
 
 impl Out {
@@ -508,6 +577,37 @@ impl Out {
             }
             None => self.parsed.push_str(fallback),
         }
+    }
+
+    /// A matrix literal, `cols` items to a row: a Word matrix in brackets, `&` between columns and
+    /// `@` between rows (`[■(1&2@3&4)]`). Its tree is built cell by cell, each cell parsed alone,
+    /// and stands in the parsed text as one sentinel: the linear parser bounds its work, and a
+    /// long literal parsed whole would lose its last elements to that bound. A literal inside an
+    /// element recurses here; the parser bounds that nesting (64 deep).
+    fn matrix(&mut self, cols: usize, items: &[Expr]) {
+        let mut text = String::from("[■(");
+        let mut rows: Vec<Vec<Arg>> = Vec::new();
+        for (k, item) in items.iter().enumerate() {
+            let new_row = k.checked_rem(cols) == Some(0);
+            if k > 0 {
+                text.push(if new_row { '@' } else { '&' });
+            }
+            if new_row || rows.is_empty() {
+                rows.push(Vec::new());
+            }
+            let mut cell = Out::default();
+            write_expr(item, &mut cell);
+            text.push_str(&cell.linear);
+            if let Some(row) = rows.last_mut() {
+                row.push(restore_pieces(parse_linear(&cell.parsed), &cell.pieces, &cell.nodes));
+            }
+        }
+        text.push_str(")]");
+        self.linear.push_str(&text);
+        let k = self.nodes.len();
+        self.nodes.push(bracketed(rows));
+        // Out of sentinels, the literal is parsed with the rest, as text.
+        self.sentinel(Piece { text: k.to_string(), kind: Kind::Node(k) }, &text);
     }
 
     /// A name that a subscript index follows: in invisible brackets when it has a subscript of
@@ -790,7 +890,8 @@ fn write_expr(root: &Expr, out: &mut Out) {
                     out.name(name);
                 }
             }
-            Expr::Matrix { .. } | Expr::Index(..) | Expr::Range { .. } => push_array_syntax(e, &mut todo, out),
+            Expr::Matrix { cols, items, .. } => out.matrix(*cols, items),
+            Expr::Index(..) | Expr::Range { .. } => push_array_syntax(e, &mut todo, out),
             Expr::Binary(op, a, b) => match op {
                 Op::Add | Op::Sub | Op::Neg => {
                     wrap(&mut todo, b, prec(b) <= 1 || matches!(&**b, Expr::Unary(..)));
@@ -830,16 +931,10 @@ fn write_expr(root: &Expr, out: &mut Out) {
     }
 }
 
-/// Push the steps of a literal, an index or a range (`e` is one of them). The name of an index
-/// is written at once, before the steps.
+/// Push the steps of an index or a range (`e` is one of them). The name of an index is written at
+/// once, before the steps.
 fn push_array_syntax<'a>(e: &'a Expr, todo: &mut Vec<Step<'a>>, out: &mut Out) {
     match e {
-        // A literal is a Word matrix in brackets: `&` between columns, `@` between rows.
-        Expr::Matrix { cols, items, .. } => {
-            todo.push(Step::Text(")]"));
-            push_separated(todo, items, |k| if k.checked_rem(*cols) == Some(0) { "@" } else { "&" });
-            todo.push(Step::Text("[■("));
-        }
         // An index is a subscript: `D_2`, `M_(i,j)`, `〖D_o〗_i`.
         Expr::Index(name, at) => {
             match at.as_slice() {
@@ -934,13 +1029,15 @@ fn piece_run(piece: &Piece, prev: Option<char>, pieces: &[Piece], template: &MRu
         }
         Kind::Name => MRun { text: piece.text.clone(), ..template.clone() },
         Kind::Upright => MRun { text: piece.text.clone(), sty: Some(MSty::Plain), ..template.clone() },
+        // Replaced by its node in `restore_pieces`; never a run.
+        Kind::Node(_) => MRun { text: String::new(), ..template.clone() },
     }
 }
 
 /// Replace each sentinel in the tree with a run of its text, and take a script's base out of the
 /// invisible brackets that kept it whole. The tree comes from
 /// [`parse_linear`], which caps its depth, so recursing over it is bounded.
-fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
+fn restore_pieces(arg: Arg, pieces: &[Piece], nodes: &[MNode]) -> Arg {
     let mut out: Arg = Vec::with_capacity(arg.len());
     for node in arg {
         match node {
@@ -954,7 +1051,10 @@ fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
                             if !buf.is_empty() {
                                 out.push(MNode::Run(MRun { text: std::mem::take(&mut buf), ..r.clone() }));
                             }
-                            out.push(MNode::Run(piece_run(piece, prev, pieces, &r)));
+                            match piece.kind {
+                                Kind::Node(k) => out.extend(nodes.get(k).cloned()),
+                                _ => out.push(MNode::Run(piece_run(piece, prev, pieces, &r))),
+                            }
                         }
                         None => buf.push(c),
                     }
@@ -971,7 +1071,7 @@ fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
                     Some(MNode::Run(r)) => r.text.chars().last(),
                     _ => None,
                 };
-                let mut base = restore_pieces(base, pieces);
+                let mut base = restore_pieces(base, pieces, nodes);
                 // A base in invisible brackets (`〖25〗^2`) is the bracketed content itself.
                 if let [MNode::Delim { beg: None, end: None, elems, .. }] = base.as_mut_slice()
                     && elems.len() == 1
@@ -985,9 +1085,9 @@ fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
                 {
                     r.text.insert(0, THIN_SPACE);
                 }
-                out.push(MNode::Script { kind, base, sub: restore_pieces(sub, pieces), sup: restore_pieces(sup, pieces) });
+                out.push(MNode::Script { kind, base, sub: restore_pieces(sub, pieces, nodes), sup: restore_pieces(sup, pieces, nodes) });
             }
-            other => out.push(map_args(other, &|a| restore_pieces(a, pieces))),
+            other => out.push(map_args(other, &|a| restore_pieces(a, pieces, nodes))),
         }
     }
     out

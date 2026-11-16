@@ -106,6 +106,7 @@ fn runs(nodes: &[MNode]) -> Vec<MRun> {
             MNode::Rad { deg, e, .. } => todo.extend(deg.iter().chain(e.iter())),
             MNode::Delim { elems, .. } => todo.extend(elems.iter().flatten()),
             MNode::Func { name, e } => todo.extend(name.iter().chain(e.iter())),
+            MNode::Matrix { rows, .. } => todo.extend(rows.iter().flatten().flatten()),
             _ => {}
         }
     }
@@ -1231,4 +1232,155 @@ fn a_vector_whose_display_fails_defines_nothing() {
 fn defined_names_lists_vectors() {
     let d = doc_with(&["D := [1, 2]", "i := 0..3", "t[i] := 2·i", "n := 1", "f(x) := x"]);
     assert_eq!(defined_names(&d), [("D".to_string(), 1), ("i".to_string(), 2), ("n".to_string(), 4), ("t".to_string(), 3)]);
+}
+
+#[test]
+fn wide_results_are_visibly_cut() {
+    let mut d = doc_with(&["i := 0..9999", "r := transpose(i) =", "a := 0..59", "M := mmul(a, transpose(a)) =", "w := transpose(a) ="]);
+    recalc(&mut d, &no_page);
+    // A row of 10,000 shows its first 50, a ⋯, and how many there are; no more cells are built.
+    let (r, linear, math) = region(&d, 2);
+    assert_eq!(r.state, CalcState::Fresh, "{linear}");
+    assert!(linear.ends_with("&48&49&⋯)] \"(10000 columns)\""), "{linear}");
+    let (cells, after) = result_matrix(&math.nodes);
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].len(), 51);
+    assert_eq!(cells[0][50], "⋯");
+    assert_eq!(after.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["\u{2009}(10000 columns)"]);
+    // Cut both ways: the dots meet in a corner, and the size names both.
+    let (r, linear, math) = region(&d, 4);
+    assert_eq!(r.state, CalcState::Fresh, "{linear}");
+    assert!(linear.ends_with("&⋮&⋮&⋱)] \"(60 rows × 60 columns)\""), "{}", &linear[linear.len() - 60..]);
+    let (cells, after) = result_matrix(&math.nodes);
+    assert_eq!(cells.len(), 51);
+    assert!(cells.iter().all(|row| row.len() == 51));
+    assert_eq!((cells[0][50].as_str(), cells[50][0].as_str(), cells[50][50].as_str()), ("⋯", "⋮", "⋱"));
+    assert_eq!(cells[49][49], (49 * 49).to_string());
+    assert_eq!(after.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["\u{2009}(60 rows × 60 columns)"]);
+    // Going stale keeps every form.
+    let fresh: Vec<String> = regions(&d).into_iter().map(|(_, linear, _)| linear).collect();
+    mark_stale(&mut d);
+    for (k, (_, linear, _)) in regions(&d).into_iter().enumerate() {
+        if let Some((head, tail)) = fresh[k].rsplit_once('=') {
+            assert_eq!(linear, format!("{head}≈{tail}"));
+        }
+    }
+    // A quoted row lists its first 50 values.
+    let mut d = doc_with(&["i := 0..9999", "r := transpose(i)"]);
+    if let Block::Para(p) = Arc::make_mut(&mut d.body[1]) {
+        let end = p.text.len();
+        p.insert_object(end, field("WCCALC r"), &CharProps::default()).unwrap();
+    }
+    recalc(&mut d, &no_page);
+    let to_49: Vec<String> = (0..50).map(|k| k.to_string()).collect();
+    assert_eq!(field_results(&d), [format!("{}, … (10000 values)", to_49.join(", "))]);
+}
+
+/// The text of every cell of the (first) bracketed matrix in a source's math tree, row by row.
+fn literal_cells(nodes: &[MNode]) -> Vec<Vec<String>> {
+    let at = nodes.iter().position(|n| matches!(n, MNode::Delim { beg: Some('['), .. })).unwrap_or_else(|| panic!("{nodes:#?}"));
+    result_matrix(&nodes[..=at]).0
+}
+
+#[test]
+fn a_long_literal_keeps_every_element() {
+    let long: Vec<String> = (0..200).map(|k| k.to_string()).collect();
+    let square: Vec<String> = (0..20).map(|r| (0..20).map(|c| format!("{}.5 in", r * 20 + c)).collect::<Vec<_>>().join(", ")).collect();
+    let mut d = doc_with(&[
+        &format!("D := [{}]", long.join(", ")),
+        &format!("M := [{}]", square.join("; ")),
+        "v := 2·[a + b, -c] in",
+        "a := 1",
+        "b := 2",
+        "c := 3",
+    ]);
+    recalc(&mut d, &no_page);
+    let (_, linear, math) = region(&d, 1);
+    assert!(linear.starts_with("D≔[■(0@1@2@") && linear.ends_with("@198@199)]"), "{linear}");
+    let cells = literal_cells(&math.nodes);
+    assert_eq!(cells, long.iter().map(|k| vec![k.clone()]).collect::<Vec<_>>());
+    let (_, _, math) = region(&d, 2);
+    let cells = literal_cells(&math.nodes);
+    assert_eq!(cells.len(), 20);
+    for (r, row) in cells.iter().enumerate() {
+        assert_eq!(row.len(), 20);
+        for (c, cell) in row.iter().enumerate() {
+            assert_eq!(cell, &format!("{}.5\u{2009}in", r * 20 + c), "[{r}, {c}]");
+        }
+    }
+    // As long a literal as a source can hold, of elements as long as they get: the linear parser
+    // alone would stop partway through it.
+    let small: Vec<String> = (0..1200).map(|k| format!("{}.5e-{} m", k % 10, k % 9 + 7)).collect();
+    let mut big = doc_with(&[&format!("E := [{}]", small.join(", "))]);
+    recalc(&mut big, &no_page);
+    let (r, linear, math) = region(&big, 1);
+    assert_eq!(r.state, CalcState::Fresh, "{linear}");
+    let cells = literal_cells(&math.nodes);
+    assert_eq!(cells.len(), 1200);
+    let mut one = doc_with(&[small[1199].as_str()].map(|e| format!("E := [{e}]")).each_ref().map(String::as_str));
+    recalc(&mut one, &no_page);
+    assert_eq!(cells[1199], literal_cells(&region(&one, 1).2.nodes)[0]);
+    // A wide one too: 40 × 40 elements that each take the parser some work.
+    let rows: Vec<String> = (0..40).map(|r| (0..40).map(|c| format!("{}.5e-{}", (r + c) % 10, c % 9 + 7)).collect::<Vec<_>>().join(", ")).collect();
+    let mut wide = doc_with(&[&format!("G := [{}]", rows.join("; "))]);
+    recalc(&mut wide, &no_page);
+    let (r, linear, math) = region(&wide, 1);
+    assert_eq!(r.state, CalcState::Fresh, "{linear}");
+    let cells = literal_cells(&math.nodes);
+    assert_eq!(cells.len(), 40);
+    assert!(cells.iter().all(|row| row.len() == 40), "{:?}", cells.iter().map(Vec::len).collect::<Vec<_>>());
+    // A literal among other things keeps its place, and the unit after it stands apart.
+    let (_, linear, math) = region(&d, 3);
+    assert_eq!(linear, "v≔2·[■(a+b@-c)] \"in\"");
+    assert_eq!(literal_cells(&math.nodes), [["a+b"], ["-c"]]);
+    let unit = math.nodes.last();
+    assert!(matches!(unit, Some(MNode::Run(r)) if r.text == "\u{2009}in" && r.sty == Some(MSty::Plain)), "{unit:?}");
+}
+
+#[test]
+fn a_definition_that_cannot_be_shown_defines_nothing() {
+    // 10^308 m is 3.9×10^309 in: no number to show in US customary units.
+    let mut d = doc_with(&["x := 1e308 m =", "y := x =", "v := [1 m, 1e308 m] =", "z := v[0] ="]);
+    if let Block::Para(p) = Arc::make_mut(&mut d.body[1]) {
+        for code in ["WCCALC x", "WCCALC v"] {
+            let end = p.text.len();
+            p.insert_object(end, field(code), &CharProps::default()).unwrap();
+        }
+    }
+    recalc(&mut d, &no_page);
+    let non_finite = CalcError::Unit(craft_units::UnitError::NonFinite);
+    assert_eq!(region(&d, 1).0.state, err(non_finite.clone()));
+    assert_eq!(region(&d, 2).0.state, err(CalcError::Upstream));
+    // The element that can't be shown is named.
+    assert_eq!(region(&d, 3).0.state, err(CalcError::Element { at: "1".into(), error: Box::new(non_finite) }));
+    assert_eq!(region(&d, 4).0.state, err(CalcError::Upstream));
+    assert_eq!(field_results(&d), ["?", "?"]);
+}
+
+#[test]
+fn a_long_source_keeps_all_its_text() {
+    // As long as sources get, in shapes the linear parser works hardest on: every name reaches the
+    // math tree.
+    let sources = [
+        format!("x := {}a", "a + ".repeat(1000)),
+        format!("x := {}a", "(a + b)/(c + d) + ".repeat(800)),
+        format!("x := {}a", "a_b^2 + ".repeat(1000)),
+        format!("x := {}a", "√(a + 1) + ".repeat(1000)),
+        format!("x := {}a", "[a, b; a, b] + ".repeat(700)),
+    ];
+    let names = ["a", "b", "c", "d"];
+    let defined: Vec<String> = names.iter().map(|n| format!("{n} := 1")).collect();
+    for src in &sources {
+        let mut all: Vec<&str> = defined.iter().map(String::as_str).collect();
+        all.push(src);
+        let mut d = doc_with(&all);
+        recalc(&mut d, &no_page);
+        let (r, linear, math) = region(&d, 5);
+        assert!(!matches!(r.state, CalcState::Error(ref e) if e.contains("too complex")), "{}: {:?}", &src[..40], r.state);
+        let text: String = runs(&math.nodes).iter().map(|r| r.text.as_str()).collect();
+        for n in names {
+            let want = linear.matches(n).count();
+            assert_eq!(text.matches(n).count(), want, "{n} in {}", &src[..40]);
+        }
+    }
 }

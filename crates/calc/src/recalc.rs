@@ -18,7 +18,7 @@ use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph};
 
 use crate::array::{self, Data};
 use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, run_stmt_in};
-use crate::render::{self, MAX_SHOWN_ROWS, Rendered, Shown, rendered, shown_result, shows_value};
+use crate::render::{self, MAX_SHOWN_COLS, MAX_SHOWN_ROWS, Rendered, Shown, rendered, shown_result, shows_value};
 use crate::{CalcError, Env, Stmt, check_name, defined_name, free_names, parse};
 
 /// What a [`recalc`] pass did.
@@ -809,18 +809,21 @@ fn format_value(q: Quantity, unit: Option<&str>, sys: UnitSystem, p: Precision) 
 }
 
 /// A result as it is shown: one value, or a vector or matrix of its first [`MAX_SHOWN_ROWS`] rows
-/// (each element in `unit` when given). An element that can't be formatted is named, counted from
-/// `origin`.
+/// and [`MAX_SHOWN_COLS`] columns (each element in `unit` when given); only those are formatted.
+/// An element that can't be formatted is named, counted from `origin`.
 fn format_data(d: &Data, unit: Option<&str>, sys: UnitSystem, p: Precision, origin: u8) -> Result<Shown, CalcError> {
     match d {
         Data::One(v) => format_value(v.q, unit, sys, p).map(Shown::One),
         Data::Grid(g) => {
             let scale = unit.map(parse_unit).transpose()?;
-            let rows = g.rows.min(MAX_SHOWN_ROWS);
-            let shown = g.items.get(..rows.saturating_mul(g.cols)).unwrap_or(&g.items);
-            let (items, unit) = format_elements(shown, &g.items, scale.as_ref(), sys, p)
-                .map_err(|(k, e)| array::element_error(g.rows, g.cols, k, origin, e.into()))?;
-            Ok(Shown::Grid { rows, cols: g.cols, items, unit, total_rows: g.rows })
+            let (rows, cols) = (g.rows.min(MAX_SHOWN_ROWS), g.cols.min(MAX_SHOWN_COLS));
+            let shown: Vec<Val> = (0..rows).filter_map(|r| g.items.get(r.saturating_mul(g.cols)..)?.get(..cols)).flatten().copied().collect();
+            let (items, unit) = format_elements(&shown, &g.items, scale.as_ref(), sys, p).map_err(|(k, e)| {
+                // Element `k` of those shown, as an element of the whole grid.
+                let (r, c) = (k.checked_div(cols).unwrap_or(0), k.checked_rem(cols).unwrap_or(0));
+                array::element_error(g.rows, g.cols, r.saturating_mul(g.cols).saturating_add(c), origin, e.into())
+            })?;
+            Ok(Shown::Grid { rows, cols, items, unit, total_rows: g.rows, total_cols: g.cols })
         }
     }
 }

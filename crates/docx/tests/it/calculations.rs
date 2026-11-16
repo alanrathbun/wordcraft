@@ -681,7 +681,20 @@ fn a_broken_fit_store_under_its_own_name_is_dropped() {
 
 #[test]
 fn vector_results_round_trip_as_word_matrices() {
-    let sources = ["D := [0.840, 1.050] in = ? mm", "x := 0..59 =", "v := [2 in, 3 lbf] =", "M := [1, 2; 3, 4] =", "S := [1e-9, 2e9] ="];
+    // A literal of many long elements, built cell by cell (Word keeps a matrix of up to 1000 rows).
+    let long: Vec<String> = (0..1000).map(|k| format!("{}.5e-{} m", k % 10, k % 9 + 7)).collect();
+    let long = format!("E := [{}]", long.join(", "));
+    let sources = [
+        "D := [0.840, 1.050] in = ? mm",
+        "x := 0..59 =",
+        "v := [2 in, 3 lbf] =",
+        "M := [1, 2; 3, 4] =",
+        "S := [1e-9, 2e9] =",
+        "i := 0..9999",
+        "r := transpose(i) =",
+        "Mx := mmul(x, transpose(x)) =",
+        long.as_str(),
+    ];
     let mut doc = Document::new();
     doc.body = sources
         .iter()
@@ -697,6 +710,8 @@ fn vector_results_round_trip_as_word_matrices() {
     let xml = document_xml(&bytes);
     assert!(xml.contains("<m:m>") || xml.contains("<m:m "), "a vector result is a Word matrix");
     assert!(xml.contains('⋮') && xml.contains("(60 rows)"), "the cut is in Word's equation too");
+    assert!(xml.contains('⋯') && xml.contains('⋱'), "so are a column cut and the corner");
+    assert!(xml.contains("(10000 columns)") && xml.contains("(60 rows × 60 columns)"));
     let back = open(&bytes);
     for (i, (r, linear)) in regions(&back).iter().enumerate() {
         assert_eq!(r.state, CalcState::Fresh, "{} came back as {:?} ({linear})", sources[i], r.state);
