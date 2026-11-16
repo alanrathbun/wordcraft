@@ -147,9 +147,10 @@ document.
 | `L_1 := [2 in, 50 mm]` | each element with its own unit |
 | `M := [1, 2; 3, 4]` | a 2×2 matrix; `;` starts a new row |
 
-A list in brackets is always a column: `[1, 2, 3]` has 3 rows and 1 column, as in Mathcad. A unit
-after the bracket applies to every element. An element can carry its own unit instead, and mixed
-units are fine where they make sense (`[2 in, 50 mm]` is two lengths).
+A list in brackets is always a column: `[1, 2, 3]` has 3 rows and 1 column, as in Mathcad. For a
+row, transpose it: `transpose([1, 2, 3])` has 1 row and 3 columns. A unit after the bracket
+applies to every element. An element can carry its own unit instead, and mixed units are fine
+where they make sense (`[2 in, 50 mm]` is two lengths).
 
 ### Arithmetic is element by element
 
@@ -175,8 +176,10 @@ The `[` must touch the name: with anything else before it, `[` starts a list, so
 times the list.
 
 Elements count from 0, as in Mathcad, so `D[0]` is the first. To count from 1, choose 1 under
-"Arrays count from" in References › Calculation Options; the setting is saved in the document. An
-index outside the array is an error that gives the valid range ("index 3 is outside D (0 to 2)").
+"Arrays count from" in References › Calculation Options; the setting is saved in the document.
+Changing this renumbers every index, including quoted elements: after a change from 0 to 1, a
+value quoted as element 1 shows the first element, not the second. An index outside the array is
+an error that gives the valid range ("index 3 is outside D (0 to 2)").
 
 ### Ranges and `t[i] :=`
 
@@ -191,6 +194,11 @@ index outside the array is an error that gives the valid range ("index 3 is outs
 A range is a vector. It can only be the whole right side of a definition: `x := 0..5 =` shows it,
 but `0..5 =` alone is an error. A function, or an indexed name like `t[i]`, can't be defined as a
 range.
+
+A step that lands on the last value ends exactly on it, however large the values are
+(`100000, 100000.1..100002` has 21 elements, ending at 100002). A step too small next to its
+values to tell where the range ends, such as 0.1 on values near 10^15, is an error rather than a
+guess.
 
 `t[i] := …` is Mathcad's range-and-index pattern, and it is still a single definition of `t`.
 Usually the element-by-element form is simpler: `t := 2·D` gives the same vector.
@@ -210,8 +218,8 @@ Usually the element-by-element form is simpler: `t := 2·D` gives the same vecto
 | `linterp(xs, ys, x)` | the straight-line interpolation of `ys` at `x` |
 | `spline(xs, ys, x)` | the interpolation along a natural cubic spline through every point |
 
-- `lookup` never guesses. `x` must equal one `xs` element exactly (after converting units); no
-  match, or more than one, is an error.
+- `lookup` never guesses. `x` must equal one `xs` element to within rounding, after converting
+  units (so `38.1 mm` finds `1.5 in`); no match, or more than one, is an error.
 - For `linterp` and `spline`, `xs` must be a single row or column, strictly increasing. Neither
   extrapolates: an `x` outside `xs` is an error, such as "1.6 in is outside NPS (0.5 in to
   1.5 in)".
@@ -302,10 +310,19 @@ names the column and the row of values (counting the first row under the heading
 A column name defined twice in the document follows the usual rule: whichever comes second is the
 error.
 
-Merged cells, or a heading row other than the first row, are an error for the whole table. A red
-⚠ on the heading cell shows the table has errors; hover over it to read them. The table's text is
-never changed. Every calculation that uses a column in error shows "depends on table data with an
-error" instead of a result.
+These are errors for the whole table:
+
+- merged cells;
+- a heading row (repeated on each page) other than the first row;
+- a row without exactly one cell under each heading;
+- fewer than two rows, so no row of values (also when every row of values is deleted with
+  tracked changes);
+- more than 63 columns.
+
+A column of more than 10,000 values is an error for that column. A red ⚠ on the heading cell
+shows the table has errors (on the first cell for an error about the whole table); hover over it
+to read them. The table's text is never changed. Every calculation that uses a column in error
+shows "depends on table data with an error" instead of a result.
 
 ### How results and quoted values show
 
