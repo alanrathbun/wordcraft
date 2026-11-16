@@ -1473,6 +1473,95 @@ fn per_element_branches() {
     assert_eq!(vector_in(&mut env, "n := g_2(x) if x > 0, 0 otherwise ="), vec![2.0, 0.0, 1.0, 0.0]);
 }
 
+/// The `x` of `lookup`, `linterp` and `spline` is per element in a branch: an element that picks
+/// another branch can't fail there, and `x`'s own failed elements fail only their own results.
+/// The tables stay whole, and strict callers keep their errors.
+#[test]
+fn lookups_and_interpolations_fail_only_the_elements_that_pick_them() {
+    let mut env = Env::new();
+    for src in ["xs := [0, 10, 20]", "ys := [0, 100, 400]", "x := [5, 15, 30]", "k := [1, 2, 9]", "xs_2 := [1, 2, 3]", "ys_2 := [10, 20, 30]"] {
+        run(&mut env, src).unwrap();
+    }
+    // The reproductions: per-element results.
+    assert_eq!(vector_in(&mut env, "y := linterp(xs, ys, x) if x ≤ 20, 0 otherwise ="), vec![50.0, 250.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "y_2 := if(x ≤ 20, linterp(xs, ys, x), 0) ="), vec![50.0, 250.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "y_3 := lookup(xs_2, ys_2, k) if k ≤ 3, 0 otherwise ="), vec![10.0, 20.0, 0.0]);
+    let s = vector_in(&mut env, "y_4 := spline(xs, ys, x) if x ≤ 20, 0 otherwise =");
+    assert_eq!((s.len(), s[2]), (3, 0.0));
+    // `x`'s own failed element (`1/z` at 0) passes through, as in `2·(1/z)`.
+    run(&mut env, "z := [4, 0, 9]").unwrap();
+    assert_eq!(vector_in(&mut env, "y_5 := 2·(1/z) if z ≠ 0, 0 otherwise ="), vec![0.5, 0.0, 2.0 / 9.0]);
+    let v = vector_in(&mut env, "y_6 := linterp([0, 1], [0, 10], 1/z) if z ≠ 0, 0 otherwise =");
+    assert_eq!(v.len(), 3);
+    assert!((v[0] - 2.5).abs() < 1e-12 && v[1] == 0.0 && (v[2] - 10.0 / 9.0).abs() < 1e-12, "{v:?}");
+    assert_eq!(vector_in(&mut env, "y_7 := lookup([0.25, 1/9], [1, 2], 1/z) if z ≠ 0, 0 otherwise ="), vec![1.0, 0.0, 2.0]);
+    // A picked element that fails still fails, named once.
+    assert_eq!(err_in(&mut env, "b := linterp(xs, ys, x) if x ≥ 0, 0 otherwise ="), "element 2: 30 is outside xs (0 to 20)");
+    assert_eq!(err_in(&mut env, "b := linterp([0, 1], [0, 10], 1/z) if z ≥ 0, 0 otherwise ="), "element 1: result isn't a finite number");
+    // Strict callers: the errors as before.
+    assert_eq!(err_in(&mut env, "linterp(xs, ys, x) ="), "element 2: 30 is outside xs (0 to 20)");
+    assert_eq!(err_in(&mut env, "spline(xs, ys, x) ="), "element 2: 30 is outside xs (0 to 20)");
+    assert_eq!(err_in(&mut env, "lookup(xs_2, ys_2, k) ="), "element 2: 9 isn't in xs_2");
+    // The tables are taken whole, even in a branch: a failed element of `xs` fails every element.
+    assert_eq!(err_in(&mut env, "b := lookup(1/z, ys, 1) if z ≠ 0, 0 otherwise ="), "element 1: result isn't a finite number");
+}
+
+/// Text lookups follow the same rule, for a text `x` and for a text result.
+#[test]
+fn text_lookups_fail_only_the_elements_that_pick_them() {
+    let mut env = Env::new();
+    for src in [
+        "Material := [\"A\", \"B\"]",
+        "S := [10, 20]",
+        "mat := [\"A\", \"C\", \"B\"]",
+        "k := [1, 2, 9]",
+        "words := [\"ten\", \"twenty\", \"thirty\"]",
+        "pair := [\"ten\", \"twenty\"]",
+    ] {
+        run(&mut env, src).unwrap();
+    }
+    assert_eq!(vector_in(&mut env, "s_1 := lookup(Material, S, mat) if mat ≠ \"C\", 0 otherwise ="), vec![10.0, 0.0, 20.0]);
+    assert_eq!(
+        run_value(&mut env, "w := lookup([1, 2, 3], words, k) if k ≤ 3, \"none\" otherwise ="),
+        Ok(Some(Value::TextGrid { rows: 3, cols: 1, items: vec!["ten".into(), "twenty".into(), "none".into()] }))
+    );
+    assert_eq!(
+        run_value(&mut env, "w_2 := lookup(Material, pair, mat) if mat ≠ \"C\", \"none\" otherwise ="),
+        Ok(Some(Value::TextGrid { rows: 3, cols: 1, items: vec!["ten".into(), "none".into(), "twenty".into()] }))
+    );
+    assert_eq!(err_in(&mut env, "lookup(Material, S, mat) ="), "element 1: \"C\" isn't in Material");
+    // An `x` whose every element failed is no number to refuse against text `xs`: each element
+    // keeps its own failure.
+    run(&mut env, "z_0 := [0, 0]").unwrap();
+    assert_eq!(err_in(&mut env, "b := lookup(Material, S, 1/z_0) if z_0 == 0, 0 otherwise ="), "element 0: result isn't a finite number");
+}
+
+/// A chain is the `and` of its links: a link's right operand is worked out only where every
+/// earlier link holds, and a failure where an element is already false is ignored.
+#[test]
+fn a_chain_is_the_and_of_its_links() {
+    let mut env = Env::new();
+    run(&mut env, "b := 0").unwrap();
+    assert_eq!(run(&mut env, "0 < b < 1/b =").unwrap().unwrap().value, 0.0);
+    assert_eq!(run(&mut env, "0 < b and b < 1/b =").unwrap().unwrap().value, 0.0);
+    // A single false stops the chain before a later operand is worked out.
+    assert_eq!(run(&mut env, "1 < 0 < undefined_name =").unwrap().unwrap().value, 0.0);
+    assert_eq!(run(&mut env, "5 < 3 < [1, 2] ="), Ok(Some(Quantity::dimensionless(0.0))));
+    // A link that is reached and fails still fails.
+    assert_eq!(err_in(&mut env, "-1 < b < 1/b ="), "result isn't a finite number");
+    // Per element.
+    run(&mut env, "v := [0.5, 0, 2]").unwrap();
+    assert_eq!(vector_in(&mut env, "0 < v < 1/v ="), vec![1.0, 0.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "0 < v and v < 1/v ="), vec![1.0, 0.0, 0.0]);
+    assert_eq!(err_in(&mut env, "-1 < v < 1/v ="), "element 1: result isn't a finite number");
+    // Three links: the third operand only where the first two hold.
+    run(&mut env, "w := [1, 0, -1, 0.5]").unwrap();
+    assert_eq!(vector_in(&mut env, "0 < w ≤ 1 < 2/w ="), vec![1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(err_in(&mut env, "-1 < w ≤ 1 < 2/w ="), "element 1: result isn't a finite number");
+    // In a branch, as a condition.
+    assert_eq!(vector_in(&mut env, "c := 1 if 0 < v < 1/v, 2 otherwise ="), vec![1.0, 2.0, 2.0]);
+}
+
 #[test]
 fn piecewise_details() {
     let mut env = Env::new();

@@ -394,7 +394,9 @@ grades := ["A106 B", "A312 TP316"]
   that lands exactly on its limit doesn't flip because of unit conversion: `38.1 mm > 1.5 in` is
   false and `38.1 mm ≤ 1.5 in` is true. Zero is equal only to exactly zero. To compare with zero,
   use a tolerance: `abs(x) < 1e-9 m`, not `x == 0 m`.
-- Comparisons chain: `0 ≤ x < 1` means `0 ≤ x and x < 1`.
+- Comparisons chain: `0 ≤ x < 1` means `0 ≤ x and x < 1`. Like `and`, a chain stops at the first
+  link that is false, so `0 < b < 1/b` is 0, not an error, when `b` is 0. On vectors this happens
+  per element.
 - An absolute temperature (a `°C` or `°F` value, or one plus or minus a difference) compares with
   another absolute temperature or with a `K` or `°R` value: `T ≤ 900 °F` and `T ≤ 755 K` both
   work. It can't be compared with a temperature difference, or with an average written
@@ -414,8 +416,8 @@ instead; they mean the same.
 ok := P ≤ P_max and T ≤ T_max =
 ```
 
-- `not` binds looser than a comparison, so `not x < 3` means `not (x < 3)`. `and` binds tighter than
-  `or`.
+- `not` binds looser than a comparison, so `not x < 3` means `not (x < 3)`, and it is shown as
+  `¬(x<3)`. `and` binds tighter than `or`.
 - When the left side already decides the result, the right side isn't worked out:
   `b ≠ 0 and 1/b > 1` is 0, not an error, when `b` is 0. On vectors this happens per element.
 
@@ -442,8 +444,13 @@ left brace, one line per case.
 - With a vector, each element picks its own case, and an element only fails if the case it picks
   fails: `sqrt(x) if x ≥ 0, 0 otherwise` works for a vector `x` with negative entries, giving the
   square root where `x ≥ 0` and 0 elsewhere.
-- Inside a case, whole arrays stay whole. `sum(x)`, `x[0]` and `lookup(xs, …)` see all of `x`, as
-  they do outside a case; only the choice of result is per element.
+- Inside a case, whole arrays stay whole. `sum(x)`, `x[0]` and the tables of `lookup(xs, ys, …)`
+  see all of `x`, `xs` and `ys`, as they do outside a case; only the choice of result is per
+  element.
+- The value looked up or interpolated at, the `x` of `lookup`, `linterp` and `spline`, is per
+  element like arithmetic. With `xs` ending at 20, `linterp(xs, ys, x) if x ≤ 20, 0 otherwise`
+  works for a vector `x` with elements past 20, giving 0 there. Likewise an element of `x` with no
+  match in `xs` fails only if it picks that case.
 - The results can be text: `"OK" if margin ≥ 0 in, "NG" otherwise`. A single value may be text in
   one case and a number in another, but a vector can't mix them: if one element picks a number and
   another picks text, the result is an error that names the element ("element 1 is text but
@@ -539,7 +546,7 @@ on that definition, and the same message on each calculation that uses the word 
 rather than quietly changing what the document means. Rename the variable to fix it. A variable
 named `text` is fine; only a heading ending in `(text)` is special.
 
-### In Word
+### Conditions, text and sums in Word
 
 Text, comparisons, cases (as a left brace, one line per case) and sums are saved as ordinary Word
 math that reads correctly in Word, and reopen live in WordCraft. A text column's cells are an

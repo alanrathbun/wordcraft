@@ -739,20 +739,43 @@ fn index_text(i: f64) -> String {
     if i.abs() < 1e15 { format!("{}", i as i64) } else { format!("{i:e}") }
 }
 
-/// `a < b ≤ c …`: every operand evaluated once, each link compared element by element, and the
-/// links combined with `and`. The result is 1 or 0 (a grid of them when an operand is a grid).
+/// `a < b ≤ c …`: the `and` of its links (`a < b and b ≤ c …`), each operand evaluated at most
+/// once. As with `and`, a link's right operand is worked out only where every earlier link holds: a
+/// single false stops the chain, and for a grid the rest is worked out over whole arrays
+/// ([`eval_lenient`]) but taken only by the elements still true, so an element already false
+/// ignores a later operand's failures ([`logic_per_element`]). The result is 1 or 0 (a grid of them
+/// when an operand is a grid).
 // Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
 fn compare_chain(cx: &Cx<'_>, fr: &Frame<'_>, first: &Expr, rest: &[(Cmp, Expr)], depth: usize) -> Result<Data, CalcError> {
     let mut prev = eval(cx, fr, first, depth + 1)?;
     let mut holds: Option<Data> = None;
     for (cmp, e) in rest {
-        let next = eval(cx, fr, e, depth + 1)?;
-        let link = compare(cx, &prev, *cmp, &next)?;
-        holds = Some(match holds {
-            Some(all) => pair(cx, &all, &link, |x, y| Ok(truth_val(x.q.value != 0.0 && y.q.value != 0.0)))?,
-            None => link,
-        });
+        let link = |prev: &Data| -> Result<(Data, Data), CalcError> {
+            let next = eval(cx, fr, e, depth + 1)?;
+            let link = compare(cx, prev, *cmp, &next)?;
+            Ok((next, link))
+        };
+        let (next, all) = match holds {
+            // A false so far decides the chain.
+            Some(Data::One(v)) if v.q.value == 0.0 => return Ok(Data::One(v)),
+            Some(Data::Grid(g)) => {
+                let (rows, cols) = (g.rows, g.cols);
+                let (mut slots, open) = undecided(&g, false);
+                if open.is_empty() {
+                    return Ok(Data::Grid(g));
+                }
+                let (next, link) = leniently(cx, || link(&prev))?;
+                same_shape((rows, cols), &link)?;
+                take(cx, &link, open, &mut slots)?;
+                (next, assemble(cx, rows, cols, slots)?)
+            }
+            // None so far, or true: the chain is this link.
+            Some(Data::One(_)) | None => link(&prev)?,
+            // A comparison gives numbers.
+            Some(Data::Text(_) | Data::TextGrid(_)) => return Err(CalcError::NotCondition),
+        };
+        holds = Some(all);
         prev = next;
     }
     holds.ok_or_else(|| CalcError::Syntax("a comparison needs two values".to_string()))
@@ -883,18 +906,7 @@ fn logic_op(cx: &Cx<'_>, fr: &Frame<'_>, logic: Logic, a: &Expr, b: &Expr, depth
 #[inline(never)]
 fn logic_per_element(cx: &Cx<'_>, fr: &Frame<'_>, decides: bool, left: &Grid, b: &Expr, depth: usize) -> Result<Data, CalcError> {
     let (rows, cols) = (left.rows, left.cols);
-    let mut failures = array::Failures::of(Some(left));
-    let mut slots: Vec<Slot> = left
-        .items
-        .iter()
-        .enumerate()
-        .map(|(k, v)| match failures.at(k) {
-            Some(e) => Slot::Failed(e.clone()),
-            None if (v.q.value != 0.0) == decides => Slot::Num(truth_val(decides)),
-            None => Slot::Open,
-        })
-        .collect();
-    let open: Vec<usize> = slots.iter().enumerate().filter_map(|(k, s)| matches!(s, Slot::Open).then_some(k)).collect();
+    let (mut slots, open) = undecided(left, decides);
     if !open.is_empty() {
         let right = leniently(cx, || {
             let y = eval(cx, fr, b, depth + 1)?;
@@ -904,6 +916,25 @@ fn logic_per_element(cx: &Cx<'_>, fr: &Frame<'_>, decides: bool, left: &Grid, b:
         take(cx, &right, open, &mut slots)?;
     }
     assemble(cx, rows, cols, slots)
+}
+
+/// The slots of `left and …` or `left or …` for a grid `left` of 1s and 0s that decides each
+/// element where it is `decides` (true for `or`, false for `and`), and the elements it leaves open
+/// to the right side, in order. An element that failed in `left` keeps its failure.
+fn undecided(left: &Grid, decides: bool) -> (Vec<Slot>, Vec<usize>) {
+    let mut failures = array::Failures::of(Some(left));
+    let slots: Vec<Slot> = left
+        .items
+        .iter()
+        .enumerate()
+        .map(|(k, v)| match failures.at(k) {
+            Some(e) => Slot::Failed(e.clone()),
+            None if (v.q.value != 0.0) == decides => Slot::Num(truth_val(decides)),
+            None => Slot::Open,
+        })
+        .collect();
+    let open = slots.iter().enumerate().filter_map(|(k, s)| matches!(s, Slot::Open).then_some(k)).collect();
+    (slots, open)
 }
 
 /// What one element of a result worked out per element is, as it is worked out.
@@ -1272,7 +1303,7 @@ fn shown_value(cx: &Cx<'_>, v: Val) -> String {
             return format!("{} {}", crate::render::text_number(&f.number), f.unit);
         }
     }
-    let acx = array_funcs::Ctx { origin: cx.env.origin, pass: cx.pass, system, precision };
+    let acx = array_funcs::Ctx { origin: cx.env.origin, pass: cx.pass, system, precision, lenient: false };
     array_funcs::shown(v.q, &acx)
 }
 
@@ -1699,7 +1730,7 @@ fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) ->
     let exprs = args;
     let args = eval_args(cx, fr, exprs, depth)?;
     let env = cx.env;
-    let acx = array_funcs::Ctx { origin: env.origin, pass: cx.pass, system: env.system, precision: env.precision };
+    let acx = array_funcs::Ctx { origin: env.origin, pass: cx.pass, system: env.system, precision: env.precision, lenient: cx.lenient() };
     if let Some(result) = array_funcs::call_array(name, &args, exprs, &acx) {
         return result;
     }

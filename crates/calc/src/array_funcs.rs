@@ -11,10 +11,12 @@
 //!
 //! None of them guesses: a lookup that matches no `xs` and an interpolation outside `xs` are
 //! errors, never the nearest value or an extrapolation. `x` may be a grid, giving one result per
-//! element. An error about an argument names it as written when it is a bare name (`NPS`), else
-//! by its role (`xs`). Each function charges its element work to the pass before doing it.
+//! element; in a branch worked out per element ([`Ctx::lenient`]) an element of `x` that fails
+//! fails only its own result, as in element-wise arithmetic. An error about an argument names it as
+//! written when it is a bare name (`NPS`), else by its role (`xs`). Each function charges its
+//! element work to the pass before doing it.
 
-use crate::array::{self, Data, Grid, MAX_ELEMENTS};
+use crate::array::{self, Data, Failures, Grid, MAX_ELEMENTS};
 use crate::eval::{Pass, Val, cut_text, picked, text_use};
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, render};
@@ -35,13 +37,19 @@ pub(crate) struct Ctx<'a> {
     pub(crate) system: UnitSystem,
     /// The decimal places values in messages are shown with.
     pub(crate) precision: Precision,
+    /// Whether the call is in a branch worked out over whole arrays: then the per-element `x` of
+    /// `lookup`, `linterp` and `spline` keeps each element's error in the result's `failed` list
+    /// (and passes its own failed elements through), as element-wise arithmetic does. Their tables
+    /// and every other function's arguments are taken whole, so they stay strict.
+    pub(crate) lenient: bool,
 }
 
 /// Call the array function `name` on evaluated `args`, written as `exprs`; `None` when `name`
 /// isn't one, and for `min`/`max` of single values only (those are scalar built-ins).
 ///
 /// They take their arguments whole, so an argument with a failed element ([`Data::strict`]) is that
-/// element's error.
+/// element's error; but for a lenient caller ([`Ctx::lenient`]), the `x` of `lookup`, `linterp` and
+/// `spline` is per element, and its failed elements fail only their own results.
 pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Option<Result<Data, CalcError>> {
     type Run = fn(&str, &[Data], &[Expr], &Ctx<'_>) -> Result<Data, CalcError>;
     let run: Run = match name {
@@ -56,7 +64,9 @@ pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>
         "linterp" | "spline" => interpolate,
         _ => return None,
     };
-    if let Some(e) = args.iter().find_map(|a| a.failure(cx.origin)) {
+    // The per-element `x` (the third argument) of a lookup or an interpolation.
+    let per_x = cx.lenient && args.len() == 3 && matches!(name, "lookup" | "linterp" | "spline");
+    if let Some(e) = args.iter().enumerate().filter(|(i, _)| !(per_x && *i == 2)).find_map(|(_, a)| a.failure(cx.origin)) {
         return Some(Err(e));
     }
     // Numbers only, but for the sizes, `transpose` and `lookup`.
@@ -319,24 +329,33 @@ fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError
     // Texts are read (and keyed) by their size.
     cx.pass.charge(text_work(xs).saturating_add(text_work(x)))?;
     let (xs_text, x_text) = (xs.text(), x.text());
-    let found: Vec<usize> = match (xs_text, x_text) {
+    let found = match (xs_text, x_text) {
         (None, None) => {
             // Every element of `x` is compared with every element of `xs`.
             charge(cx, count(x).saturating_add(1).saturating_mul(count(xs)))?;
             let xv = items(xs);
             let dim = one_dim(xv, xs_name, cx.origin)?;
-            let results = items(x).iter().map(|x| {
+            let mut failures = failures_of(x);
+            let results = items(x).iter().enumerate().map(|(k, x)| {
+                // A failed element's item is a placeholder: its own error is its result.
+                if let Some(e) = failures.at(k) {
+                    return Err(e.clone());
+                }
                 fits(x.q, dim)?;
                 let matches = xv.iter().enumerate().filter(|(_, xi)| nearly_equal(xi.q.value, x.q.value)).map(|(i, _)| i);
                 unique(matches, xs_name, || shown(x.q, cx))
             });
-            positions(x, cx.origin, results)?
+            positions(x, cx, results)?
         }
         (Some(_), Some(_)) => {
             charge(cx, count(xs))?;
             let keys: Vec<String> = texts(xs).iter().map(|s| array::text_key(s)).collect();
             let steps: Vec<u64> = keys.iter().map(|k| array::text_steps(k)).collect();
-            let results = texts(x).iter().map(|text| {
+            let mut failures = failures_of(x);
+            let results = texts(x).iter().enumerate().map(|(k, text)| {
+                if let Some(e) = failures.at(k) {
+                    return Err(e.clone());
+                }
                 let key = array::text_key(text);
                 // Comparing two texts costs one step and the size of the shorter, as `==` does
                 // (a mismatch ends at the shorter). Charged before this element is searched.
@@ -345,11 +364,17 @@ fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError
                 let matches = keys.iter().enumerate().filter(|(_, k)| **k == key).map(|(i, _)| i);
                 unique(matches, xs_name, || format!("\"{}\"", cut_text(text)))
             });
-            positions(x, cx.origin, results)?
+            positions(x, cx, results)?
+        }
+        // An `x` whose every element failed (only a lenient caller's can) is built as numbers, but
+        // it is of no kind: its failures are the result, not a mismatch with text `xs`.
+        (Some(_), None) if matches!(x, Data::Grid(g) if g.failed.len() == g.items.len()) => {
+            cx.pass.charge(x.copy_work())?;
+            return Ok(x.clone());
         }
         (Some(text), None) | (None, Some(text)) => return Err(CalcError::Syntax(format!("can't compare \"{}\" with a number", cut_text(text)))),
     };
-    gather(ys, ys_name, &found, x.shape(), cx)
+    gather(ys, ys_name, found, x.shape(), cx)
 }
 
 /// The one element index of `matches`: none is "isn't in", and two or more is "matches more than
@@ -362,43 +387,64 @@ fn unique(mut matches: impl Iterator<Item = usize>, xs_name: &str, shown: impl F
     }
 }
 
-/// Each element's result, in order; the first error stops it, naming its element when `x` is a
-/// grid (counted from `origin`).
-fn positions(x: &Data, origin: u8, results: impl Iterator<Item = Result<usize, CalcError>>) -> Result<Vec<usize>, CalcError> {
-    let mut found = Vec::new();
+/// Where each element of a lookup's `x` was found (`None` where it failed), and the failed
+/// elements' errors, in order.
+struct Found {
+    at: Vec<Option<usize>>,
+    failed: Vec<(usize, CalcError)>,
+}
+
+/// Each element's result, in order. A single `x`'s error is returned as it is. For a grid, a
+/// lenient caller keeps each element's error ([`array::keep_failure`]); otherwise the first stops
+/// it, naming its element (counted from `cx.origin`). Running out of work always stops it.
+fn positions(x: &Data, cx: &Ctx<'_>, results: impl Iterator<Item = Result<usize, CalcError>>) -> Result<Found, CalcError> {
+    let mut found = Found { at: Vec::new(), failed: Vec::new() };
     for (k, r) in results.enumerate() {
-        match r {
-            Ok(i) => found.push(i),
-            Err(e) => {
-                return Err(match x.shape() {
-                    Some((rows, cols)) => array::element_error(rows, cols, k, origin, e),
-                    None => e,
-                });
+        match (r, x.shape()) {
+            (Ok(i), _) => found.at.push(Some(i)),
+            (Err(e), None) => return Err(e),
+            (Err(e), Some((rows, cols))) => {
+                array::keep_failure(&mut found.failed, k, e, cx.lenient, |e| array::element_error(rows, cols, k, cx.origin, e))?;
+                found.at.push(None);
             }
         }
     }
     Ok(found)
 }
 
-/// The elements `found` of `ys`, in `shape` (`None` for a single value). Text is charged for
-/// before it is copied.
-fn gather(ys: &Data, ys_name: &str, found: &[usize], shape: Option<(usize, usize)>, cx: &Ctx<'_>) -> Result<Data, CalcError> {
+/// The failures of `d`'s elements, of numbers or of texts (none for a single value).
+fn failures_of(d: &Data) -> Failures<'_> {
+    match d {
+        Data::Grid(g) => Failures::of(Some(g)),
+        Data::TextGrid(g) => Failures::of(Some(g)),
+        Data::One(_) | Data::Text(_) => Failures::of::<Val>(None),
+    }
+}
+
+/// The elements `found` of `ys`, in `shape` (`None` for a single value); a failed element keeps
+/// its error, with a placeholder item. Text is charged for before it is copied. A grid whose every
+/// element failed is of numbers, as [`Data::text`] expects.
+fn gather(ys: &Data, ys_name: &str, found: Found, shape: Option<(usize, usize)>, cx: &Ctx<'_>) -> Result<Data, CalcError> {
     let missing = |i: usize| CalcError::Syntax(format!("{ys_name} has no element {i}"));
     let single = || CalcError::Syntax("an array needs at least one element".to_string());
-    if matches!(ys, Data::Text(_) | Data::TextGrid(_)) {
+    let Found { at, failed } = found;
+    let any = at.iter().any(Option::is_some);
+    if matches!(ys, Data::Text(_) | Data::TextGrid(_)) && any {
         let all = texts(ys);
-        let picked: Vec<&String> = found.iter().map(|&i| all.get(i).ok_or_else(|| missing(i))).collect::<Result<_, _>>()?;
-        cx.pass.charge(picked.iter().fold(0, |n: u64, s| n.saturating_add(array::text_steps(s))))?;
-        let out: Vec<String> = picked.into_iter().cloned().collect();
+        let picked: Vec<Option<&String>> =
+            at.iter().map(|&i| i.map(|i| all.get(i).ok_or_else(|| missing(i))).transpose()).collect::<Result<_, _>>()?;
+        cx.pass.charge(picked.iter().flatten().fold(0, |n: u64, s| n.saturating_add(array::text_steps(s))))?;
+        let out: Vec<String> = picked.into_iter().map(|s| s.cloned().unwrap_or_default()).collect();
         return match shape {
-            Some((rows, cols)) => Grid::new(rows, cols, out).map(Data::TextGrid),
+            Some((rows, cols)) => Grid::with_failed(rows, cols, out, failed).map(Data::TextGrid),
             None => out.into_iter().next().map(Data::Text).ok_or_else(single),
         };
     }
     let all = items(ys);
-    let out: Vec<Val> = found.iter().map(|&i| all.get(i).copied().ok_or_else(|| missing(i))).collect::<Result<_, _>>()?;
+    let out: Vec<Val> =
+        at.iter().map(|&i| i.map_or(Ok(array::placeholder()), |i| all.get(i).copied().ok_or_else(|| missing(i)))).collect::<Result<_, _>>()?;
     match shape {
-        Some((rows, cols)) => Grid::new(rows, cols, out).map(Data::Grid),
+        Some((rows, cols)) => Grid::with_failed(rows, cols, out, failed).map(Data::Grid),
         None => out.into_iter().next().map(Data::One).ok_or_else(single),
     }
 }
@@ -436,7 +482,7 @@ fn interpolate(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Resul
     let yv: Vec<f64> = ys.iter().map(|v| v.q.value).collect();
     let curve = if name == "spline" { second_derivatives(&xv, &yv) } else { Vec::new() };
     let t = picked(ys);
-    array::map(x, cx.origin, false, |x| {
+    array::map(x, cx.origin, cx.lenient, |x| {
         fits(x.q, x_dim)?;
         let v = x.q.value;
         // The first point at or past `v`: `v` is between it and the one before.
@@ -510,7 +556,7 @@ mod tests {
         let xs = Data::TextGrid(Grid::new(n, 1, keys.to_vec()).expect("grid"));
         let ys = Data::Grid(Grid::new(n, 1, (0..n).map(|k| Val::plain(Quantity::dimensionless(k as f64))).collect()).expect("grid"));
         let pass = Pass::new(u64::MAX);
-        let cx = Ctx { origin: 1, pass: &pass, system: UnitSystem::Si, precision: Precision::new(4) };
+        let cx = Ctx { origin: 1, pass: &pass, system: UnitSystem::Si, precision: Precision::new(4), lenient: false };
         // A sought text that isn't there is an error, after the same work.
         let _ = call_array("lookup", &[xs, ys, Data::Text(x.to_string())], &[], &cx);
         pass.spent()
