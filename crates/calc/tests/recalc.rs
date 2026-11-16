@@ -740,6 +740,23 @@ fn a_range_keeps_its_dots_out_of_fractions_in_the_math() {
     }
 }
 
+/// A fraction before a range's `,` or after its `..` keeps the comma and dots out of it too.
+#[test]
+fn a_range_keeps_its_comma_out_of_fractions_in_the_math() {
+    let sources = ["p := 1 + 1/2, 2..5", "q := 1/2, 1..5", "r := 0..1 + 1/2 =", "s := 0, 1/2..1"];
+    let mut d = doc_with(&sources);
+    recalc(&mut d, &no_page);
+    for (k, src) in sources.iter().enumerate() {
+        let (_, linear, math) = region(&d, k as u64 + 1);
+        let dens = denominators(&math.nodes);
+        assert!(!dens.is_empty(), "{src}: no fraction in {:#?}", math.nodes);
+        for den in dens {
+            let text: String = runs(&den).iter().map(|r| r.text.clone()).collect();
+            assert!(!text.contains(',') && !text.contains(".."), "{src} ({linear}): a denominator holds {text:?}");
+        }
+    }
+}
+
 #[test]
 fn a_subscripted_function_keeps_its_arguments_out_of_the_subscript() {
     let mut d = doc_with(&["f_a(t) := t^2"]);
