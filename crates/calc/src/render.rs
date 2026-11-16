@@ -775,7 +775,18 @@ impl Out {
             text.push(')');
         }
         text.push_str("▒〖");
-        let e = built(|o| write_expr(body, o), &mut text);
+        // A term that is a sum of terms, a comparison or looser keeps visible parentheses: the
+        // invisible grouping alone would show `∑(i = 1..n) (a[i] + 1)` as `∑ a_i+1`, which reads
+        // as `∑(i = 1..n) a[i] + 1`.
+        let grouped = prec(body) < PRODUCT;
+        let e = built(
+            |o| {
+                o.text(if grouped { "(" } else { "" });
+                write_expr(body, o);
+                o.text(if grouped { ")" } else { "" });
+            },
+            &mut text,
+        );
         text.push('〗');
         self.linear.push_str(&text);
         let k = self.nodes.len();

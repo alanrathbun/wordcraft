@@ -846,3 +846,13 @@ fn nested_sums_are_bounded() {
     let closes: String = (0..200).map(|_| ") 1").collect();
     assert_eq!(parse(&format!("{in_ends}3{closes} =")), Err(CalcError::TooComplex));
 }
+
+#[test]
+fn a_keyword_cannot_be_a_sums_index() {
+    for word in ["and", "or", "not", "if", "otherwise"] {
+        assert_eq!(parse(&format!("∑({word} = 1..3) 1 =")), Err(CalcError::Keyword(word.to_string())), "{word}");
+    }
+    assert_eq!(parse("∑(and = 1..3) 1 =").unwrap_err().to_string(), "and is a reserved word — choose another name");
+    // Anything else that isn't a name is still a syntax error.
+    syntax("∑(1 = 1..3) 1 =");
+}

@@ -985,8 +985,15 @@ impl<'a> Parser<'a> {
         if self.bump().map(|t| &t.kind) != Some(&Kind::LParen) {
             return Err(bad());
         }
-        let Some(Tok { kind: Kind::Name(index), .. }) = self.bump() else {
-            return Err(syntax("a sum's index must be a name, like ∑(i = 1..n) a[i]"));
+        let index = match self.bump().map(|t| &t.kind) {
+            Some(Kind::Name(index)) => index,
+            // A keyword (`and`, or its symbol `∧`) isn't a name, as anywhere a name is defined.
+            Some(Kind::And) => return Err(CalcError::Keyword("and".to_string())),
+            Some(Kind::Or) => return Err(CalcError::Keyword("or".to_string())),
+            Some(Kind::Not) => return Err(CalcError::Keyword("not".to_string())),
+            Some(Kind::If) => return Err(CalcError::Keyword("if".to_string())),
+            Some(Kind::Otherwise) => return Err(CalcError::Keyword("otherwise".to_string())),
+            _ => return Err(syntax("a sum's index must be a name, like ∑(i = 1..n) a[i]")),
         };
         if self.bump().map(|t| &t.kind) != Some(&Kind::SumEq) {
             return Err(bad());

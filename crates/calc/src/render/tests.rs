@@ -385,3 +385,23 @@ fn a_sum_shows_its_limits_and_a_grouped_term() {
     let d = display_of("x := (∑(i = 1..3) i)^2", None);
     assert_eq!(d.linear, "x≔(∑_(i=1)^3▒〖i〗)^2");
 }
+
+#[test]
+fn a_sum_of_terms_keeps_its_parentheses() {
+    let grouped = display_of("x := ∑(i = 1..3) (i + 1)", None);
+    let outside = display_of("x := ∑(i = 1..3) i + 1", None);
+    assert!(grouped.linear.contains("▒〖(i+1)〗"), "{}", grouped.linear);
+    assert_eq!(outside.linear, "x≔∑_(i=1)^3▒〖i〗+1");
+    assert_ne!(grouped.linear, outside.linear);
+    // The parentheses are in the tree too, not only the linear text.
+    let Some(MNode::Nary { e, .. }) = find_node(&grouped.math, |n| matches!(n, MNode::Nary { .. })) else { panic!("{:?}", grouped.math) };
+    assert!(matches!(e.as_slice(), [MNode::Delim { beg: Some('('), end: Some(')'), .. }]), "{e:?}");
+    // A comparison is grouped too; a product, power or lone name is not.
+    let d = display_of("x := ∑(i = 0..2) (a[i] > 0)", None);
+    assert!(d.linear.contains("▒〖(a_i>0)〗"), "{}", d.linear);
+    for body in ["a[i]·b[i]", "a[i]^2", "-a[i]", "a[i]/2"] {
+        let d = display_of(&format!("x := ∑(i = 0..2) {body}"), None);
+        let Some(MNode::Nary { e, .. }) = find_node(&d.math, |n| matches!(n, MNode::Nary { .. })) else { panic!("{:?}", d.math) };
+        assert!(!matches!(e.as_slice(), [MNode::Delim { .. }]), "{body}: {e:?}");
+    }
+}
