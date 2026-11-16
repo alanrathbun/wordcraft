@@ -667,6 +667,8 @@ fn options_choose_array_origin() {
     let mut h = ready(a);
     assert!(h.query_by_label("Arrays count from").is_some(), "the choice is labelled");
     assert!(h.query_by_label("0 (Mathcad)").is_some());
+    // Changing it renumbers what quoted elements show: the dialog says so.
+    assert!(h.query_by_label("Changing this renumbers every index, including quoted elements.").is_some(), "the renumbering note is shown");
     h.get_by_role_and_label(egui::accesskit::Role::RadioButton, "1").click();
     h.run_steps(2);
     let params = match h.state().dialog.as_ref() {
@@ -873,4 +875,49 @@ fn table_error_is_marked_on_screen() {
     h.event(Event::PointerMoved(bounds.center()));
     h.run_steps(4);
     assert!(h.query_by_label("a calculation data table can't have merged cells").is_some());
+}
+
+/// The walk behind the table markers: nothing while no table has an error (ordinary tables, data
+/// tables without errors), and every erroring data table at any depth, by its path, in document
+/// order.
+#[test]
+fn erroring_tables_are_found_at_any_depth() {
+    let mut a = app();
+    let outer = typed_table(&mut a, &[&["x", "y"], &["1", "2"]]);
+    assert!(calc_ui::erroring_tables(&a.session.doc.body).is_empty(), "an ordinary table");
+    // A data table inside a cell of the outer table, and one after it.
+    a.session.sel = wordcraft_engine::Selection::caret(cell_pos(outer, 1, 1));
+    let r = a.run("insert.table", json!({"rows": 2, "cols": 1})).unwrap();
+    let inner: Vec<u32> = r["table"].as_array().expect("a path").iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect();
+    assert_eq!(inner.len(), 4, "nested in a cell: {r}");
+    a.session.sel =
+        wordcraft_engine::Selection::caret(Pos { story: StoryRef::Body, path: wordcraft_doc::Path([inner.clone(), vec![0, 0, 0]].concat()), off: 0 });
+    a.run("calc.dataTable", json!({"on": true})).unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    let after = typed_table(&mut a, &[&["D (in)"], &["0.5"]]);
+    a.session.sel = wordcraft_engine::Selection::caret(cell_pos(after, 1, 0));
+    a.run("calc.dataTable", json!({"on": true})).unwrap();
+    let marked = |a: &WordApp, path: &[u32]| {
+        a.session.doc.table(StoryRef::Body, &wordcraft_doc::Path(path.to_vec())).and_then(|t| t.calc.as_deref().cloned()).is_some()
+    };
+    assert!(marked(&a, &inner) && marked(&a, &[after as u32]), "both are data tables");
+    let error = |col: Option<u32>, m: &str| wordcraft_doc::calc::ColumnError { col, message: m.into() };
+    let set = |a: &mut WordApp, path: &[u32], errors: Vec<wordcraft_doc::calc::ColumnError>| {
+        if let Some(c) = a.session.doc.table_mut(StoryRef::Body, &wordcraft_doc::Path(path.to_vec())).ok().and_then(|t| t.calc.as_mut()) {
+            c.errors = errors;
+        }
+    };
+    set(&mut a, &inner, Vec::new());
+    set(&mut a, &[after as u32], Vec::new());
+    assert!(calc_ui::erroring_tables(&a.session.doc.body).is_empty(), "data tables without errors");
+    set(&mut a, &[after as u32], vec![error(Some(0), "D row 1 isn't a number")]);
+    set(&mut a, &inner, vec![error(None, "a calculation data table needs a row of headings and at least one row of values")]);
+    let found = calc_ui::erroring_tables(&a.session.doc.body);
+    assert_eq!(
+        found,
+        [
+            (wordcraft_doc::Path(inner), vec![(0, "a calculation data table needs a row of headings and at least one row of values".to_string())]),
+            (wordcraft_doc::Path(vec![after as u32]), vec![(0, "D row 1 isn't a number".to_string())]),
+        ]
+    );
 }

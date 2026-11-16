@@ -823,6 +823,7 @@ fn options_ui(app: &mut WordApp, ui: &mut Ui, f: &mut OptionsForm) -> bool {
     ui.label(egui::RichText::new(tl!("Arrays count from")).strong());
     ui.radio_value(&mut f.origin, 0, tl!("0 (Mathcad)"));
     ui.radio_value(&mut f.origin, 1, "1");
+    ui.label(egui::RichText::new(tl!("Changing this renumbers every index, including quoted elements.")).small().weak());
     error_line(ui, &f.message);
     let (ok, cancel) = crate::dialogs::buttons(ui, tl!("OK"));
     if cancel {
@@ -966,28 +967,57 @@ pub fn error_markers(errors: &[ColumnError]) -> Vec<(u32, String)> {
     out
 }
 
-/// The data tables in `blocks` (at `prefix`) that have errors, at any depth, with their paths (as
-/// the engine gives them: block index, then row, cell and block index for each table level) and
-/// their [`error_markers`]. Run every frame, so it only looks at the tables' marks.
-fn erroring_tables(blocks: &wordcraft_doc::Blocks, prefix: &[u32], out: &mut Vec<(wordcraft_doc::Path, Vec<(u32, String)>)>) {
-    let index = |k: usize| u32::try_from(k).unwrap_or(u32::MAX);
-    for (i, b) in blocks.iter().enumerate() {
-        let wordcraft_doc::Block::Table(t) = &**b else { continue };
-        let mut path = prefix.to_vec();
-        path.push(index(i));
-        if let Some(c) = t.calc.as_deref()
-            && !c.errors.is_empty()
-        {
-            out.push((wordcraft_doc::Path(path.clone()), error_markers(&c.errors)));
+/// The data tables in `body` that have errors, at any depth, in document order, with their paths
+/// (as the engine gives them: block index, then row, cell and block index for each table level)
+/// and their [`error_markers`]. Run every frame, so it only looks at the tables' marks: a first
+/// look holds only the tables still to look in and ends the walk when none has an error (the
+/// usual case); after it, a path is made only for a table with an error or a cell holding a
+/// table. Tables are walked with explicit stacks, as a file can nest them deep.
+pub(crate) fn erroring_tables(body: &wordcraft_doc::Blocks) -> Vec<(wordcraft_doc::Path, Vec<(u32, String)>)> {
+    use wordcraft_doc::{Block, Table};
+    fn errors(t: &Table) -> Option<&wordcraft_doc::calc::CalcTable> {
+        t.calc.as_deref().filter(|c| !c.errors.is_empty())
+    }
+    fn tables(blocks: &wordcraft_doc::Blocks) -> impl Iterator<Item = (usize, &Table)> {
+        blocks.iter().enumerate().filter_map(|(i, b)| match &**b {
+            Block::Table(t) => Some((i, t)),
+            Block::Para(_) => None,
+        })
+    }
+    // A first look, holding only the tables still to look in.
+    let mut todo: Vec<&Table> = tables(body).map(|(_, t)| t).collect();
+    let mut any = false;
+    while let Some(t) = todo.pop() {
+        if errors(t).is_some() {
+            any = true;
+            break;
         }
-        for (r, row) in t.rows.iter().enumerate() {
-            for (k, cell) in row.cells.iter().enumerate() {
-                let mut inner = path.clone();
-                inner.extend([index(r), index(k)]);
-                erroring_tables(&cell.blocks, &inner, out);
+        todo.extend(t.rows.iter().flat_map(|r| &r.cells).flat_map(|c| tables(&c.blocks)).map(|(_, t)| t));
+    }
+    if !any {
+        return Vec::new();
+    }
+    let index = |k: usize| u32::try_from(k).unwrap_or(u32::MAX);
+    let mut out = Vec::new();
+    let mut levels: Vec<(Vec<u32>, &wordcraft_doc::Blocks)> = vec![(Vec::new(), body)];
+    while let Some((prefix, blocks)) = levels.pop() {
+        for (i, t) in tables(blocks) {
+            let at = |more: &[u32]| prefix.iter().copied().chain([index(i)]).chain(more.iter().copied()).collect::<Vec<u32>>();
+            if let Some(c) = errors(t) {
+                out.push((wordcraft_doc::Path(at(&[])), error_markers(&c.errors)));
+            }
+            for (r, row) in t.rows.iter().enumerate() {
+                for (k, cell) in row.cells.iter().enumerate() {
+                    if tables(&cell.blocks).next().is_some() {
+                        levels.push((at(&[index(r), index(k)]), &cell.blocks));
+                    }
+                }
             }
         }
     }
+    // A path sorts before the paths inside it and after those before it: document order.
+    out.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    out
 }
 
 /// The marker on a data table's erroring heading cell.
@@ -1001,8 +1031,7 @@ pub(crate) fn table_markers(app: &mut WordApp, ctx: &egui::Context) {
         return;
     }
     let Some(view) = app.canvas.viewport else { return };
-    let mut tables = Vec::new();
-    erroring_tables(&app.session.doc.body, &[], &mut tables);
+    let tables = erroring_tables(&app.session.doc.body);
     if tables.is_empty() {
         return;
     }
