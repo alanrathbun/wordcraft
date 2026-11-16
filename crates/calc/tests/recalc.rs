@@ -948,6 +948,37 @@ fn perf_2000_regions() {
     assert!(took.as_millis() < 100, "recalc took {took:?}");
 }
 
+/// `n` regions defining the reserved word `or` (a document from before it was one), then `n`
+/// using `not` and `and`.
+fn reserved_word_doc(defining: usize, using: usize) -> Document {
+    let mut sources = vec!["or := 1"; defining];
+    sources.extend(std::iter::repeat_n("not 1 > 2 and 1 < 2 =", using));
+    doc_with(&sources)
+}
+
+#[test]
+#[ignore = "timing: run with --release -- --ignored perf_reserved_words"]
+fn perf_reserved_words() {
+    // Each region is checked against the words defined as names: each word once, however many
+    // regions define it, so 20,000 definitions of `or` cost what one does.
+    let n = 20_000;
+    let time = |defining: usize| {
+        let mut d = reserved_word_doc(defining, n);
+        let start = Instant::now();
+        let report = recalc(&mut d, &no_page);
+        let took = start.elapsed();
+        assert_eq!(report.regions, defining + n);
+        (took, d)
+    };
+    let (one, _) = time(1);
+    let (many, d) = time(n);
+    println!("perf_reserved_words: one definition {one:?}, {n} definitions {many:?}");
+    assert_eq!(region(&d, 1).0.state, err(CalcError::Keyword("or".into())));
+    assert!(matches!(region(&d, n as u64 + 1).0.state, CalcState::Fresh), "{:?}", region(&d, n as u64 + 1).0.state);
+    // The extra 20,000 regions cost their own work, not 20,000 scans each.
+    assert!(many < one * 2 + std::time::Duration::from_millis(30), "{n} definitions took {many:?}, one took {one:?}");
+}
+
 #[test]
 fn one_budget_bounds_the_whole_pass() {
     // Each f_i calls the one before twice: f_24(1) needs ~33 million steps, far over one

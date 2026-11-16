@@ -805,13 +805,15 @@ impl Index {
         // A word that is a keyword now but that a definition tries to use as a name (a document
         // from before it was a keyword): every calculation using it as an operator fails with the
         // word named, rather than quietly changing meaning.
-        let defined_words: Vec<&str> = parsed
-            .iter()
-            .filter_map(|s| match s {
-                Err(CalcError::Keyword(word)) => Some(word.as_str()),
-                _ => None,
-            })
-            .collect();
+        // Each word once (there are five), so the scan below stays linear in the regions.
+        let mut defined_words: Vec<&str> = Vec::new();
+        for s in &parsed {
+            if let Err(CalcError::Keyword(word)) = s
+                && !defined_words.contains(&word.as_str())
+            {
+                defined_words.push(word);
+            }
+        }
         if !defined_words.is_empty() {
             for (i, stmt) in parsed.iter().enumerate() {
                 let edited = regions.get(i).is_some_and(|r| r.state == CalcState::EditedOutside);
