@@ -913,7 +913,13 @@ fn products() {
     let (shape, items) = grid(&mut env, "mmul([1, 2; 3, 4], [5; 6]) =");
     assert_eq!(shape, (2, 1));
     close_all(&items, &[17.0, 39.0], Dim::ONE);
-    assert!(matches!(run_value(&mut env, "mmul([1, 2, 3; 4, 5, 6], [1, 2, 3; 4, 5, 6]) ="), Err(CalcError::Shape { .. })));
+    // The inner sizes must agree: the message names the arguments, by name when they are names.
+    let e = run_value(&mut env, "mmul([1, 2, 3; 4, 5, 6], [1, 2, 3; 4, 5, 6]) =").expect_err("3 columns by 2 rows");
+    assert_eq!(syntax_msg(e), "mmul needs A's columns to match B's rows (3 and 2)");
+    run(&mut env, "M := [1, 2, 3; 4, 5, 6]").expect("defines M");
+    run(&mut env, "X := [1; 2]").expect("defines X");
+    let e = run_value(&mut env, "mmul(M, X) =").expect_err("3 columns by 2 rows");
+    assert_eq!(syntax_msg(e), "mmul needs M's columns to match X's rows (3 and 2)");
     let (shape, items) = grid(&mut env, "transpose([1, 2, 3]) =");
     assert_eq!(shape, (1, 3));
     close_all(&items, &[1.0, 2.0, 3.0], Dim::ONE);
@@ -937,6 +943,14 @@ fn lookup_is_exact() {
     let e = run_value(&mut env, "lookup(NPS, T, [0.5, 0.6] in) =").expect_err("0.6 in isn't a size");
     assert_eq!(e.to_string(), "element 1: 0.6 in isn't in NPS");
     assert!(matches!(run(&mut env, "lookup(NPS, T, 1 lbf) ="), Err(CalcError::Unit(UnitError::Mismatch { .. }))));
+    // A size listed twice matches more than one value: an error, never the first match.
+    run(&mut env, "NPS_2 := [0.5, 1.5, 1, 1.5] in").expect("defines NPS_2");
+    let e = run(&mut env, "lookup(NPS_2, T, 1.5 in) =").expect_err("two matches");
+    assert_eq!(syntax_msg(e), "1.5 in matches more than one value in NPS_2");
+    // Equal after conversion counts as a match too.
+    let e = run(&mut env, "lookup(NPS_2, T, 38.1 mm) =").expect_err("two matches");
+    assert_eq!(syntax_msg(e), "1.5 in matches more than one value in NPS_2");
+    close_to(shown(&mut env, "lookup(NPS_2, T, 1 in) ="), quantity(60.0, "ft·lbf"));
 }
 
 #[test]
@@ -961,6 +975,18 @@ fn linterp_and_spline_never_extrapolate() {
     }
     let between = shown(&mut env, "spline(X, S, 1.5) =").value;
     assert!(between > 1.0 && between < 4.0, "{between}");
+    // The solver itself: the second derivatives through y = x² at 0…4 are 0, 18/7, 12/7, 18/7, 0,
+    // so s(1.5) = 2.5 − (3/8)(18/7 + 12/7)/6 = 125/56.
+    assert!((between - 125.0 / 56.0).abs() <= 1e-9, "{between}");
+    // Uneven spacing (widths 1, 2, 3), where swapping an interval's neighbours' widths changes the
+    // answer: through y = x² at 0, 1, 3, 6 the second derivatives are 0, 15/7, 18/7, 0, giving
+    // s(2) = 107/28 and s(2.5) = 1367/224 (derived in the task 4 report).
+    column(&mut env, "X_u", &[0.0, 1.0, 3.0, 6.0], "1");
+    column(&mut env, "S_u", &[0.0, 1.0, 9.0, 36.0], "1");
+    for (x, want) in [("2", 107.0 / 28.0), ("2.5", 1367.0 / 224.0)] {
+        let got = shown(&mut env, &format!("spline(X_u, S_u, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-9, "s({x}) = {got}, want {want}");
+    }
     // A vector x gives one result per element.
     let (shape, items) = grid(&mut env, "spline(X, L, [0.5, 1.5, 2.5]) =");
     assert_eq!(shape, (3, 1));
@@ -1040,4 +1066,12 @@ fn reductions_of_temperatures_keep_what_they_stand_for() {
     }
     assert_eq!(run(&mut env, "sum([300 K, 310 K]) = ? °C"), Err(CalcError::NotAbsolute("°C".into())));
     assert_eq!(run(&mut env, "max([300 K, 310 K], 5 Δ°C) = ? °C"), Err(CalcError::NotAbsolute("°C".into())));
+}
+
+#[test]
+fn array_messages_always_show_a_unit() {
+    let mut env = flanges();
+    // 10^307 m is too many inches to show: it shows in metres rather than as a bare number.
+    let e = run(&mut env, "linterp(NPS, T, 10^307 m) =").expect_err("past the end");
+    assert_eq!(syntax_msg(e), "1×10³⁰⁷ m is outside NPS (0.5 in to 1.5 in)");
 }

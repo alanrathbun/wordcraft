@@ -16,7 +16,7 @@ use crate::array::{self, Data, Grid, MAX_ELEMENTS};
 use crate::eval::{Pass, Val, picked};
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, render};
-use craft_units::{Dim, Precision, Quantity, UnitError, UnitSystem, format};
+use craft_units::{Dim, Formatted, Precision, Quantity, UnitError, UnitSystem, format};
 
 /// How far apart (relative to the larger) two values may be and still count as equal in `lookup`
 /// and at the ends and knots of an interpolation: what converting units can leave
@@ -44,7 +44,7 @@ pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>
         "length" | "rows" | "cols" => size(name, args),
         "sum" | "mean" => total(name, args, cx),
         "dot" => dot(args, exprs, cx),
-        "mmul" => mmul(args, cx),
+        "mmul" => mmul(args, exprs, cx),
         "transpose" => transpose(args, cx),
         "lookup" => lookup(args, exprs, cx),
         "linterp" | "spline" => interpolate(name, args, exprs, cx),
@@ -88,12 +88,16 @@ fn finite(q: Quantity) -> Result<Quantity, CalcError> {
     if q.value.is_finite() { Ok(q) } else { Err(CalcError::NonFinite) }
 }
 
-/// `q` as the document shows values: `1.6 in` in a US customary document.
+/// `q` as the document shows values: `1.6 in` in a US customary document. A value too large for
+/// the document's units shows in SI units, and never as a number without its unit.
 fn shown(q: Quantity, cx: &Ctx<'_>) -> String {
-    match format(q, None, cx.system, cx.precision) {
-        Ok(f) if f.unit.is_empty() => render::text_number(&f.number),
-        Ok(f) => format!("{} {}", render::text_number(&f.number), f.unit),
-        Err(_) => q.value.to_string(),
+    let text =
+        |f: Formatted| if f.unit.is_empty() { render::text_number(&f.number) } else { format!("{} {}", render::text_number(&f.number), f.unit) };
+    match format(q, None, cx.system, cx.precision).or_else(|_| format(q, None, UnitSystem::Si, cx.precision)) {
+        Ok(f) => text(f),
+        // Only a non-finite value fails in SI units, and values here are finite; still, keep a unit.
+        Err(_) if q.dim == Dim::ONE => q.value.to_string(),
+        Err(_) => format!("{} {}", q.value, q.dim),
     }
 }
 
@@ -179,13 +183,14 @@ fn dot(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError> {
 
 /// `mmul(A, B)`: the matrix product of `A` (r × n) and `B` (n × c), a single value being 1 × 1.
 /// The result's size is checked, and its `r · c · n` products charged, before any is worked out.
-fn mmul(args: &[Data], cx: &Ctx<'_>) -> Result<Data, CalcError> {
+fn mmul(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError> {
     let [a, b] = args else {
         return Err(CalcError::Arity("mmul".to_string(), 2));
     };
     let ((rows, inner), (inner_b, cols)) = (shape(a), shape(b));
     if inner != inner_b {
-        return Err(CalcError::Shape { left: (rows, inner), right: (inner_b, cols) });
+        let (a_name, b_name) = (arg_name(exprs, 0, "A"), arg_name(exprs, 1, "B"));
+        return Err(CalcError::Syntax(format!("mmul needs {a_name}'s columns to match {b_name}'s rows ({inner} and {inner_b})")));
     }
     let n = rows.checked_mul(cols).filter(|&n| n <= MAX_ELEMENTS).ok_or(CalcError::TooLarge)?;
     charge(cx, n.saturating_mul(inner))?;
@@ -251,7 +256,8 @@ fn fits(x: Quantity, dim: Dim) -> Result<(), CalcError> {
 }
 
 /// `lookup(xs, ys, x)`: the `ys` value whose `xs` equals `x` (to within [`EQUAL`], after unit
-/// conversion), for each element of `x`. No match is an error, never the nearest value.
+/// conversion), for each element of `x`. No match is an error, never the nearest value, and so is
+/// more than one (repeated `xs`), never the first.
 fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError> {
     let [xs, ys, x] = args else {
         return Err(CalcError::Arity("lookup".to_string(), 3));
@@ -264,10 +270,12 @@ fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError
     let dim = one_dim(xs, xs_name, cx.origin)?;
     array::map(x, cx.origin, |x| {
         fits(x.q, dim)?;
-        xs.iter()
-            .position(|xi| equal(xi.q.value, x.q.value))
-            .and_then(|i| ys.get(i).copied())
-            .ok_or_else(|| CalcError::Syntax(format!("{} isn't in {xs_name}", shown(x.q, cx))))
+        let mut matches = xs.iter().enumerate().filter(|(_, xi)| equal(xi.q.value, x.q.value)).map(|(i, _)| i);
+        match (matches.next(), matches.next()) {
+            (Some(i), None) => ys.get(i).copied().ok_or_else(|| CalcError::Syntax(format!("{ys_name} has no element {i}"))),
+            (Some(_), Some(_)) => Err(CalcError::Syntax(format!("{} matches more than one value in {xs_name}", shown(x.q, cx)))),
+            (None, _) => Err(CalcError::Syntax(format!("{} isn't in {xs_name}", shown(x.q, cx)))),
+        }
     })
 }
 
