@@ -575,3 +575,302 @@ fn insert_symbol_menu_works_in_the_box() {
     enter(&mut h);
     assert_eq!(sources(h.state()), ["σ_b := 2 kg·g_0"]);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Vectors and data tables
+
+/// A table typed cell by cell (`insert.table`, then the cells' text with Tab between), with the
+/// caret after it; answers its body block.
+fn typed_table(a: &mut WordApp, rows: &[&[&str]]) -> usize {
+    let r = a.run("insert.table", json!({"rows": rows.len(), "cols": rows[0].len()})).unwrap();
+    let block = r["table"][0].as_u64().unwrap_or_else(|| panic!("no table in {r}")) as usize;
+    for (k, text) in rows.iter().flat_map(|r| r.iter()).enumerate() {
+        if k > 0 {
+            a.run("text.tab", json!({})).unwrap();
+        }
+        a.run("text.insert", json!({"text": text})).unwrap();
+    }
+    a.run("caret.docEnd", json!({})).unwrap();
+    block
+}
+
+/// The caret in cell (`row`, `col`) of the table at body block `block`.
+fn cell_pos(block: usize, row: u32, col: u32) -> Pos {
+    Pos { story: StoryRef::Body, path: wordcraft_doc::Path(vec![block as u32, row, col, 0]), off: 0 }
+}
+
+fn table_calc(a: &WordApp, block: usize) -> Option<wordcraft_doc::calc::CalcTable> {
+    match &*a.session.doc.body[block] {
+        wordcraft_doc::Block::Table(t) => t.calc.as_deref().cloned(),
+        wordcraft_doc::Block::Para(_) => panic!("block {block} isn't a table"),
+    }
+}
+
+fn right_click(h: &mut egui_kittest::Harness<'static, WordApp>, at: &Pos) {
+    let caret = h.state_mut().session.layout().caret(at).expect("the caret is laid out");
+    let point = crate::canvas::page_to_screen(h.state_mut(), caret.page, caret.x + 2.0, caret.top + caret.height / 2.0).expect("on screen");
+    h.state_mut().session.sel = wordcraft_engine::Selection::caret(at.clone());
+    h.event(Event::PointerMoved(point));
+    h.step();
+    for pressed in [true, false] {
+        h.event(Event::PointerButton { pos: point, button: PointerButton::Secondary, pressed, modifiers: Default::default() });
+        h.step();
+    }
+    h.run_steps(3);
+}
+
+/// The open context menu's item whose name starts `label` (the name carries its shortcut too).
+fn menu_item<'h>(h: &'h egui_kittest::Harness<'static, WordApp>, label: &str) -> Option<egui_kittest::Node<'h>> {
+    use egui_kittest::kittest::NodeT;
+    h.get_all_by_role(egui::accesskit::Role::Button).find(|n| n.accesskit_node().label().is_some_and(|l| l.trim_end() == label))
+}
+
+/// Right-click in a table: Use as Calculation Data marks it; the menu then offers Stop Using as
+/// Calculation Data. Only a table in the main text offers either.
+#[test]
+fn table_menu_marks_calculation_data() {
+    let mut a = app();
+    let t = typed_table(&mut a, &[&["D (in)", "qty"], &["0.5", "3"]]);
+    a.run("view.commentsPane", json!({"value": false})).unwrap();
+    let mut h = timed(a);
+    right_click(&mut h, &cell_pos(t, 1, 0));
+    assert!(menu_item(&h, "Stop Using as Calculation Data").is_none());
+    menu_item(&h, "Use as Calculation Data").expect("the table's menu offers it").click();
+    h.run_steps(3);
+    assert!(table_calc(h.state(), t).is_some(), "the menu marked the table");
+    right_click(&mut h, &cell_pos(t, 1, 1));
+    assert!(menu_item(&h, "Use as Calculation Data").is_none(), "a marked table isn't offered marking again");
+    menu_item(&h, "Stop Using as Calculation Data").expect("a marked table's menu offers it").click();
+    h.run_steps(3);
+    assert!(table_calc(h.state(), t).is_none(), "the menu unmarked the table");
+    // What the menu offers, by where the caret is.
+    let mut a = app();
+    let t = typed_table(&mut a, &[&["D (in)"], &["0.5"]]);
+    assert_eq!(calc_ui::data_table_item(&a), None, "the caret after the table");
+    a.session.sel = wordcraft_engine::Selection::caret(cell_pos(t, 1, 0));
+    assert_eq!(calc_ui::data_table_item(&a), Some(("Use as Calculation Data", json!({"on": true}))));
+    assert!(crate::widgets::enabled(&a, "calc.dataTable"), "the item can be clicked");
+    a.run("calc.dataTable", json!({"on": true})).unwrap();
+    assert_eq!(calc_ui::data_table_item(&a), Some(("Stop Using as Calculation Data", json!({"on": false}))));
+    // A table in a header: the command refuses there, so the menu doesn't offer it.
+    a.run("insert.header", json!({"text": "Head"})).unwrap();
+    a.run("insert.table", json!({"rows": 1, "cols": 1})).unwrap();
+    assert!(a.session.sel.focus.story != StoryRef::Body && a.session.sel.focus.path.cell().is_some(), "the caret is in a header table");
+    assert_eq!(calc_ui::data_table_item(&a), None);
+}
+
+/// Calculation Options: Arrays count from 0 (Mathcad) or 1, sent as `origin`.
+#[test]
+fn options_choose_array_origin() {
+    let mut a = app();
+    a.run("calc.settings", json!({})).unwrap();
+    let mut h = ready(a);
+    assert!(h.query_by_label("Arrays count from").is_some(), "the choice is labelled");
+    assert!(h.query_by_label("0 (Mathcad)").is_some());
+    h.get_by_role_and_label(egui::accesskit::Role::RadioButton, "1").click();
+    h.run_steps(2);
+    let params = match h.state().dialog.as_ref() {
+        Some(dialogs::Dialog::Calc(d)) => match &**d {
+            CalcDialog::Options(f) => f.params(),
+            _ => panic!("not the options"),
+        },
+        _ => panic!("no dialog"),
+    };
+    assert_eq!(params["origin"], json!(1), "{params}");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "OK").click();
+    h.run_steps(3);
+    assert!(h.state().dialog.is_none());
+    assert_eq!(h.state().session.doc.calc_settings.clone().map(|s| s.origin), Some(1));
+    // Read back when the dialog opens again.
+    assert_eq!(calc_ui::OptionsForm::read(&h.state().session.doc).origin, 1);
+}
+
+/// The fields' results in the body, in order.
+fn field_results(a: &WordApp) -> Vec<String> {
+    a.session
+        .doc
+        .para_paths(StoryRef::Body)
+        .iter()
+        .filter_map(|p| a.session.doc.para(StoryRef::Body, p))
+        .flat_map(|p| p.objects.iter())
+        .filter_map(|o| match o {
+            InlineObject::Field { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn value_form(a: &WordApp) -> calc_ui::ValueForm {
+    match a.dialog.as_ref() {
+        Some(dialogs::Dialog::Calc(d)) => match &**d {
+            CalcDialog::Value(f) => f.clone(),
+            _ => panic!("not the picker"),
+        },
+        _ => panic!("no dialog"),
+    }
+}
+
+/// The form's Insert button (the ribbon's Insert tab, at the top, has the same name).
+fn click_insert(h: &mut egui_kittest::Harness<'static, WordApp>) {
+    let lowest = h.get_all_by_role_and_label(egui::accesskit::Role::Button, "Insert").max_by(|a, b| a.rect().top().total_cmp(&b.rect().top()));
+    lowest.expect("the form's Insert button").click();
+    h.run_steps(3);
+}
+
+fn set_value_form(h: &mut egui_kittest::Harness<'static, WordApp>, change: impl FnOnce(&mut calc_ui::ValueForm)) {
+    if let Some(dialogs::Dialog::Calc(d)) = h.state_mut().dialog.as_mut()
+        && let CalcDialog::Value(f) = &mut **d
+    {
+        change(f);
+    }
+    h.run_steps(2);
+}
+
+/// The Calculated Value form's optional Element box: `1` sends `"index": [1]`, `1, 0` sends
+/// `[1, 0]`; other text is refused in the form, and the command's refusals show there too.
+#[test]
+fn calculated_value_takes_an_index() {
+    // What the box reads.
+    for (text, index) in
+        [("", None), ("  ", None), ("1", Some(vec![1])), (" 2 ", Some(vec![2])), ("1, 0", Some(vec![1, 0])), ("1 ,0", Some(vec![1, 0]))]
+    {
+        assert_eq!(calc_ui::parse_index(text), Ok(index), "{text:?}");
+    }
+    for bad in ["x", "-1", "1.5", "1,", ",1", "1, 2, 3", "1 0", "[1]", "4294967296"] {
+        assert!(calc_ui::parse_index(bad).is_err(), "{bad:?} is refused");
+    }
+    let mut a = app();
+    for s in ["D := [0.840, 1.050] in", "M := [1, 2; 3, 4]", "x := 2 in"] {
+        a.run("insert.calculation", json!({"source": s})).unwrap();
+        a.run("text.newParagraph", json!({})).unwrap();
+    }
+    a.run("insert.calcValue", json!({})).unwrap();
+    let mut h = ready(a);
+    assert!(h.query_by_label("Element").is_some(), "the Element box is drawn");
+    let f = value_form(h.state());
+    assert_eq!(f.index, "", "empty: the whole value");
+    set_value_form(&mut h, |f| {
+        f.name = "D".into();
+        f.index = "1".into();
+    });
+    assert_eq!(value_form(h.state()).params(), json!({"name": "D", "index": [1]}));
+    set_value_form(&mut h, |f| {
+        f.name = "M".into();
+        f.index = " 1 , 0 ".into();
+    });
+    assert_eq!(value_form(h.state()).params(), json!({"name": "M", "index": [1, 0]}));
+    // Other text: refused in the form with a hint; nothing is sent.
+    set_value_form(&mut h, |f| f.index = "first".into());
+    click_insert(&mut h);
+    assert!(h.state().dialog.is_some(), "the form stays open");
+    let message = value_form(h.state()).message;
+    assert!(!message.is_empty(), "a hint says why");
+    assert!(h.query_by_label(&message).is_some(), "the hint is visible: {message}");
+    assert!(field_results(h.state()).is_empty(), "nothing inserted");
+    // The command's refusal shows in the form.
+    set_value_form(&mut h, |f| {
+        f.name = "x".into();
+        f.index = "0".into();
+    });
+    click_insert(&mut h);
+    assert_eq!(value_form(h.state()).message, "x isn't a vector");
+    assert!(h.query_by_label("x isn't a vector").is_some());
+    assert!(field_results(h.state()).is_empty(), "nothing inserted");
+    // An element of the matrix, typed into the box.
+    set_value_form(&mut h, |f| {
+        f.name = "M".into();
+        f.index = String::new();
+    });
+    h.get_by_label("Element").click();
+    h.run_steps(2);
+    type_text(&mut h, "1, 0");
+    assert_eq!(value_form(h.state()).index, "1, 0", "typed into the box");
+    click_insert(&mut h);
+    assert!(h.state().dialog.is_none(), "inserted");
+    assert_eq!(field_results(h.state()), ["3"]);
+}
+
+/// Every error of a data table, grouped by where its marker goes: one per column with an error
+/// (all its messages, in order), and the first cell for an error about the whole table.
+#[test]
+fn table_errors_group_by_column() {
+    use wordcraft_doc::calc::ColumnError;
+    let e = |col: Option<u32>, m: &str| ColumnError { col, message: m.into() };
+    let errors = [e(Some(1), "D_o row 2 isn't a number"), e(None, "merged"), e(Some(1), "D_o row 3 isn't a number"), e(Some(0), "bad name")];
+    assert_eq!(
+        calc_ui::error_markers(&errors),
+        [(1, "D_o row 2 isn't a number\nD_o row 3 isn't a number".to_string()), (0, "merged\nbad name".to_string())]
+    );
+    assert!(calc_ui::error_markers(&[]).is_empty());
+}
+
+/// A data table with a column error: a red ⚠ at the top-right of that heading cell (the first
+/// cell for an error about the whole table), its message on hover; the document is untouched.
+#[test]
+fn table_error_is_marked_on_screen() {
+    let mut a = app();
+    let t = typed_table(&mut a, &[&["D (in)", "D_o (in)"], &["0.5", "0.840"], &["0.75", "1.050"]]);
+    a.session.sel = wordcraft_engine::Selection::caret(cell_pos(t, 0, 0));
+    a.run("calc.dataTable", json!({"on": true})).unwrap();
+    // A cell that isn't a number: an error for its column.
+    a.session.sel = wordcraft_engine::Selection::caret(cell_pos(t, 2, 1));
+    a.run("text.insert", json!({"text": "abc "})).unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("view.commentsPane", json!({"value": false})).unwrap();
+    let errors = table_calc(&a, t).expect("marked").errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].col, Some(1), "{errors:?}");
+    let message = errors[0].message.clone();
+    let before = a.session.doc.clone();
+    let mut h = timed(a);
+    let font = egui::TextStyle::Body.resolve(&h.ctx.global_style());
+    assert!(h.ctx.fonts_mut(|f| f.has_glyph(&font, '⚠')), "the interface can draw the marker");
+    let marker = h.get_by_label("⚠");
+    let bounds = marker.rect();
+    // The heading cell of the column, on screen.
+    let range =
+        wordcraft_engine::CellRange { story: StoryRef::Body, table: wordcraft_doc::Path(vec![t as u32]), rows: (0, 0), cols: (1, 1), stream: false };
+    let (page, cell) = {
+        let app = h.state_mut();
+        let layout = app.session.layout();
+        wordcraft_engine::cmd::table_mouse::cell_rects(&layout, &app.session.doc, &range)[0]
+    };
+    let top_right = crate::canvas::page_to_screen(h.state_mut(), page, cell.x + cell.w, cell.y).expect("on screen");
+    let top_left = crate::canvas::page_to_screen(h.state_mut(), page, cell.x, cell.y).expect("on screen");
+    assert!(bounds.right() <= top_right.x + 1.0 && bounds.right() >= top_right.x - 24.0, "at the cell's right: {bounds:?} vs {top_right:?}");
+    assert!(bounds.left() > (top_left.x + top_right.x) / 2.0, "in the right half of the cell: {bounds:?}");
+    assert!((bounds.top() - top_right.y).abs() < 12.0, "at the cell's top: {bounds:?} vs {top_right:?}");
+    assert!(h.query_by_label(&message).is_none(), "the message waits for the pointer");
+    h.event(Event::PointerMoved(bounds.center()));
+    h.run_steps(4);
+    assert!(h.query_by_label(&message).is_some(), "hovering the marker shows the message: {message}");
+    h.event(Event::PointerMoved(Pos2::new(700.0, 850.0)));
+    h.run_steps(4);
+    assert!(h.query_by_label(&message).is_none(), "the message goes with the pointer");
+    assert!(h.state().session.doc.same_content(&before), "the marker is never written into the document");
+    // An error about the whole table: the marker is on the first cell.
+    let mut a = app();
+    let t = typed_table(&mut a, &[&["D (in)", "qty"], &["0.5", "3"]]);
+    a.session.sel = wordcraft_engine::Selection::caret(cell_pos(t, 0, 0));
+    a.run("calc.dataTable", json!({"on": true})).unwrap();
+    a.run("caret.docEnd", json!({})).unwrap();
+    a.run("view.commentsPane", json!({"value": false})).unwrap();
+    if let Some(c) = a.session.doc.table_mut(StoryRef::Body, &wordcraft_doc::Path(vec![t as u32])).ok().and_then(|t| t.calc.as_mut()) {
+        c.errors = vec![wordcraft_doc::calc::ColumnError { col: None, message: "a calculation data table can't have merged cells".into() }];
+    }
+    let mut h = timed(a);
+    let bounds = h.get_by_label("⚠").rect();
+    let range =
+        wordcraft_engine::CellRange { story: StoryRef::Body, table: wordcraft_doc::Path(vec![t as u32]), rows: (0, 0), cols: (0, 0), stream: false };
+    let (page, cell) = {
+        let app = h.state_mut();
+        let layout = app.session.layout();
+        wordcraft_engine::cmd::table_mouse::cell_rects(&layout, &app.session.doc, &range)[0]
+    };
+    let top_right = crate::canvas::page_to_screen(h.state_mut(), page, cell.x + cell.w, cell.y).expect("on screen");
+    assert!(bounds.right() <= top_right.x + 1.0 && bounds.right() >= top_right.x - 24.0, "at the first cell's right: {bounds:?} vs {top_right:?}");
+    assert!((bounds.top() - top_right.y).abs() < 12.0, "at the first cell's top: {bounds:?} vs {top_right:?}");
+    h.event(Event::PointerMoved(bounds.center()));
+    h.run_steps(4);
+    assert!(h.query_by_label("a calculation data table can't have merged cells").is_some());
+}

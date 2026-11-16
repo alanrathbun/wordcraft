@@ -1,16 +1,18 @@
 //! Inline calculations in the interface: the source box (Insert › Calculation, and a double-click
 //! on a calculation), the unique-name prompt it shows before committing, Insert › Calculated
-//! Value, Calculation Options, the tooltip on an errored or out-of-date region and the bar of a
-//! region edited outside WordCraft.
+//! Value, Calculation Options, the tooltip on an errored or out-of-date region, the bar of a
+//! region edited outside WordCraft, the right-click item that makes a table calculation data and
+//! the marker on a data table's erroring heading.
 //!
 //! All the work is the engine's: the box ends in `insert.calculation` or `calc.setSource`, the
-//! prompt asks `calc.checkName`, the picker runs `insert.calcValue`, the options `calc.settings`
-//! and the bar `calc.resolveEdited`. Shown through [`crate::dialogs::Dialog::Calc`].
+//! prompt asks `calc.checkName`, the picker runs `insert.calcValue`, the options `calc.settings`,
+//! the bar `calc.resolveEdited` and the table item `calc.dataTable`. Shown through
+//! [`crate::dialogs::Dialog::Calc`].
 
 use egui::{Pos2, Ui, vec2};
 use serde::Serialize;
 use serde_json::{Value, json};
-use wordcraft_doc::calc::{CalcRegion, CalcState, UnitSystem};
+use wordcraft_doc::calc::{CalcRegion, CalcState, ColumnError, UnitSystem};
 use wordcraft_doc::{Document, InlineObject, Pos, StoryRef};
 use wordcraft_engine::Session;
 
@@ -227,6 +229,19 @@ pub fn selected_calc(app: &WordApp) -> bool {
     let sel = &app.session.sel;
     let (a, b) = if sel.anchor.off <= sel.focus.off { (&sel.anchor, &sel.focus) } else { (&sel.focus, &sel.anchor) };
     a.story == b.story && a.path == b.path && b.off == a.off + OBJ_LEN && region_at(&app.session.doc, a).is_some()
+}
+
+/// The right-click menu's item for the innermost table at the caret: Use as Calculation Data, or
+/// Stop Using as Calculation Data when it already is, with its `calc.dataTable` parameters. `None`
+/// outside a table in the main text (the command refuses there).
+pub fn data_table_item(app: &WordApp) -> Option<(&'static str, Value)> {
+    let focus = &app.session.sel.focus;
+    if focus.story != StoryRef::Body {
+        return None;
+    }
+    let (table, _, _) = focus.path.cell()?;
+    let marked = app.session.doc.table(StoryRef::Body, &table)?.calc.is_some();
+    Some(if marked { ("Stop Using as Calculation Data", json!({"on": false})) } else { ("Use as Calculation Data", json!({"on": true})) })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -630,7 +645,23 @@ pub struct ValueForm {
     /// Decimal places of its own (else the document's).
     pub precision_on: bool,
     pub precision: u8,
+    /// The element to quote, as typed (`2`, or a row and a column `1, 0`); empty: the whole value.
+    pub index: String,
     pub message: String,
+}
+
+/// The Element box's text as an `insert.calcValue` index: `None` when empty, else one or two
+/// whole numbers separated by a comma. Anything else is refused with a hint.
+pub fn parse_index(text: &str) -> Result<Option<Vec<u32>>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let parts: Option<Vec<u32>> = text.split(',').map(|p| p.trim().parse::<u32>().ok()).collect();
+    match parts {
+        Some(index) if (1..=2).contains(&index.len()) => Ok(Some(index)),
+        _ => Err(tl!("Element: a whole number, or a row and a column such as 1, 0").to_string()),
+    }
 }
 
 impl ValueForm {
@@ -651,11 +682,13 @@ impl ValueForm {
             unit: String::new(),
             precision_on: false,
             precision,
+            index: String::new(),
             message: String::new(),
         }
     }
 
-    /// The `insert.calcValue` parameters.
+    /// The `insert.calcValue` parameters (the Element box's index when it reads; [`parse_index`]
+    /// refuses the rest before anything is sent).
     pub fn params(&self) -> Value {
         let mut p = json!({"name": self.name});
         if !self.unit.trim().is_empty() {
@@ -663,6 +696,9 @@ impl ValueForm {
         }
         if self.precision_on {
             p["precision"] = json!(self.precision.min(15));
+        }
+        if let Ok(Some(index)) = parse_index(&self.index) {
+            p["index"] = json!(index);
         }
         p
     }
@@ -690,6 +726,15 @@ fn value_ui(app: &mut WordApp, ui: &mut Ui, f: &mut ValueForm) -> bool {
             let own = ui.checkbox(&mut f.precision_on, tl!("Decimal places"));
             ui.add_enabled(f.precision_on, egui::DragValue::new(&mut f.precision).range(0..=15)).labelled_by(own.id);
             ui.end_row();
+            // Optional: one element of a vector, or a row and a column of a matrix, counted from
+            // the document's origin. The command refuses it on a single value.
+            let label = ui.label(tl!("Element"));
+            let field =
+                ui.add(egui::TextEdit::singleline(&mut f.index).desired_width(120.0).hint_text(tl!("optional: 2, or 1, 0"))).labelled_by(label.id);
+            if field.changed() {
+                f.message.clear();
+            }
+            ui.end_row();
         });
     }
     error_line(ui, &f.message);
@@ -698,6 +743,10 @@ fn value_ui(app: &mut WordApp, ui: &mut Ui, f: &mut ValueForm) -> bool {
         return true;
     }
     if ok && !f.names.is_empty() {
+        if let Err(hint) = parse_index(&f.index) {
+            f.message = hint;
+            return false;
+        }
         match app.run("insert.calcValue", f.params()) {
             Ok(_) => return true,
             Err(e) => f.message = e,
@@ -720,6 +769,8 @@ pub struct OptionsForm {
     pub manual: bool,
     /// What `g` means: `gravity` (Mathcad) or `gram` (SI).
     pub g: String,
+    /// Where arrays count from: 0 (Mathcad) or 1.
+    pub origin: u8,
     pub message: String,
 }
 
@@ -736,12 +787,19 @@ impl OptionsForm {
             wordcraft_doc::calc::GMeans::Gravity => "gravity",
             wordcraft_doc::calc::GMeans::Gram => "gram",
         };
-        OptionsForm { system: system.into(), precision: s.precision.min(15), manual: s.manual, g: g.into(), message: String::new() }
+        OptionsForm {
+            system: system.into(),
+            precision: s.precision.min(15),
+            manual: s.manual,
+            g: g.into(),
+            origin: s.origin.min(1),
+            message: String::new(),
+        }
     }
 
     /// The `calc.settings` parameters.
     pub fn params(&self) -> Value {
-        json!({"system": self.system, "precision": self.precision.min(15), "manual": self.manual, "g": self.g})
+        json!({"system": self.system, "precision": self.precision.min(15), "manual": self.manual, "g": self.g, "origin": self.origin.min(1)})
     }
 }
 
@@ -761,6 +819,10 @@ fn options_ui(app: &mut WordApp, ui: &mut Ui, f: &mut OptionsForm) -> bool {
     ui.label(egui::RichText::new(tl!("g means")).strong());
     ui.radio_value(&mut f.g, "gravity".to_string(), tl!("Standard gravity (Mathcad): grams are gm"));
     ui.radio_value(&mut f.g, "gram".to_string(), tl!("Gram (SI): gravity is g_0"));
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(tl!("Arrays count from")).strong());
+    ui.radio_value(&mut f.origin, 0, tl!("0 (Mathcad)"));
+    ui.radio_value(&mut f.origin, 1, "1");
     error_line(ui, &f.message);
     let (ok, cancel) = crate::dialogs::buttons(ui, tl!("OK"));
     if cancel {
@@ -776,7 +838,7 @@ fn options_ui(app: &mut WordApp, ui: &mut Ui, f: &mut OptionsForm) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// On the page: tooltips and the edited-outside bar
+// On the page: tooltips, the edited-outside bar and data tables' error markers
 
 /// What hovering a region shows: an error's message, or that the result is out of date. An
 /// edited-outside region has its bar instead ([`bar`]).
@@ -884,4 +946,92 @@ pub(crate) fn bar(app: &mut WordApp, ctx: &egui::Context) {
 pub fn resolve(app: &mut WordApp, id: u64, keep: &str) {
     let _ = app.run("calc.resolveEdited", json!({"id": id, "keep": keep}));
     app.canvas.want_focus = true;
+}
+
+/// Where a data table's errors are marked: one marker per column with an error, on its heading
+/// cell (an error about the whole table goes on the first cell), with every message for it, one
+/// per line, in the order the table lists them.
+pub fn error_markers(errors: &[ColumnError]) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
+    for e in errors {
+        let col = e.col.unwrap_or(0);
+        match out.iter_mut().find(|(c, _)| *c == col) {
+            Some((_, text)) => {
+                text.push('\n');
+                text.push_str(&e.message);
+            }
+            None => out.push((col, e.message.clone())),
+        }
+    }
+    out
+}
+
+/// The data tables in `blocks` (at `prefix`) that have errors, at any depth, with their paths (as
+/// the engine gives them: block index, then row, cell and block index for each table level) and
+/// their [`error_markers`]. Run every frame, so it only looks at the tables' marks.
+fn erroring_tables(blocks: &wordcraft_doc::Blocks, prefix: &[u32], out: &mut Vec<(wordcraft_doc::Path, Vec<(u32, String)>)>) {
+    let index = |k: usize| u32::try_from(k).unwrap_or(u32::MAX);
+    for (i, b) in blocks.iter().enumerate() {
+        let wordcraft_doc::Block::Table(t) = &**b else { continue };
+        let mut path = prefix.to_vec();
+        path.push(index(i));
+        if let Some(c) = t.calc.as_deref()
+            && !c.errors.is_empty()
+        {
+            out.push((wordcraft_doc::Path(path.clone()), error_markers(&c.errors)));
+        }
+        for (r, row) in t.rows.iter().enumerate() {
+            for (k, cell) in row.cells.iter().enumerate() {
+                let mut inner = path.clone();
+                inner.extend([index(r), index(k)]);
+                erroring_tables(&cell.blocks, &inner, out);
+            }
+        }
+    }
+}
+
+/// The marker on a data table's erroring heading cell.
+const TABLE_ERROR_MARK: &str = "⚠";
+
+/// A red ⚠ at the top-right of each erroring heading cell of the body's data tables, their
+/// messages on hover. Drawn over the page like the edited-outside [`bar`], never written into the
+/// table's text; only where the cell is in view, and not over a dialog.
+pub(crate) fn table_markers(app: &mut WordApp, ctx: &egui::Context) {
+    if app.dialog.is_some() {
+        return;
+    }
+    let Some(view) = app.canvas.viewport else { return };
+    let mut tables = Vec::new();
+    erroring_tables(&app.session.doc.body, &[], &mut tables);
+    if tables.is_empty() {
+        return;
+    }
+    let layout = app.session.layout();
+    let mut marks = Vec::new();
+    for (path, errors) in tables {
+        for (col, text) in errors {
+            let c = col as usize;
+            let range = wordcraft_engine::CellRange { story: StoryRef::Body, table: path.clone(), rows: (0, 0), cols: (c, c), stream: false };
+            for (page, rect) in wordcraft_engine::cmd::table_mouse::cell_rects(&layout, &app.session.doc, &range) {
+                marks.push((path.clone(), col, page, rect, text.clone()));
+            }
+        }
+    }
+    for (path, col, page, rect, text) in marks {
+        let Some(corner) = crate::canvas::page_to_screen(app, page, rect.right(), rect.y) else { continue };
+        if !view.contains(corner - vec2(1.0, -1.0)) {
+            continue;
+        }
+        let id = egui::Id::unique("calc_table_marker").with((path.0, col, page));
+        egui::Area::new(id).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP).fixed_pos(corner).constrain(false).show(ctx, |ui| {
+            let red = ui.visuals().error_fg_color;
+            let mark =
+                ui.add(egui::Label::new(egui::RichText::new(TABLE_ERROR_MARK).color(red).strong()).sense(egui::Sense::hover()).selectable(false));
+            if mark.hovered() {
+                egui::Tooltip::always_open(ctx.clone(), ui.layer_id(), id.with("tip"), egui::PopupAnchor::Pointer).show(|ui| {
+                    ui.label(&text);
+                });
+            }
+        });
+    }
 }

@@ -1554,6 +1554,7 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
     }
     if !app.session.view.read_mode {
         crate::calc_ui::bar(app, ui.ctx());
+        crate::calc_ui::table_markers(app, ui.ctx());
     }
     crate::mini_toolbar::track_dismissal(app, ui.ctx(), area);
     if let Some(sel) = app.canvas.mini_anchor
