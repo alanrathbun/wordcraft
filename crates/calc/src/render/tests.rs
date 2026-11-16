@@ -248,3 +248,37 @@ fn the_result_is_found_from_the_end() {
     // Nothing from the end back to a relation within the longest result: no result.
     assert_eq!(shown_result(&format!("x={}", "a".repeat(MAX_RESULT_BYTES + 1))), None);
 }
+
+#[test]
+fn comparisons_and_logic_display() {
+    let lin = |src: &str| display_of(src, None).linear;
+    assert!(lin("c := a <= b").contains("a≤b"));
+    assert!(lin("c := a != b").contains("a≠b"));
+    assert!(lin("c := a and not b or d").contains("a∧¬b∨d"));
+    assert!(lin("c := 2·(a < b)").contains("2·(a<b)") || lin("c := 2·(a < b)").contains("2(a<b)"));
+    let eq = display_of("c := a == b", None);
+    assert!(runs(&eq.math).iter().any(|r| r.text == "=" && r.sty == Some(MSty::Bold)));
+}
+
+#[test]
+fn comparison_parentheses_follow_precedence() {
+    let lin = |src: &str| display_of(src, None).linear;
+    assert!(lin("c := a < b ≤ c").contains("a<b≤c"));
+    assert!(lin("c := a == b").contains("a==b"));
+    assert!(lin("c := (a or b) and d").contains("(a∨b)∧d"));
+    assert!(lin("c := a or (b and d)").contains("a∨b∧d"));
+    assert!(lin("c := a or (b or d)").contains("a∨(b∨d)"));
+    assert!(lin("c := not (a and b)").contains("¬(a∧b)"));
+    assert!(lin("c := a + (b < d)").contains("a+(b<d)"));
+    assert!(lin("c := (a < b) < d").contains("(a<b)<d"));
+    assert!(lin("c := x < (a or b)").contains("x<(a∨b)"));
+}
+
+#[test]
+fn a_comparison_result_reads_back() {
+    // `==` is part of the expression; the result is read from the last `=`.
+    let one = Shown::One(f("1", ""));
+    let d = display_of("a == 1 =", Some(&one));
+    assert!(d.linear.contains("a==1=1"), "{}", d.linear);
+    assert_eq!(shown_result(&d.linear), Some(one));
+}

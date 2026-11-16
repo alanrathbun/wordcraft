@@ -23,7 +23,7 @@ use wordcraft_doc::math::{Arg, FUNCTION_NAMES, MNode, MRun, MSty, Math, parse_li
 use wordcraft_doc::math_linear::map_args;
 
 use crate::array::{MAX_ELEMENTS, MAX_TEXT_CHARS};
-use crate::{CalcError, Expr, Op, Stmt, funcs, parse};
+use crate::{CalcError, Cmp, Expr, Logic, Op, Stmt, funcs, parse};
 
 /// Colour of the error marker.
 pub const ERROR_RED: Rgb = Rgb(0xC0, 0x00, 0x00);
@@ -639,6 +639,15 @@ impl Out {
         self.sentinel(Piece { text: text.to_string(), kind: Kind::Text }, &quoted);
     }
 
+    /// A comparison's `==`: written as two characters in the linear text, drawn as one bold `=` so
+    /// it is never mistaken for the `=` that shows a result.
+    fn equals(&mut self) {
+        self.linear.push_str("==");
+        let k = self.nodes.len();
+        self.nodes.push(MNode::Run(MRun { text: "=".to_string(), sty: Some(MSty::Bold), ..MRun::default() }));
+        self.sentinel(Piece { text: k.to_string(), kind: Kind::Node(k) }, "==");
+    }
+
     /// Name text: a sentinel when UnicodeMath could read part of it as a function name.
     fn name_piece(&mut self, text: &str, kind: Kind) {
         self.linear.push_str(text);
@@ -748,6 +757,7 @@ fn sub_kind(sub: &str) -> Kind {
 enum Step<'a> {
     Expr(&'a Expr),
     Text(&'static str),
+    Cmp(Cmp),
 }
 
 fn write_stmt(stmt: &Stmt, out: &mut Out) {
@@ -785,17 +795,32 @@ fn write_stmt(stmt: &Stmt, out: &mut Out) {
     }
 }
 
-/// Binding strength: ranges 0, sums 1, products 2, negation 3, powers 4, atoms 5 (literals and
-/// indexes among them).
+// Binding strength, loosest first: ranges, `or`, `and`, `not`, comparisons, sums, products,
+// negation, powers, atoms (literals and indexes among them).
+const RANGE: u8 = 0;
+const OR: u8 = 1;
+const AND: u8 = 2;
+const NOT: u8 = 3;
+const COMPARE: u8 = 4;
+const SUM: u8 = 5;
+const PRODUCT: u8 = 6;
+const NEG: u8 = 7;
+const POWER: u8 = 8;
+const ATOM: u8 = 9;
+
 fn prec(e: &Expr) -> u8 {
     match e {
-        Expr::Range { .. } => 0,
-        Expr::Binary(Op::Add | Op::Sub, ..) => 1,
-        Expr::Binary(Op::Mul | Op::Div, ..) | Expr::Quantity(..) => 2,
-        Expr::Unary(..) => 3,
-        Expr::Binary(Op::Pow, ..) => 4,
-        Expr::Binary(Op::Neg, ..) => 1,
-        Expr::Num(_) | Expr::Text(_) | Expr::Name(_) | Expr::Call(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Index(..) => 5,
+        Expr::Range { .. } => RANGE,
+        Expr::Logic(Logic::Or, ..) => OR,
+        Expr::Logic(Logic::And, ..) => AND,
+        Expr::Not(_) => NOT,
+        Expr::Compare { .. } => COMPARE,
+        Expr::Binary(Op::Add | Op::Sub, ..) => SUM,
+        Expr::Binary(Op::Mul | Op::Div, ..) | Expr::Quantity(..) => PRODUCT,
+        Expr::Unary(..) => NEG,
+        Expr::Binary(Op::Pow, ..) => POWER,
+        Expr::Binary(Op::Neg, ..) => SUM,
+        Expr::Num(_) | Expr::Text(_) | Expr::Name(_) | Expr::Call(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Index(..) => ATOM,
     }
 }
 
@@ -886,7 +911,8 @@ fn ends_in_script(e: &Expr) -> bool {
             Expr::Text(_) | Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } => return false,
             Expr::Call(..) => return is_sqrt(e),
             Expr::Index(..) | Expr::Binary(Op::Pow | Op::Div, ..) => return true,
-            Expr::Unary(_, a) | Expr::Binary(_, _, a) => e = a,
+            Expr::Unary(_, a) | Expr::Binary(_, _, a) | Expr::Logic(_, _, a) | Expr::Not(a) => e = a,
+            Expr::Compare { first, rest } => e = rest.last().map_or(&**first, |(_, last)| last),
             Expr::Range { last, .. } => e = last,
         }
     }
@@ -926,6 +952,14 @@ fn write_expr(root: &Expr, out: &mut Out) {
                 out.text(t);
                 continue;
             }
+            Step::Cmp(Cmp::Eq) => {
+                out.equals();
+                continue;
+            }
+            Step::Cmp(cmp) => {
+                out.text(cmp.symbol());
+                continue;
+            }
             Step::Expr(e) => e,
         };
         match e {
@@ -940,7 +974,7 @@ fn write_expr(root: &Expr, out: &mut Out) {
             }
             Expr::Unary(Op::Neg, a) => {
                 // A product or sum under `-` keeps its parentheses.
-                wrap(&mut todo, a, prec(a) <= 3);
+                wrap(&mut todo, a, prec(a) <= NEG);
                 todo.push(Step::Text("-"));
             }
             // No other prefix operator exists (the evaluator refuses one); show the operand only.
@@ -980,22 +1014,42 @@ fn write_expr(root: &Expr, out: &mut Out) {
                     out.name(name);
                 }
             }
+            Expr::Compare { first, rest } => {
+                // Every operand is a sum or tighter; a comparison, `not`, `and` or `or` inside one
+                // keeps its parentheses.
+                for (cmp, operand) in rest.iter().rev() {
+                    wrap(&mut todo, operand, prec(operand) <= COMPARE);
+                    todo.push(Step::Cmp(*cmp));
+                }
+                wrap(&mut todo, first, prec(first) <= COMPARE);
+            }
+            Expr::Logic(logic, a, b) => {
+                // Left to right, like a sum: the same connective on the right keeps its parentheses.
+                let level = if *logic == Logic::And { AND } else { OR };
+                wrap(&mut todo, b, prec(b) <= level);
+                todo.push(Step::Text(if *logic == Logic::And { "∧" } else { "∨" }));
+                wrap(&mut todo, a, prec(a) < level);
+            }
+            Expr::Not(a) => {
+                wrap(&mut todo, a, prec(a) < NOT);
+                todo.push(Step::Text("¬"));
+            }
             Expr::Matrix { cols, items, .. } => out.matrix(*cols, items),
             Expr::Index(..) | Expr::Range { .. } => push_array_syntax(e, &mut todo, out),
             Expr::Binary(op, a, b) => match op {
                 Op::Add | Op::Sub | Op::Neg => {
-                    wrap(&mut todo, b, prec(b) <= 1 || matches!(&**b, Expr::Unary(..)));
+                    wrap(&mut todo, b, prec(b) <= SUM || matches!(&**b, Expr::Unary(..)));
                     todo.push(Step::Text(if *op == Op::Add { "+" } else { "-" }));
                     todo.push(Step::Expr(a));
                 }
                 Op::Mul => {
                     // A quotient on the right needs no parentheses: UnicodeMath's numerator stops
                     // at the `·`, so `c·a/b` reads as c·(a/b), as it was evaluated.
-                    let right_parens = prec(b) < 2 || matches!(&**b, Expr::Binary(Op::Mul, ..) | Expr::Quantity(..) | Expr::Unary(..));
+                    let right_parens = prec(b) < PRODUCT || matches!(&**b, Expr::Binary(Op::Mul, ..) | Expr::Quantity(..) | Expr::Unary(..));
                     wrap(&mut todo, b, right_parens);
                     let spaced = is_unitish(b) && !is_unitish(last_factor(a)) && !right_parens;
                     todo.push(Step::Text(if spaced { " " } else { "·" }));
-                    wrap(&mut todo, a, prec(a) < 2);
+                    wrap(&mut todo, a, prec(a) < PRODUCT);
                 }
                 // The parentheses around a fraction's operands are dropped when it is built up.
                 Op::Div => {

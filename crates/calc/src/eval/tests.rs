@@ -1195,3 +1195,95 @@ fn text_is_charged_by_size() {
     assert_eq!(copies("v", &numbers), Ok(()));
     assert_eq!(copies("t", &texts), Err(CalcError::TooMuchWork));
 }
+
+/// Run `src` in a fresh env and return the plain values of the grid it shows.
+fn vector(src: &str) -> Vec<f64> {
+    let mut env = Env::new();
+    let stmt = parse(&format!("{src} =")).unwrap_or_else(|e| panic!("{src:?} did not parse: {e}"));
+    match run_stmt(&mut env, &stmt) {
+        Ok(Some(Value::Grid { items, .. })) => items.iter().map(|q| q.value).collect(),
+        other => panic!("{src:?} did not show a grid: {other:?}"),
+    }
+}
+
+#[test]
+fn comparisons() {
+    let t = |src: &str| val(&format!("{src} =")).value;
+    assert_eq!(t("38.1 mm == 1.5 in"), 1.0);
+    assert_eq!(t("38.1 mm > 1.5 in"), 0.0);
+    assert_eq!(t("212 °F ≤ 100 °C"), 1.0);
+    assert_eq!(t("100 °C == 212 °F"), 1.0);
+    assert_eq!(t("0.1 + 0.2 == 0.3"), 1.0);
+    assert_eq!(t("1e-20 == 0"), 0.0);
+    assert_eq!(t("0 ≤ 0.5 ≤ 1"), 1.0);
+    assert_eq!(t("0 ≤ 1.5 ≤ 1"), 0.0);
+    assert_eq!(t("\"A106 B\" == \" A106\u{a0} B \""), 1.0);
+    assert_eq!(t("\"a\" ≠ \"A\""), 1.0);
+    assert!(matches!(run(&mut Env::new(), "1 in < 1 lbf ="), Err(CalcError::Unit(_))));
+    assert_eq!(err("\"a\" < \"b\" =").to_string(), "\"a\" is text — it can't be used with <");
+    assert_eq!(err("\"OK\" == 1 =").to_string(), "can't compare \"OK\" with a number");
+    let v = vector("[1, 5, 9] > 4");
+    assert_eq!(v, vec![0.0, 1.0, 1.0]);
+}
+
+#[test]
+fn comparison_results_are_plain_one_and_zero() {
+    let q = val("3 in < 4 in =");
+    assert_eq!(q.dim, Dim::ONE);
+    assert_eq!(q.value, 1.0);
+    // Text grids compare element by element, and a text broadcasts.
+    assert_eq!(vector("[\"OK\", \"NG\", \" OK \"] == \"OK\""), vec![1.0, 0.0, 1.0]);
+    assert_eq!(vector("[\"a\", \"b\"] ≠ [\"a\", \"c\"]"), vec![0.0, 1.0]);
+    assert_eq!(err("[1, 2] < [1, 2, 3] =").to_string(), "shapes don't match: 2 rows × 1 vs 3 rows × 1");
+    assert_eq!(err("[1, 2] < \"a\" =").to_string(), "can't compare \"a\" with a number");
+    // A chain over a vector compares every link element by element.
+    assert_eq!(vector("0 ≤ [0.5, 2, 1] ≤ 1"), vec![1.0, 0.0, 1.0]);
+    assert_eq!(err("1 in == 2 =").to_string(), CalcError::Unit(UnitError::Mismatch { left: Dim::LENGTH, right: Dim::ONE }).to_string());
+}
+
+#[test]
+fn temperature_comparisons() {
+    let mut env = Env::new();
+    for src in ["T := 950 °F", "T_K := 700 K", "ΔT := 20 Δ°F", "T_1 := 100 °F", "T_2 := 200 °F"] {
+        run(&mut env, src).unwrap();
+    }
+    assert_eq!(run(&mut env, "T ≤ 900 °F =").unwrap().unwrap().value, 0.0);
+    assert_eq!(run(&mut env, "T ≤ 800 K =").unwrap().unwrap().value, 1.0); // 950 °F is 783.15 K
+    assert_eq!(run(&mut env, "ΔT ≤ 10 Δ°F =").unwrap().unwrap().value, 0.0);
+    assert_eq!(run(&mut env, "T_K > ΔT =").unwrap().unwrap().value, 1.0);
+    let msg = "can't compare an absolute temperature with a temperature difference — write an average as T_1 + (T_2 − T_1)/2";
+    assert_eq!(run(&mut env, "ΔT ≤ 10 °F =").unwrap_err().to_string(), msg);
+    assert_eq!(run(&mut env, "(T_1 + T_2)/2 ≤ 900 °F =").unwrap_err().to_string(), msg);
+    assert_eq!(run(&mut env, "T_1 + (T_2 - T_1)/2 ≤ 900 °F =").unwrap().unwrap().value, 1.0);
+}
+
+#[test]
+fn logic() {
+    let t = |src: &str| val(&format!("{src} =")).value;
+    assert_eq!(t("1 < 2 and 3 < 4"), 1.0);
+    assert_eq!(t("1 > 2 or not 3 > 4"), 1.0);
+    assert_eq!(t("0.5 and 1"), 1.0); // nonzero is true
+    assert_eq!(err("1 in and 1 =").to_string(), "a condition must be a comparison or a plain number");
+    assert_eq!(err("\"OK\" or 1 =").to_string(), "\"OK\" is text — it can't be used as a condition");
+    // A single false left side decides `and` without evaluating the right.
+    assert_eq!(t("1 > 2 and undefined_name > 0"), 0.0);
+    assert_eq!(t("1 < 2 or undefined_name > 0"), 1.0);
+    assert_eq!(vector("[1, 0, 2] > 0 and [1, 1, 0] > 0"), vec![1.0, 0.0, 0.0]);
+}
+
+#[test]
+fn logic_on_vectors_and_not() {
+    assert_eq!(vector("not [1, 0, 2]"), vec![0.0, 1.0, 0.0]);
+    assert_eq!(vector("[1, 0] > 0 or [0, 0] > 0"), vec![1.0, 0.0]);
+    assert_eq!(err("not 1 in =").to_string(), "a condition must be a comparison or a plain number");
+    assert_eq!(val("not not 1 =").value, 1.0);
+}
+
+#[test]
+fn keywords_are_not_names() {
+    for word in ["and", "or", "not", "if", "otherwise"] {
+        assert_eq!(check_name(word), Err(CalcError::Keyword(word.into())), "{word}");
+    }
+    assert_eq!(CalcError::Keyword("or".into()).to_string(), "or is a reserved word — choose another name");
+    assert!(check_name("order").is_ok());
+}

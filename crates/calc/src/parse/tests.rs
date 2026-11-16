@@ -1,5 +1,5 @@
 use super::parse;
-use crate::{CalcError, Expr, Op, Show, Stmt, defined_name, free_names};
+use crate::{CalcError, Cmp, Expr, Logic, Op, Show, Stmt, defined_name, free_names};
 use proptest::prelude::*;
 
 fn num(v: f64) -> Expr {
@@ -440,8 +440,9 @@ fn quantity_variant_is_never_produced() {
         match e {
             Expr::Quantity(..) => true,
             Expr::Num(_) | Expr::Text(_) | Expr::Name(_) => false,
-            Expr::Unary(_, a) | Expr::Abs(a) => has_quantity(a),
-            Expr::Binary(_, a, b) => has_quantity(a) || has_quantity(b),
+            Expr::Unary(_, a) | Expr::Abs(a) | Expr::Not(a) => has_quantity(a),
+            Expr::Binary(_, a, b) | Expr::Logic(_, a, b) => has_quantity(a) || has_quantity(b),
+            Expr::Compare { first, rest } => has_quantity(first) || rest.iter().any(|(_, e)| has_quantity(e)),
             Expr::Call(_, args) | Expr::Index(_, args) => args.iter().any(has_quantity),
             Expr::Matrix { items, .. } => items.iter().any(has_quantity),
             Expr::Range { first, second, last } => has_quantity(first) || second.as_deref().is_some_and(has_quantity) || has_quantity(last),
@@ -648,4 +649,51 @@ fn text_literals() {
     assert_eq!(parse("c := \"OK").unwrap_err().to_string(), "a text needs a closing quote, like \"OK\"");
     assert_eq!(parse(&format!("c := \"{}\"", "x".repeat(1001))).unwrap_err().to_string(), "a text is at most 1,000 characters");
     assert!(parse("c := 2 \"OK\"").is_err(), "text never multiplies by adjacency");
+}
+
+/// The expression of `src =`.
+fn expr(src: &str) -> Expr {
+    expr_of(src)
+}
+
+#[test]
+fn comparisons_and_logic_parse() {
+    let cmp = |a: Expr, rest: Vec<(Cmp, Expr)>| Expr::Compare { first: Box::new(a), rest };
+    let n = |s: &str| Expr::Name(s.into());
+    assert_eq!(expr("a <= b + 1"), cmp(n("a"), vec![(Cmp::Le, Expr::Binary(Op::Add, Box::new(n("b")), Box::new(Expr::Num(1.0))))]));
+    assert_eq!(expr("0 ≤ x < 1"), cmp(Expr::Num(0.0), vec![(Cmp::Le, n("x")), (Cmp::Lt, Expr::Num(1.0))]));
+    assert_eq!(expr("a == b"), cmp(n("a"), vec![(Cmp::Eq, n("b"))]));
+    assert_eq!(expr("a != b"), expr("a ≠ b"));
+    assert_eq!(expr("a >= b"), expr("a ≥ b"));
+    assert_eq!(expr("not a < b and c or d"), expr("((¬(a < b)) ∧ c) ∨ d"));
+    assert_eq!(expr("a ∧ b"), Expr::Logic(Logic::And, Box::new(n("a")), Box::new(n("b"))));
+    // `==` is not the show `=`; a statement can still end in `=`.
+    assert!(matches!(parse("a == b ="), Ok(Stmt::Eval { .. })));
+    assert_eq!(parse("or := 5").unwrap_err().to_string(), "or is a reserved word — choose another name");
+    assert_eq!(parse("f(if) := 5").unwrap_err().to_string(), "if is a reserved word — choose another name");
+    assert!(parse("x := 1 ! 2").unwrap_err().to_string().contains("`!`"));
+}
+
+#[test]
+fn logic_binds_looser_than_comparison() {
+    assert_eq!(expr("not a < b and c ≥ d or e"), expr("((not (a < b)) and (c ≥ d)) or e"));
+    // `or` is loosest, then `and`, then `not`, then comparisons, then sums.
+    assert_eq!(expr("a or b and c"), expr("a or (b and c)"));
+    assert_eq!(expr("a < b + 1"), expr("a < (b + 1)"));
+    assert_eq!(expr("a or b or c"), expr("(a or b) or c"));
+    // A keyword is not a name: it starts no product, and `if` is not parsed yet.
+    assert!(parse("2 and =").is_err());
+    assert!(parse("x := 2 or 3 4").is_err());
+    assert!(parse("if =").is_err());
+    assert!(parse("x := 1 otherwise 2").is_err());
+    // A long chain or a deep `not` is bounded, not recursive without limit.
+    let chain = vec!["a"; 3000].join(" < ");
+    assert!(matches!(parse(&format!("{chain} =")), Ok(Stmt::Eval { .. })));
+    assert_eq!(parse(&format!("{}a =", "not ".repeat(100))), Err(CalcError::TooComplex));
+}
+
+#[test]
+fn comparison_names_are_free_names() {
+    let s = parse("x := a < b and not c or d == a").unwrap();
+    assert_eq!(free_names(&s), vec!["a", "b", "c", "d"]);
 }

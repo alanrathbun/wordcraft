@@ -110,6 +110,19 @@ impl Data {
     }
 }
 
+/// What two texts are compared by: the text trimmed, with every run of whitespace (a non-breaking
+/// space included) as one space. Case is kept.
+pub(crate) fn text_key(s: &str) -> String {
+    let mut key = String::with_capacity(s.len());
+    for word in s.split_whitespace() {
+        if !key.is_empty() {
+            key.push(' ');
+        }
+        key.push_str(word);
+    }
+    key
+}
+
 /// The steps of work a text costs to copy: one per 32 bytes (UTF-8).
 pub(crate) fn text_steps(text: &str) -> u64 {
     u64::try_from(text.len() / 32).unwrap_or(u64::MAX)

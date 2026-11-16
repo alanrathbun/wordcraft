@@ -14,9 +14,10 @@
 //! [`crate::array_funcs`]) take whole grids rather than applying element by element.
 
 use crate::array::{self, Data, Grid, MAX_ELEMENTS};
-use crate::array_funcs;
+use crate::array_funcs::{self, nearly_equal};
 use crate::funcs::{self, unit};
-use crate::{CalcError, Expr, Op, Show, Stmt, Value};
+use crate::parse::is_keyword;
+use crate::{CalcError, Cmp, Expr, Logic, Op, Show, Stmt, Value};
 use craft_units::{Dim, Precision, Quantity, Scale, UnitError, UnitSystem, lookup, parse_unit};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -78,11 +79,16 @@ const SHOWN_TEXT_CHARS: usize = 40;
 /// The error for the text `text` used where only a number makes sense, at `place` (`in
 /// arithmetic`, `with a unit`): the text is shown cut to [`SHOWN_TEXT_CHARS`] characters.
 pub(crate) fn text_use(text: &str, place: impl Into<Cow<'static, str>>) -> CalcError {
+    CalcError::TextUse { text: cut_text(text), place: place.into() }
+}
+
+/// `text` cut to [`SHOWN_TEXT_CHARS`] characters, with `…` when it was cut.
+fn cut_text(text: &str) -> String {
     let mut shown: String = text.chars().take(SHOWN_TEXT_CHARS).collect();
     if text.chars().nth(SHOWN_TEXT_CHARS).is_some() {
         shown.push('…');
     }
-    CalcError::TextUse { text: shown, place: place.into() }
+    shown
 }
 
 /// Refuse text among `operands`, which are used at `place`: the first text is named.
@@ -91,6 +97,11 @@ fn no_text(operands: &[&Data], place: &'static str) -> Result<(), CalcError> {
         Some(text) => Err(text_use(text, place)),
         None => Ok(()),
     }
+}
+
+/// 1 for true and 0 for false: a dimensionless, plain value.
+fn truth_val(holds: bool) -> Val {
+    Val::plain(Quantity::dimensionless(if holds { 1.0 } else { 0.0 }))
 }
 
 /// What a name means in an [`Env`].
@@ -206,10 +217,14 @@ impl Env {
     }
 }
 
-/// Refuse a name that is a unit (with or without an SI prefix), a built-in function, or one of
-/// one of the built-in constants (`π`, `pi`, `e`, `g_0`, `c_0`, `R_u`); and a name with an empty subscript part (`a__b`, `x_`),
-/// which would display like a different name (`a_b`, `x`).
+/// Refuse a name that is a keyword (`and`, `or`, `not`, `if`, `otherwise`), a unit (with or without
+/// an SI prefix), a built-in function, or one of the built-in constants (`π`, `pi`, `e`, `g_0`,
+/// `c_0`, `R_u`); and a name with an empty subscript part (`a__b`, `x_`), which would display like a
+/// different name (`a_b`, `x`).
 pub fn check_name(name: &str) -> Result<(), CalcError> {
+    if is_keyword(name) {
+        return Err(CalcError::Keyword(name.to_string()));
+    }
     if name.contains('_') && name.split('_').any(str::is_empty) {
         return Err(CalcError::Syntax(format!("{name} has an empty subscript — write a name like a_b")));
     }
@@ -373,7 +388,7 @@ fn fits(v: Val, scale: &Scale, text: &str) -> Result<(), CalcError> {
 }
 
 /// Shared state of one evaluation.
-struct Cx<'a> {
+pub(crate) struct Cx<'a> {
     env: &'a Env,
     /// Expression nodes evaluated so far.
     steps: Cell<u32>,
@@ -473,6 +488,13 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
                 };
                 Ok(Val { q, t })
             })
+        }
+        Expr::Compare { first, rest } => compare_chain(cx, fr, first, rest, depth),
+        Expr::Logic(logic, a, b) => logic_op(cx, fr, *logic, a, b, depth),
+        Expr::Not(a) => {
+            let x = eval(cx, fr, a, depth + 1)?;
+            let t = truth(cx, &x)?;
+            each(cx, &t, |v| Ok(truth_val(v.q.value == 0.0)))
         }
         Expr::Call(name, args) => call(cx, fr, name, args, depth),
         Expr::Matrix { rows, cols, items } => matrix(cx, fr, *rows, *cols, items, depth),
@@ -656,6 +678,132 @@ fn slot(i: f64, origin: u8, len: usize) -> Option<usize> {
 /// A whole number as the author would write it: `3`, `-1`, and `1e300` for one too large to spell.
 fn index_text(i: f64) -> String {
     if i.abs() < 1e15 { format!("{}", i as i64) } else { format!("{i:e}") }
+}
+
+/// `a < b ≤ c …`: every operand evaluated once, each link compared element by element, and the
+/// links combined with `and`. The result is 1 or 0 (a grid of them when an operand is a grid).
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn compare_chain(cx: &Cx<'_>, fr: &Frame<'_>, first: &Expr, rest: &[(Cmp, Expr)], depth: usize) -> Result<Data, CalcError> {
+    let mut prev = eval(cx, fr, first, depth + 1)?;
+    let mut holds: Option<Data> = None;
+    for (cmp, e) in rest {
+        let next = eval(cx, fr, e, depth + 1)?;
+        let link = compare(cx, &prev, *cmp, &next)?;
+        holds = Some(match holds {
+            Some(all) => pair(cx, &all, &link, |x, y| Ok(truth_val(x.q.value != 0.0 && y.q.value != 0.0)))?,
+            None => link,
+        });
+        prev = next;
+    }
+    holds.ok_or_else(|| CalcError::Syntax("a comparison needs two values".to_string()))
+}
+
+/// `x cmp y`, element by element (a single value broadcast over a grid): 1 where it holds, else 0.
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn compare(cx: &Cx<'_>, x: &Data, cmp: Cmp, y: &Data) -> Result<Data, CalcError> {
+    let (xt, yt) = (x.text(), y.text());
+    match (xt, yt) {
+        (None, None) => pair(cx, x, y, |a, b| compare_values(a, cmp, b).map(truth_val)),
+        (Some(_), Some(_)) => compare_texts(cx, x, cmp, y),
+        (Some(text), None) | (None, Some(text)) => Err(CalcError::Syntax(format!("can't compare \"{}\" with a number", cut_text(text)))),
+    }
+}
+
+/// Whether `a cmp b`, for numbers: the dimensions must agree, and the SI values are compared with
+/// the tolerance `==` has. An absolute temperature is compared with another absolute temperature or
+/// a `K`/`°R` value, but not with a difference or an average.
+fn compare_values(a: Val, cmp: Cmp, b: Val) -> Result<bool, CalcError> {
+    let (l, r) = (a.q, b.q);
+    if !l.dim.same_ignoring_angle(r.dim) {
+        return Err(CalcError::Unit(UnitError::Mismatch { left: l.dim, right: r.dim }));
+    }
+    let plain_temperature = |v: Val| v.t == Temp::Plain && v.q.dim == Dim::TEMPERATURE;
+    if (a.t == Temp::Absolute && plain_temperature(b)) || (b.t == Temp::Absolute && plain_temperature(a)) {
+        return Err(CalcError::TempCompare);
+    }
+    let same = nearly_equal(l.value, r.value);
+    let less = l.value < r.value;
+    Ok(match cmp {
+        Cmp::Eq => same,
+        Cmp::Ne => !same,
+        Cmp::Lt => less && !same,
+        Cmp::Le => less || same,
+        Cmp::Gt => !less && !same,
+        Cmp::Ge => !less || same,
+    })
+}
+
+/// `x cmp y` for texts, which are only equal or not: after [`array::text_key`] on both. Each
+/// element counts as a step of work, and so does the text's size.
+#[inline(never)]
+fn compare_texts(cx: &Cx<'_>, x: &Data, cmp: Cmp, y: &Data) -> Result<Data, CalcError> {
+    let equal = match cmp {
+        Cmp::Eq => true,
+        Cmp::Ne => false,
+        _ => return Err(text_use(x.text().unwrap_or_default(), format!("with {}", cmp.symbol()))),
+    };
+    let shape = array::result_shape(x, y)?;
+    if let Some((rows, cols)) = shape {
+        charge_elements(cx, rows.saturating_mul(cols))?;
+    }
+    let (xs, ys) = (texts_of(x), texts_of(y));
+    let n = xs.len().max(ys.len());
+    // A single text is broadcast over the other's elements.
+    fn at(s: &[String], k: usize) -> &str {
+        s.get(if s.len() == 1 { 0 } else { k }).map_or("", String::as_str)
+    }
+    let mut items = Vec::with_capacity(n);
+    for k in 0..n {
+        let (a, b) = (at(xs, k), at(ys, k));
+        cx.pass.charge(array::text_steps(a).saturating_add(array::text_steps(b)))?;
+        items.push(truth_val((array::text_key(a) == array::text_key(b)) == equal));
+    }
+    match shape {
+        Some((rows, cols)) => Grid::new(rows, cols, items).map(Data::Grid),
+        None => items.pop().map(Data::One).ok_or(CalcError::NonFinite),
+    }
+}
+
+/// The texts of a text or a text grid (none for numbers).
+fn texts_of(d: &Data) -> &[String] {
+    match d {
+        Data::Text(s) => std::slice::from_ref(s),
+        Data::TextGrid(g) => &g.items,
+        Data::One(_) | Data::Grid(_) => &[],
+    }
+}
+
+/// `a and b` or `a or b` as 1 or 0. A single left value that decides the result (false for `and`,
+/// true for `or`) leaves the right side unevaluated. A grid on the left evaluates both sides and
+/// combines them element by element.
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn logic_op(cx: &Cx<'_>, fr: &Frame<'_>, logic: Logic, a: &Expr, b: &Expr, depth: usize) -> Result<Data, CalcError> {
+    let x = eval(cx, fr, a, depth + 1)?;
+    let left = truth(cx, &x)?;
+    let decides = logic == Logic::Or;
+    if let Data::One(v) = &left
+        && (v.q.value != 0.0) == decides
+    {
+        return Ok(left);
+    }
+    let y = eval(cx, fr, b, depth + 1)?;
+    let right = truth(cx, &y)?;
+    pair(cx, &left, &right, |p, q| {
+        let (p, q) = (p.q.value != 0.0, q.q.value != 0.0);
+        Ok(truth_val(if decides { p || q } else { p && q }))
+    })
+}
+
+/// A condition checked: the plain numbers of `d` (nonzero is true) as 1 and 0, a grid for a grid.
+/// A value with a unit is [`CalcError::NotCondition`], and a text can't be one.
+pub(crate) fn truth(cx: &Cx<'_>, d: &Data) -> Result<Data, CalcError> {
+    if let Some(text) = d.text() {
+        return Err(text_use(text, "as a condition"));
+    }
+    each(cx, d, |v| if v.q.dim == Dim::ONE { Ok(truth_val(v.q.value != 0.0)) } else { Err(CalcError::NotCondition) })
 }
 
 /// The range `first..last` or `first, second..last`, both ends included: a column of the values

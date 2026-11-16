@@ -1914,3 +1914,11 @@ fn text_results_show_and_quote() {
     mark_stale(&mut d);
     assert!(region(&d, 1).1.ends_with("≈\"t = 0.2 & up\""), "{}", region(&d, 1).1);
 }
+
+#[test]
+fn a_reserved_word_name_fails_alone() {
+    let mut d = doc_with(&["a := 1", "or := 2", "b := a + 1 ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 2).0.state, CalcState::Error("or is a reserved word — choose another name".into()));
+    assert_eq!(region(&d, 3).0.state, CalcState::Fresh);
+}

@@ -56,6 +56,18 @@ pub enum Expr {
     Unary(Op, Box<Expr>),
     /// An infix operator.
     Binary(Op, Box<Expr>, Box<Expr>),
+    /// A comparison or a chain of them: `a < b` is one link, `a < b ≤ c` two (`rest` is never
+    /// empty). A chain holds when every link does.
+    Compare {
+        /// The leftmost operand.
+        first: Box<Expr>,
+        /// Each further operand with the comparison that joins it to the one before.
+        rest: Vec<(Cmp, Expr)>,
+    },
+    /// `a and b` or `a or b`.
+    Logic(Logic, Box<Expr>, Box<Expr>),
+    /// `not a`.
+    Not(Box<Expr>),
     /// A function call; `√x` is `Call("sqrt", [x])`.
     Call(String, Vec<Expr>),
     /// Absolute value, `|x|`.
@@ -82,6 +94,46 @@ pub enum Expr {
         /// The last value.
         last: Box<Expr>,
     },
+}
+
+/// A comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cmp {
+    /// `<`
+    Lt,
+    /// `>`
+    Gt,
+    /// `≤` or `<=`
+    Le,
+    /// `≥` or `>=`
+    Ge,
+    /// `==`
+    Eq,
+    /// `≠` or `!=`
+    Ne,
+}
+
+impl Cmp {
+    /// The symbol it is shown as and named by in messages.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Cmp::Lt => "<",
+            Cmp::Gt => ">",
+            Cmp::Le => "≤",
+            Cmp::Ge => "≥",
+            Cmp::Eq => "==",
+            Cmp::Ne => "≠",
+        }
+    }
+}
+
+/// A logical connective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Logic {
+    /// `and` or `∧`
+    And,
+    /// `or` or `∨`
+    Or,
 }
 
 /// An operator.
@@ -131,13 +183,18 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
         let name = match e {
             Expr::Num(_) | Expr::Text(_) | Expr::Quantity(..) => continue,
             Expr::Name(n) => n,
-            Expr::Unary(_, a) | Expr::Abs(a) => {
+            Expr::Unary(_, a) | Expr::Abs(a) | Expr::Not(a) => {
                 stack.push(a);
                 continue;
             }
-            Expr::Binary(_, a, b) => {
+            Expr::Binary(_, a, b) | Expr::Logic(_, a, b) => {
                 stack.push(b);
                 stack.push(a);
+                continue;
+            }
+            Expr::Compare { first, rest } => {
+                stack.extend(rest.iter().rev().map(|(_, e)| e));
+                stack.push(first);
                 continue;
             }
             Expr::Call(n, args) | Expr::Index(n, args) => {

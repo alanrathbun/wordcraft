@@ -17,6 +17,7 @@ use wordcraft_doc::table::MAX_COLS;
 use wordcraft_doc::{Block, Cell, Paragraph, Table};
 
 use crate::array::MAX_ELEMENTS;
+use crate::parse::is_keyword;
 use crate::{CalcError, Env, Expr, Stmt, check_name, defined_name, parse};
 
 fn syntax(message: impl Into<String>) -> CalcError {
@@ -49,6 +50,10 @@ fn heading_name(text: &str) -> Result<&str, CalcError> {
     let name = text.split_once('(').map_or(text, |(name, _)| name).trim();
     if name.is_empty() {
         return Err(syntax("a calculation data column needs a heading: a name, and a unit in brackets, like D_o (in)"));
+    }
+    // A keyword is reported as one, not as a name the parser can't read.
+    if is_keyword(name) {
+        return Err(CalcError::Keyword(name.to_string()));
     }
     // The name as the calculation parser reads it: anything but a single plain name is refused.
     let parsed = parse(&format!("{name} := 0")).ok();
@@ -354,5 +359,7 @@ mod tests {
             assert!(heading(bad).is_err(), "{bad:?} reads as {:?}", heading(bad));
         }
         assert_eq!(heading("m (kg)"), Err(CalcError::ReservedName("m".into())));
+        assert_eq!(heading("or (in)"), Err(CalcError::Keyword("or".into())));
+        assert_eq!(heading("if"), Err(CalcError::Keyword("if".into())));
     }
 }

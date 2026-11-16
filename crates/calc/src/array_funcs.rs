@@ -20,8 +20,8 @@ use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, render};
 use craft_units::{Dim, Formatted, Precision, Quantity, UnitError, UnitSystem, format};
 
-/// How far apart (relative to the larger) two values may be and still count as equal in `lookup`
-/// and at the ends and knots of an interpolation: what converting units can leave
+/// How far apart (relative to the larger) two values may be and still count as equal in `lookup`, in
+/// `==` and at the ends and knots of an interpolation: what converting units can leave
 /// (`38.1 mm` against `1.5 in`).
 const EQUAL: f64 = 1e-12;
 
@@ -248,8 +248,9 @@ fn transposed<T: Clone>(g: &Grid<T>) -> Result<Grid<T>, CalcError> {
     Grid::new(g.cols, g.rows, items)
 }
 
-/// Whether `a` and `b` are equal to within [`EQUAL`] of the larger.
-fn equal(a: f64, b: f64) -> bool {
+/// Whether `a` and `b` are equal to within a relative 1e-12 of the larger (what converting units
+/// can leave): the rule of `lookup`, of interpolation knots and of `==`. Only 0 equals 0.
+pub(crate) fn nearly_equal(a: f64, b: f64) -> bool {
     (a - b).abs() <= EQUAL * a.abs().max(b.abs())
 }
 
@@ -286,7 +287,7 @@ fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError
     let dim = one_dim(xs, xs_name, cx.origin)?;
     array::map(x, cx.origin, |x| {
         fits(x.q, dim)?;
-        let mut matches = xs.iter().enumerate().filter(|(_, xi)| equal(xi.q.value, x.q.value)).map(|(i, _)| i);
+        let mut matches = xs.iter().enumerate().filter(|(_, xi)| nearly_equal(xi.q.value, x.q.value)).map(|(i, _)| i);
         match (matches.next(), matches.next()) {
             (Some(i), None) => ys.get(i).copied().ok_or_else(|| CalcError::Syntax(format!("{ys_name} has no element {i}"))),
             (Some(_), Some(_)) => Err(CalcError::Syntax(format!("{} matches more than one value in {xs_name}", shown(x.q, cx)))),
@@ -333,7 +334,7 @@ fn interpolate(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Resul
         let v = x.q.value;
         // The first point at or past `v`: `v` is between it and the one before.
         let p = xv.partition_point(|&xi| xi < v);
-        let knot = [p.checked_sub(1), Some(p)].into_iter().flatten().find(|&k| xv.get(k).is_some_and(|&xk| equal(xk, v)));
+        let knot = [p.checked_sub(1), Some(p)].into_iter().flatten().find(|&k| xv.get(k).is_some_and(|&xk| nearly_equal(xk, v)));
         let value = match knot {
             Some(k) => yv.get(k).copied(),
             None if p == 0 || p >= xv.len() => None,

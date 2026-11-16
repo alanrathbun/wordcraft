@@ -23,7 +23,7 @@ mod recalc;
 pub mod render;
 mod tables;
 
-pub use ast::{Expr, Op, Show, Stmt, defined_name, free_names};
+pub use ast::{Cmp, Expr, Logic, Op, Show, Stmt, defined_name, free_names};
 pub use eval::{Env, check_name, eval_expr, run_stmt};
 pub use parse::parse;
 pub use recalc::{
@@ -110,6 +110,15 @@ pub enum CalcError {
     /// A name that is a unit, function or constant.
     #[error("{0} is a unit, function or constant name — choose another name")]
     ReservedName(String),
+    /// A name that is a keyword of the language (`and`, `or`, `not`, `if`, `otherwise`).
+    #[error("{0} is a reserved word — choose another name")]
+    Keyword(String),
+    /// A condition that is a unit value or a temperature, not a comparison or a plain number.
+    #[error("a condition must be a comparison or a plain number")]
+    NotCondition,
+    /// An absolute temperature compared with a difference or an average.
+    #[error("can't compare an absolute temperature with a temperature difference — write an average as T_1 + (T_2 − T_1)/2")]
+    TempCompare,
     /// Calculations that depend on each other in a cycle. Holds the names joined with `, `.
     #[error("{0} depend on each other")]
     Circular(String),

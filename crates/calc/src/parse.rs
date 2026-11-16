@@ -9,7 +9,13 @@
 //! body      := range | expr
 //! range     := expr [ "," expr ] ".." expr                    first, second..last; `..` loosest
 //! show      := "=" [ "?" ] [ unit text ]                       the rest of the text is the unit
-//! expr      := term { ("+" | "-") term }
+//! expr      := or
+//! or        := and { ("or" | "∨") and }
+//! and       := not { ("and" | "∧") not }
+//! not       := ("not" | "¬") not | compare                     the operand is a whole comparison
+//! compare   := sum { ("<" | ">" | "≤" | "<=" | "≥" | ">=" | "==" | "≠" | "!=") sum }
+//!                                                               a chain, `a < b ≤ c`, is one comparison
+//! sum       := term { ("+" | "-") term }
 //! term      := unary { ("*" | "/" | adjacency) unary }
 //! unary     := "-" unary | power                               so -x^2 is -(x^2)
 //! power     := atom [ "^" unary ]                              right-associative
@@ -19,6 +25,9 @@
 //! items     := expr { "," expr }
 //! postfix   := atom { "²" | "³" | "⁻¹" ... }                   one superscript digit, like `^`
 //! ```
+//!
+//! `and`, `or`, `not`, `if` and `otherwise` are keywords, never names (`if` and `otherwise` are
+//! lexed but not yet parsed). A `==` is a comparison; a lone `=` still ends the statement.
 //!
 //! A text is written between quotes, `"OK"` or `“OK”`, and is at most [`MAX_TEXT_CHARS`] characters.
 //! It never multiplies by adjacency (`2 "OK"` is an error).
@@ -38,7 +47,7 @@
 //! the height of the tree it builds at most [`MAX_HEIGHT`], so nothing downstream recurses deeply.
 
 use crate::array::MAX_TEXT_CHARS;
-use crate::{CalcError, Expr, Op, Show, Stmt};
+use crate::{CalcError, Cmp, Expr, Logic, Op, Show, Stmt};
 
 #[cfg(test)]
 mod tests;
@@ -55,6 +64,13 @@ const MAX_DEPTH: usize = 64;
 const MAX_HEIGHT: usize = 1024;
 
 // Binding powers: (left, right) for infix operators; a higher number binds tighter.
+const OR_BP: (u8, u8) = (2, 3);
+const AND_BP: (u8, u8) = (4, 5);
+/// The operand of a prefix `not`: a whole comparison, but no `and` or `or`, so
+/// `not a < b and c` is `(not (a < b)) and c`.
+const NOT_BP: u8 = 7;
+/// Comparisons chain (`a < b ≤ c`), so the right power only decides where each operand ends.
+const CMP_BP: (u8, u8) = (8, 9);
 const ADD_BP: (u8, u8) = (10, 11);
 const MUL_BP: (u8, u8) = (20, 21);
 /// Prefix minus: tighter than `*`, looser than `^`, so `-x^2` is `-(x^2)` and `-a*b` is `(-a)*b`.
@@ -76,7 +92,7 @@ pub fn parse(src: &str) -> Result<Stmt, CalcError> {
     let toks = lex(src)?;
     match toks.iter().position(|t| t.kind == Kind::Define) {
         Some(at) => {
-            let (name, index, params) = define_head(toks.get(..at).unwrap_or_default())?;
+            let (name, index, params) = define_head(src, toks.get(..at).unwrap_or_default())?;
             let mut p = Parser::new(toks.get(at + 1..).unwrap_or_default());
             let body = p.body()?.expr;
             let show = p.finish(src)?;
@@ -134,6 +150,58 @@ enum Kind {
     Define,
     /// A lone `=`; the lexer stops here, and the text after it is the unit.
     Eq,
+    /// `<`
+    Lt,
+    /// `>`
+    Gt,
+    /// `≤` or `<=`
+    Le,
+    /// `≥` or `>=`
+    Ge,
+    /// `==`
+    EqEq,
+    /// `≠` or `!=`
+    Ne,
+    /// `and` or `∧`
+    And,
+    /// `or` or `∨`
+    Or,
+    /// `not` or `¬`
+    Not,
+    /// `if`
+    If,
+    /// `otherwise`
+    Otherwise,
+}
+
+/// Whether `name` is a keyword (`and`, `or`, `not`, `if`, `otherwise`) rather than a name.
+pub(crate) fn is_keyword(name: &str) -> bool {
+    keyword(name).is_some()
+}
+
+/// The token a whole name is, when it is a keyword.
+fn keyword(name: &str) -> Option<Kind> {
+    match name {
+        "and" => Some(Kind::And),
+        "or" => Some(Kind::Or),
+        "not" => Some(Kind::Not),
+        "if" => Some(Kind::If),
+        "otherwise" => Some(Kind::Otherwise),
+        _ => None,
+    }
+}
+
+/// The comparison a token is.
+fn comparison(kind: Option<&Kind>) -> Option<Cmp> {
+    match kind? {
+        Kind::Lt => Some(Cmp::Lt),
+        Kind::Gt => Some(Cmp::Gt),
+        Kind::Le => Some(Cmp::Le),
+        Kind::Ge => Some(Cmp::Ge),
+        Kind::EqEq => Some(Cmp::Eq),
+        Kind::Ne => Some(Cmp::Ne),
+        _ => None,
+    }
 }
 
 impl Kind {
@@ -159,6 +227,17 @@ impl Kind {
             Kind::Sup(_) => "a superscript".into(),
             Kind::Define => "`:=`".into(),
             Kind::Eq => "`=`".into(),
+            Kind::Lt => "`<`".into(),
+            Kind::Gt => "`>`".into(),
+            Kind::Le => "`≤`".into(),
+            Kind::Ge => "`≥`".into(),
+            Kind::EqEq => "`==`".into(),
+            Kind::Ne => "`≠`".into(),
+            Kind::And => "`and`".into(),
+            Kind::Or => "`or`".into(),
+            Kind::Not => "`not`".into(),
+            Kind::If => "`if`".into(),
+            Kind::Otherwise => "`otherwise`".into(),
         }
     }
 }
@@ -240,6 +319,21 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
             ';' => Kind::Semi,
             '√' => Kind::Sqrt,
             '≔' => Kind::Define,
+            '≤' => Kind::Le,
+            '≥' => Kind::Ge,
+            '≠' => Kind::Ne,
+            '∧' => Kind::And,
+            '∨' => Kind::Or,
+            '¬' => Kind::Not,
+            '<' => two_char(&mut chars, &mut end, Kind::Lt, Kind::Le),
+            '>' => two_char(&mut chars, &mut end, Kind::Gt, Kind::Ge),
+            '!' => match chars.next_if(|&(_, n)| n == '=') {
+                Some((i, n)) => {
+                    end = i + n.len_utf8();
+                    Kind::Ne
+                }
+                None => return Err(syntax("unexpected character `!` (did you mean `!=`?)")),
+            },
             '"' | '“' => {
                 let (text, text_end) = lex_text(src, start, c, &mut chars)?;
                 end = text_end;
@@ -261,8 +355,13 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
                 Kind::Sup(decode_superscript(&run)?)
             }
             '=' => {
-                toks.push(Tok { kind: Kind::Eq, start, end });
-                return Ok(toks);
+                // `==` is a comparison; a lone `=` ends the expression, and what follows is the unit.
+                if chars.next_if(|&(_, n)| n == '=').is_none() {
+                    toks.push(Tok { kind: Kind::Eq, start, end });
+                    return Ok(toks);
+                }
+                end += 1;
+                Kind::EqEq
             }
             '.' if chars.peek().is_some_and(|&(_, n)| n == '.') => {
                 chars.next();
@@ -288,7 +387,8 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
                 while let Some((i, n)) = chars.next_if(|&(_, n)| is_name_continue(n)) {
                     end = i + n.len_utf8();
                 }
-                Kind::Name(src.get(start..end).unwrap_or_default().to_string())
+                let name = src.get(start..end).unwrap_or_default();
+                keyword(name).unwrap_or_else(|| Kind::Name(name.to_string()))
             }
             other => return Err(syntax(format!("unexpected character `{}`", other.escape_debug()))),
         };
@@ -298,6 +398,17 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
 }
 
 type Chars<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
+
+/// `alone`, or `with_eq` when a `=` follows (`<` or `<=`); `end` moves past the `=`.
+fn two_char(chars: &mut Chars<'_>, end: &mut usize, alone: Kind, with_eq: Kind) -> Kind {
+    match chars.next_if(|&(_, n)| n == '=') {
+        Some((i, n)) => {
+            *end = i + n.len_utf8();
+            with_eq
+        }
+        None => alone,
+    }
+}
 
 /// The text literal that starts at `start` with the opening quote `open`: its content, and the
 /// offset after its closing quote. The content may not hold a quote, so the first `"` or `”` closes
@@ -369,11 +480,23 @@ fn lex_number(src: &str, start: usize, chars: &mut Chars<'_>) -> usize {
 // ---------------------------------------------------------------------------------------------
 
 /// The tokens before `:=` must be `name`, `name(param, ...)` or `name[i]`: the name, the range
-/// variable of an indexed definition, and the parameters.
-fn define_head(head: &[Tok]) -> Result<(String, Option<String>, Vec<String>), CalcError> {
+/// variable of an indexed definition, and the parameters. A keyword in any of those places is a
+/// [`CalcError::Keyword`]. `src` is the text the tokens came from.
+fn define_head(src: &str, head: &[Tok]) -> Result<(String, Option<String>, Vec<String>), CalcError> {
     let bad = || syntax("`:=` must follow a name, or a function like f(x, y)");
+    // A keyword written as a word (`or`), where a name belongs.
+    let reserved = |t: &Tok| match t.kind {
+        Kind::And | Kind::Or | Kind::Not | Kind::If | Kind::Otherwise => {
+            src.get(t.start..t.end).filter(|w| is_keyword(w)).map(|w| CalcError::Keyword(w.to_string()))
+        }
+        _ => None,
+    };
     let mut it = head.iter();
-    let Some(Tok { kind: Kind::Name(name), end: name_end, .. }) = it.next() else {
+    let name_tok = it.next();
+    if let Some(e) = name_tok.and_then(reserved) {
+        return Err(e);
+    }
+    let Some(Tok { kind: Kind::Name(name), end: name_end, .. }) = name_tok else {
         return Err(bad());
     };
     let mut params: Vec<String> = Vec::new();
@@ -383,6 +506,7 @@ fn define_head(head: &[Tok]) -> Result<(String, Option<String>, Vec<String>), Ca
         Some(Tok { kind: Kind::LBracket, start, .. }) if start == name_end => {
             return match (it.next(), it.next(), it.next()) {
                 (Some(Tok { kind: Kind::Name(i), .. }), Some(Tok { kind: Kind::RBracket, .. }), None) => Ok((name.clone(), Some(i.clone()), params)),
+                (Some(t), Some(Tok { kind: Kind::RBracket, .. }), None) if reserved(t).is_some() => Err(reserved(t).unwrap_or_else(bad)),
                 _ => Err(syntax("an indexed definition takes one range variable, like t[i] := 2·D[i]")),
             };
         }
@@ -396,6 +520,7 @@ fn define_head(head: &[Tok]) -> Result<(String, Option<String>, Vec<String>), Ca
                 }
                 params.push(p.clone());
             }
+            Some(t) if reserved(t).is_some() => return Err(reserved(t).unwrap_or_else(bad)),
             _ => return Err(syntax("a function's parameters must be names, like f(x, y)")),
         }
         match it.next() {
@@ -568,6 +693,27 @@ impl<'a> Parser<'a> {
                 lhs = Node::over(lhs.height.max(exponent.height), Expr::Binary(Op::Pow, Box::new(lhs.expr), Box::new(exponent.expr)))?;
                 continue;
             }
+            if let Some(first) = comparison(self.peek_kind()) {
+                if CMP_BP.0 < min_bp {
+                    break;
+                }
+                lhs = self.compare(lhs, first)?;
+                continue;
+            }
+            let logic = match self.peek_kind() {
+                Some(Kind::And) => Some((Logic::And, AND_BP)),
+                Some(Kind::Or) => Some((Logic::Or, OR_BP)),
+                _ => None,
+            };
+            if let Some((logic, (left_bp, right_bp))) = logic {
+                if left_bp < min_bp {
+                    break;
+                }
+                self.pos += 1;
+                let rhs = self.expr(right_bp)?;
+                lhs = Node::over(lhs.height.max(rhs.height), Expr::Logic(logic, Box::new(lhs.expr), Box::new(rhs.expr)))?;
+                continue;
+            }
             let (op, (left_bp, right_bp), implicit) = match self.peek_kind() {
                 Some(Kind::Plus) => (Op::Add, ADD_BP, false),
                 Some(Kind::Minus) => (Op::Sub, ADD_BP, false),
@@ -590,6 +736,26 @@ impl<'a> Parser<'a> {
             lhs = Node::over(lhs.height.max(rhs.height), Expr::Binary(op, Box::new(lhs.expr), Box::new(rhs.expr)))?;
         }
         Ok(lhs)
+    }
+
+    /// A comparison chain that starts with `first` (the next token) after the operand `lhs`:
+    /// `a < b ≤ c` is one node, so the whole chain is read iteratively and its height is one more
+    /// than its tallest operand's.
+    fn compare(&mut self, lhs: Node, first: Cmp) -> Result<Node, CalcError> {
+        let mut height = lhs.height;
+        let mut rest = Vec::new();
+        let mut cmp = first;
+        loop {
+            self.pos += 1; // the comparison
+            let rhs = self.expr(CMP_BP.1)?;
+            height = height.max(rhs.height);
+            rest.push((cmp, rhs.expr));
+            match comparison(self.peek_kind()) {
+                Some(next) => cmp = next,
+                None => break,
+            }
+        }
+        Node::over(height, Expr::Compare { first: Box::new(lhs.expr), rest })
     }
 
     /// The token just consumed.
@@ -669,6 +835,10 @@ impl<'a> Parser<'a> {
                 Node::over(operand.height, Expr::Unary(Op::Neg, Box::new(operand.expr)))
             }
             Kind::Plus => self.expr(NEG_BP),
+            Kind::Not => {
+                let operand = self.expr(NOT_BP)?;
+                Node::over(operand.height, Expr::Not(Box::new(operand.expr)))
+            }
             Kind::Sqrt => {
                 let operand = self.expr(SQRT_BP)?;
                 Node::over(operand.height, Expr::Call("sqrt".to_string(), vec![operand.expr]))
