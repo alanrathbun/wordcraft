@@ -1324,6 +1324,14 @@ fn err_in(env: &mut Env, src: &str) -> String {
     }
 }
 
+/// Run `src` in `env` and return the plain values of the grid it shows.
+fn vector_in(env: &mut Env, src: &str) -> Vec<f64> {
+    match run_value(env, src) {
+        Ok(Some(Value::Grid { items, .. })) => items.iter().map(|q| q.value).collect(),
+        other => panic!("{src:?} did not show a grid: {other:?}"),
+    }
+}
+
 fn failed_at<T>(g: &Grid<T>) -> Vec<usize> {
     g.failed.iter().map(|(k, _)| *k).collect()
 }
@@ -1416,4 +1424,176 @@ fn strict_boundaries_refuse_failed_grids() {
     let Ok(Data::Grid(g)) = compare_texts(&cx, &b, crate::Cmp::Eq, &texts) else { panic!() };
     assert_eq!(failed_at(&g), [1]);
     assert_eq!(g.items[2].q.value, 1.0);
+}
+
+#[test]
+fn piecewise() {
+    let mut env = Env::new();
+    let y = |env: &mut Env, t: &str| {
+        run(env, &format!("T_{} := {t}", t.len())).unwrap();
+        run(env, &format!("Y_{} := 0.4 if T_{} ≤ 900 °F, 0.5 if T_{} ≤ 950 °F, 0.7 otherwise =", t.len(), t.len(), t.len())).unwrap().unwrap().value
+    };
+    assert_eq!(y(&mut env, "900 °F"), 0.4);
+    assert_eq!(y(&mut env, "900.1 °F"), 0.5);
+    assert_eq!(y(&mut env, "482.2222222222222 °C"), 0.4); // 900 °F
+    assert_eq!(y(&mut env, "1000 °F"), 0.7);
+    run(&mut env, "T := 1000 °F").unwrap();
+    let e = run(&mut env, "Z := 0.4 if T ≤ 900 °F, 0.5 if T ≤ 950 °F").unwrap_err().to_string();
+    assert!(e.starts_with("no case applies (T = 1"), "{e}");
+}
+
+#[test]
+fn per_element_branches() {
+    let mut env = Env::new();
+    run(&mut env, "x := [4, -1, 9, 0]").unwrap();
+    assert_eq!(vector_in(&mut env, "r := sqrt(x) if x ≥ 0, 0 otherwise ="), vec![2.0, 0.0, 3.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "q := if(x ≠ 0, 1/x, 0) ="), vec![0.25, -1.0, 1.0 / 9.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "a := x ≠ 0 and 1/x > 0.2 ="), vec![1.0, 0.0, 0.0, 0.0]);
+    // Whole arrays stay whole inside a branch.
+    // (`s` is the second, so the sum is `s_x`.)
+    assert_eq!(vector_in(&mut env, "s_x := sum(x) if x > 0, 0 otherwise ="), vec![12.0, 0.0, 12.0, 0.0]);
+    // A picked element that fails fails; an unpicked one doesn't.
+    assert!(err_in(&mut env, "b := 1/x if x ≥ 0, 0 otherwise =").starts_with("element 3:"));
+    // Text verdicts per element, and counting them. (`m` is the metre, so the margins are `margin`.)
+    run(&mut env, "margin := [0.1, -0.2, 0.3] in").unwrap();
+    run(&mut env, "check := \"OK\" if margin ≥ 0 in, \"NG\" otherwise").unwrap();
+    assert_eq!(run_value(&mut env, "check ="), Ok(Some(Value::TextGrid { rows: 3, cols: 1, items: vec!["OK".into(), "NG".into(), "OK".into()] })));
+    assert_eq!(run(&mut env, "sum(check == \"NG\") =").unwrap().unwrap().value, 1.0);
+    assert_eq!(err_in(&mut env, "mix := \"OK\" if margin ≥ 0 in, 0 otherwise ="), "element 1 is a number but element 0 is text");
+    // No otherwise: the unmatched element names itself.
+    assert!(err_in(&mut env, "z := 1 if margin > 0 in =").starts_with("element 1: no case applies (margin = "));
+    // A single value may be text in one case and a number in another.
+    assert_eq!(run_value(&mut env, "w := \"none\" if 1 > 2, 5 otherwise ="), Ok(Some(Value::One(Quantity::dimensionless(5.0)))));
+    // Review Focus 4: inside a user function called with a vector.
+    run(&mut env, "f(v) := sqrt(v) if v ≥ 0, 0 otherwise").unwrap();
+    assert_eq!(vector_in(&mut env, "f([4, -1, 9]) ="), vec![2.0, 0.0, 3.0]);
+    // A nested piecewise inside a lenient branch keeps its element failures to itself: g_2 has no
+    // case for x ≤ 0, but those elements never pick the branch that calls it. (`g` is the gram.)
+    run(&mut env, "g_2(v) := 1 if v > 5, 2 if v > 0").unwrap();
+    assert_eq!(vector_in(&mut env, "n := g_2(x) if x > 0, 0 otherwise ="), vec![2.0, 0.0, 1.0, 0.0]);
+}
+
+#[test]
+fn piecewise_details() {
+    let mut env = Env::new();
+    run(&mut env, "x := [4, -1, 9, 0]").unwrap();
+    // Only the picked branch of a single condition is evaluated.
+    assert_eq!(run(&mut env, "p := 1 if 1 > 0, undefined_name otherwise =").unwrap().unwrap().value, 1.0);
+    assert_eq!(run(&mut env, "p_2 := if(1 < 0, undefined_name, 2) =").unwrap().unwrap().value, 2.0);
+    // A later condition that fails for an element already decided doesn't fail it; a still
+    // undecided one does, and so does a picked branch that fails as a whole.
+    assert_eq!(vector_in(&mut env, "c := 1 if x ≤ 0, 2 if 1/x > 0.2, 3 otherwise ="), vec![2.0, 1.0, 3.0, 1.0]);
+    assert!(err_in(&mut env, "c_2 := 1 if x < 0, 2 if 1/x > 0.2, 3 otherwise =").starts_with("element 3: result isn't a finite number"));
+    assert_eq!(err_in(&mut env, "c_3 := [1, 2] if x > 0, 0 otherwise ="), "shapes don't match: 4 rows × 1 vs 2 rows × 1");
+    assert_eq!(err_in(&mut env, "c_4 := 1 if x > 0, 2 if [1, 0] > 0, 3 otherwise ="), "shapes don't match: 4 rows × 1 vs 2 rows × 1");
+    // ... but an unpicked branch that fails as a whole doesn't matter.
+    assert_eq!(vector_in(&mut env, "c_5 := 1 if x > -5, undefined_name otherwise ="), vec![1.0; 4]);
+    // A single condition after a vector one decides every element still undecided.
+    assert_eq!(vector_in(&mut env, "c_6 := x if x > 5, 7 if 1 > 0 ="), vec![7.0, 7.0, 9.0, 7.0]);
+    // Each element keeps what its value stands for as a temperature.
+    run(&mut env, "T := 100 °F if x > 0, 200 °F otherwise").unwrap();
+    assert!(run_value(&mut env, "T = ? °F").is_ok());
+    // A condition must be a plain number; text or a unit value is an error.
+    assert_eq!(err_in(&mut env, "d := 1 if \"a\", 2 otherwise ="), "\"a\" is text — it can't be used as a condition");
+    assert_eq!(err_in(&mut env, "d := 1 if 1 in, 2 otherwise ="), "a condition must be a comparison or a plain number");
+    assert_eq!(err_in(&mut env, "d := 1 if x > 0, 2 if 1 in, 3 otherwise ="), "a condition must be a comparison or a plain number");
+    // `if` takes three arguments.
+    assert_eq!(err_in(&mut env, "d := if(1, 2) ="), "if expects 3 argument(s)");
+    // The no-case message: up to three variables, never units, functions or constants.
+    run(&mut env, "a := 1").unwrap();
+    run(&mut env, "b := \"x\"").unwrap();
+    run(&mut env, "k := 2 in").unwrap();
+    run(&mut env, "id(v) := v").unwrap();
+    assert_eq!(err_in(&mut env, "n_c := 1 if id(a) > 2 and π > 4 and k > 1 m and b == \"y\" ="), "no case applies (a = 1, k = 2 in, b = \"x\")");
+    assert_eq!(err_in(&mut env, "n_c := 1 if 1 > 2 ="), "no case applies");
+    // Text grids, matrices and the origin.
+    env.set_origin(1);
+    run(&mut env, "M := [1, -2; 3, -4]").unwrap();
+    assert!(err_in(&mut env, "n_c := 1 if M > 0 =").starts_with("element [1, 2]: no case applies (M = -2)"));
+}
+
+#[test]
+fn logic_short_circuits_per_element() {
+    let mut env = Env::new();
+    run(&mut env, "x := [4, -1, 9, 0]").unwrap();
+    assert_eq!(vector_in(&mut env, "o := x == 0 or 1/x > 0.2 ="), vec![1.0, 0.0, 0.0, 1.0]);
+    // An element the left side doesn't decide takes the right side's failure.
+    assert!(err_in(&mut env, "o := x ≠ 4 and 1/x > 0 =").starts_with("element 3: result isn't a finite number"));
+    // A left side that decides every element leaves the right side unevaluated.
+    assert_eq!(vector_in(&mut env, "o := x > 100 and undefined_name ="), vec![0.0; 4]);
+    // The right side broadcasts a single value, and must otherwise have the left's shape.
+    assert_eq!(vector_in(&mut env, "o := x > 0 or 1 > 2 ="), vec![1.0, 0.0, 1.0, 0.0]);
+    assert_eq!(err_in(&mut env, "o := x > 0 or [1, 0] > 0 ="), "shapes don't match: 4 rows × 1 vs 2 rows × 1");
+}
+
+#[test]
+fn piecewise_failures_reach_the_strict_boundaries_named_once() {
+    let mut env = Env::new();
+    run(&mut env, "x := [4, -1, 9, 0]").unwrap();
+    let want = "element 3: result isn't a finite number";
+    // A definition that shows its value, and one that doesn't.
+    assert_eq!(err_in(&mut env, "b := 1/x if x ≥ 0, 0 otherwise ="), want);
+    assert_eq!(err_in(&mut env, "b := 1/x if x ≥ 0, 0 otherwise"), want);
+    assert!(env.data("b").is_none(), "nothing failed is defined");
+    // An evaluation, through `run_stmt` and through `eval_expr`.
+    assert_eq!(err_in(&mut env, "if(x ≥ 0, 1/x, 0) ="), want);
+    assert_eq!(eval_expr(&env, &expr_of("if(x ≥ 0, 1/x, 0)")).map_err(|e| e.to_string()), Err(want.to_string()));
+    // A function's piecewise body called with a vector.
+    run(&mut env, "f(v) := 1/v if v ≥ 0, 0 otherwise").unwrap();
+    assert_eq!(err_in(&mut env, "f(x) ="), want);
+    // An indexed definition: element by element, a failing element is named once; a body that
+    // is a vector is that error, even when one of its elements failed.
+    run(&mut env, "i := 0..3").unwrap();
+    assert_eq!(err_in(&mut env, "t[i] := 1/x[i] if x[i] ≥ 0, 0 otherwise"), want);
+    assert_eq!(err_in(&mut env, "t[i] := 1/x if x ≥ 0, 0 otherwise"), "t[i] is one element — its right side can't be a vector");
+    assert_eq!(vector_in(&mut env, "t[i] := 1/x[i] if x[i] > 0, 0 otherwise ="), vec![0.25, 0.0, 1.0 / 9.0, 0.0]);
+}
+
+#[test]
+fn piecewise_work_is_bounded() {
+    // Many cases over a large vector: each condition's work is counted, and an element decided
+    // early stops the rest from being tried.
+    let mut env = Env::new();
+    run(&mut env, "v := 1..10000").unwrap();
+    let many = (0..300).map(|k| format!("{k} if v < {k}")).collect::<Vec<_>>().join(", ");
+    let stmt = parse(&format!("y := {many}, -1 otherwise")).unwrap();
+    assert_eq!(run_stmt_in(&mut env, &stmt, &Pass::new(100_000)).unwrap_err(), CalcError::TooMuchWork);
+    // A long chain of nested piecewise functions is bounded by the call depth.
+    let mut env = Env::new();
+    run(&mut env, "f_0(v) := v").unwrap();
+    for k in 1..40 {
+        run(&mut env, &format!("f_{k}(v) := f_{}(v) + 1 if v > 0, 0 otherwise", k - 1)).unwrap();
+    }
+    assert_eq!(err_in(&mut env, "f_39([1, 2]) ="), "too complex");
+}
+
+#[test]
+fn text_errors_name_a_text_that_did_not_fail() {
+    let texts =
+        Data::TextGrid(Grid { rows: 3, cols: 1, items: vec![String::new(), "b".into(), "c".into()], failed: vec![(0, CalcError::NonFinite)] });
+    assert_eq!(texts.text(), Some("b"));
+}
+
+#[test]
+fn deep_piecewise_is_refused_not_a_stack_overflow() {
+    // Hand-built `if(x > 0, if(x > 0, …), 0)` with a vector `x`, so every level decides per
+    // element: just inside the depth limit evaluates, far past it is refused. Each level costs
+    // more stack than a call level (eval → call → piecewise → per_element → eval); 8 MB covers it,
+    // well inside a recalculation's own stack.
+    let mut env = Env::new();
+    run(&mut env, "x := [1, -1]").unwrap();
+    let deep = move || {
+        let condition = expr_of("x > 0");
+        let nest = |n: usize| (0..n).fold(Expr::Num(1.0), |e, _| Expr::Call("if".into(), vec![condition.clone(), e, Expr::Num(0.0)]));
+        assert_eq!(
+            eval_expr(&env, &nest(1000)),
+            Ok(Value::Grid { rows: 2, cols: 1, items: vec![Quantity::dimensionless(1.0), Quantity::dimensionless(0.0)] })
+        );
+        assert_eq!(eval_expr(&env, &nest(3000)), Err(CalcError::TooComplex));
+        let cases = |n: usize| {
+            (0..n).fold(Expr::Num(1.0), |e, _| Expr::Cases { cases: vec![(e, condition.clone())], otherwise: Some(Box::new(Expr::Num(0.0))) })
+        };
+        assert_eq!(eval_expr(&env, &cases(3000)), Err(CalcError::TooComplex));
+    };
+    std::thread::Builder::new().stack_size(8 << 20).spawn(deep).expect("spawns").join().expect("no panic");
 }

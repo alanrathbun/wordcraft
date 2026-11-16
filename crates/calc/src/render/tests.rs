@@ -305,3 +305,57 @@ fn looser_operators_keep_their_parentheses_as_operands() {
     assert!(lin("c := D[a < b]").contains("(a<b)"));
     assert!(lin("c := |a < b|").contains("|a<b|"));
 }
+
+/// The first node in a math tree, depth first, for which `want` holds.
+fn find_node(nodes: &[MNode], want: impl Fn(&MNode) -> bool) -> Option<&MNode> {
+    let mut todo: Vec<&MNode> = nodes.iter().rev().collect();
+    while let Some(n) = todo.pop() {
+        if want(n) {
+            return Some(n);
+        }
+        let children: Vec<&MNode> = match n {
+            MNode::Frac { num, den, .. } => num.iter().chain(den.iter()).collect(),
+            MNode::Script { base, sub, sup, .. } => base.iter().chain(sub.iter()).chain(sup.iter()).collect(),
+            MNode::Rad { deg, e, .. } => deg.iter().chain(e.iter()).collect(),
+            MNode::Delim { elems, .. } => elems.iter().flatten().collect(),
+            MNode::Func { name, e } => name.iter().chain(e.iter()).collect(),
+            MNode::Matrix { rows, .. } => rows.iter().flatten().flatten().collect(),
+            _ => Vec::new(),
+        };
+        todo.extend(children.into_iter().rev());
+    }
+    None
+}
+
+#[test]
+fn cases_show_as_a_brace() {
+    let d = display_of("Y := 0.4 if T ≤ 900 °F, 0.7 otherwise", None);
+    let brace = find_node(&d.math, |n| matches!(n, MNode::Delim { beg: Some('{'), end: None, .. }));
+    let Some(MNode::Delim { elems, .. }) = brace else { panic!("{:?}", d.math) };
+    assert!(
+        matches!(elems.first().and_then(|e| e.first()), Some(MNode::Matrix { rows, .. }) if rows.len() == 2 && rows.iter().all(|r| r.len() == 2))
+    );
+    let words: Vec<String> = runs(&d.math).into_iter().map(|r| r.text).collect();
+    assert!(words.iter().any(|w| w.trim() == "if") && words.iter().any(|w| w.trim() == "otherwise"));
+    assert!(display_of("y := if(x > 0, 1, 2)", None).linear.contains("if(x>0,1,2)"));
+}
+
+#[test]
+fn cases_linear_text_and_runs() {
+    let d = display_of("Y := 0.4 if T ≤ 900 °F, 0.5 if T ≤ 950 °F, 0.7 otherwise =", Some(&Shown::One(f("0.5", ""))));
+    assert!(d.linear.starts_with("Y≔{■(0.4&\"if \"T≤900 \"°F\"@0.5&\"if \"T≤950 \"°F\"@0.7&\"otherwise\")┤=0.5"), "{}", d.linear);
+    // The words are upright; the condition's unit keeps its own run.
+    let rs = runs(&d.math);
+    for word in ["if ", "otherwise"] {
+        assert!(rs.iter().any(|r| r.text == word && r.sty == Some(MSty::Plain)), "{word}: {rs:?}");
+    }
+    assert!(rs.iter().any(|r| r.text.trim() == "°F"));
+    // No otherwise: one row per case. A piecewise function shows the same way.
+    let d = display_of("f(v) := 1 if v > 0, 2 if v < 0", None);
+    assert!(d.linear.contains("f(v)≔{■(1&\"if \"v>0@2&\"if \"v<0)┤"), "{}", d.linear);
+    let brace = find_node(&d.math, |n| matches!(n, MNode::Matrix { .. }));
+    assert!(matches!(brace, Some(MNode::Matrix { rows, .. }) if rows.len() == 2));
+    // `if(` shows as an upright function name.
+    let d = display_of("y := if(x > 0, 1, 2)", None);
+    assert!(runs(&d.math).iter().any(|r| r.text == "if" && r.sty == Some(MSty::Plain)));
+}

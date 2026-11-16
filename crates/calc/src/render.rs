@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use craft_units::{Formatted, lookup};
 use wordcraft_doc::Rgb;
 use wordcraft_doc::calc::CalcState;
-use wordcraft_doc::math::{Arg, FUNCTION_NAMES, MNode, MRun, MSty, Math, parse_linear};
+use wordcraft_doc::math::{Arg, ColJc, FUNCTION_NAMES, MNode, MRun, MSty, Math, parse_linear};
 use wordcraft_doc::math_linear::map_args;
 
 use crate::array::{MAX_ELEMENTS, MAX_TEXT_CHARS};
@@ -692,11 +692,9 @@ impl Out {
             if new_row || rows.is_empty() {
                 rows.push(Vec::new());
             }
-            let mut cell = Out::default();
-            write_expr(item, &mut cell);
-            text.push_str(&cell.linear);
+            let cell = cell(item, &mut text);
             if let Some(row) = rows.last_mut() {
-                row.push(restore_pieces(parse_linear(&cell.parsed), &cell.pieces, &cell.nodes));
+                row.push(cell);
             }
         }
         text.push_str(")]");
@@ -704,6 +702,46 @@ impl Out {
         let k = self.nodes.len();
         self.nodes.push(bracketed(rows));
         // Out of sentinels, the literal is parsed with the rest, as text.
+        self.sentinel(Piece { text: k.to_string(), kind: Kind::Node(k) }, &text);
+    }
+
+    /// A piecewise: a brace open on the left only, over a matrix of one row per case, its value
+    /// then `if` and its condition, and a last row of `otherwise`'s value then `otherwise`
+    /// (`{■(0.4&"if "T≤900 "°F"@0.7&"otherwise")┤`). The words are upright. Like
+    /// [`Out::matrix`], the tree is built cell by cell and stands in the parsed text as one
+    /// sentinel.
+    fn cases(&mut self, cases: &[(Expr, Expr)], otherwise: Option<&Expr>) {
+        const IF: &str = "if ";
+        const OTHERWISE: &str = "otherwise";
+        let word = |w: &str| MNode::Run(MRun { text: w.to_string(), sty: Some(MSty::Plain), ..MRun::default() });
+        let mut text = String::from("{■(");
+        let mut rows: Vec<Vec<Arg>> = Vec::with_capacity(cases.len().saturating_add(1));
+        let lines = cases.iter().map(|(value, condition)| (value, Some(condition))).chain(otherwise.map(|value| (value, None)));
+        for (k, (value, condition)) in lines.enumerate() {
+            if k > 0 {
+                text.push('@');
+            }
+            let value = cell(value, &mut text);
+            text.push('&');
+            let mut when = Vec::new();
+            match condition {
+                Some(condition) => {
+                    text.push_str(&format!("\"{IF}\""));
+                    when.push(word(IF));
+                    when.extend(cell(condition, &mut text));
+                }
+                None => {
+                    text.push_str(&format!("\"{OTHERWISE}\""));
+                    when.push(word(OTHERWISE));
+                }
+            }
+            rows.push(vec![value, when]);
+        }
+        text.push_str(")┤");
+        self.linear.push_str(&text);
+        let k = self.nodes.len();
+        let matrix = MNode::Matrix { rows, col_jc: vec![ColJc::Left, ColJc::Left] };
+        self.nodes.push(MNode::Delim { beg: Some('{'), end: None, sep: None, grow: true, shp_match: false, elems: vec![vec![matrix]] });
         self.sentinel(Piece { text: k.to_string(), kind: Kind::Node(k) }, &text);
     }
 
@@ -746,6 +784,16 @@ impl Out {
             }
         }
     }
+}
+
+/// `e` written alone, its linear text added to `text`: the cell of a matrix or a piecewise, as a
+/// tree. An expression inside one recurses into [`Out::matrix`] or [`Out::cases`]; the parser
+/// bounds that nesting.
+fn cell(e: &Expr, text: &mut String) -> Arg {
+    let mut cell = Out::default();
+    write_expr(e, &mut cell);
+    text.push_str(&cell.linear);
+    restore_pieces(parse_linear(&cell.parsed), &cell.pieces, &cell.nodes)
 }
 
 /// A subscript of two or more characters is upright (`σ_max`); a one-letter one is a symbol.
@@ -795,7 +843,7 @@ fn write_stmt(stmt: &Stmt, out: &mut Out) {
     }
 }
 
-// Binding strength, loosest first: ranges, `or`, `and`, `not`, comparisons, sums, products,
+// Binding strength, loosest first: ranges and cases, `or`, `and`, `not`, comparisons, sums, products,
 // negation, powers, atoms (literals and indexes among them).
 const RANGE: u8 = 0;
 const OR: u8 = 1;
@@ -810,7 +858,7 @@ const ATOM: u8 = 9;
 
 fn prec(e: &Expr) -> u8 {
     match e {
-        Expr::Range { .. } => RANGE,
+        Expr::Range { .. } | Expr::Cases { .. } => RANGE,
         Expr::Logic(Logic::Or, ..) => OR,
         Expr::Logic(Logic::And, ..) => AND,
         Expr::Not(_) => NOT,
@@ -908,7 +956,7 @@ fn ends_in_script(e: &Expr) -> bool {
         match e {
             Expr::Num(v) => return exponential(*v),
             Expr::Name(n) => return n.contains('_') && !is_unit(n),
-            Expr::Text(_) | Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } => return false,
+            Expr::Text(_) | Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Cases { .. } => return false,
             Expr::Call(..) => return is_sqrt(e),
             Expr::Index(..) | Expr::Binary(Op::Pow | Op::Div, ..) => return true,
             Expr::Unary(_, a) | Expr::Binary(_, _, a) | Expr::Logic(_, _, a) | Expr::Not(a) => e = a,
@@ -1008,7 +1056,7 @@ fn write_expr(root: &Expr, out: &mut Out) {
                 todo.push(Step::Text(if doubled { "((" } else { "(" }));
                 if applied {
                     out.text(name);
-                } else if funcs::is_builtin(name) {
+                } else if funcs::is_builtin(name) || name == "if" {
                     out.name_piece(name, Kind::Upright);
                 } else {
                     out.name(name);
@@ -1035,6 +1083,7 @@ fn write_expr(root: &Expr, out: &mut Out) {
                 todo.push(Step::Text("¬"));
             }
             Expr::Matrix { cols, items, .. } => out.matrix(*cols, items),
+            Expr::Cases { cases, otherwise } => out.cases(cases, otherwise.as_deref()),
             Expr::Index(..) | Expr::Range { .. } => push_array_syntax(e, &mut todo, out),
             Expr::Binary(op, a, b) => match op {
                 Op::Add | Op::Sub | Op::Neg => {

@@ -21,7 +21,7 @@ use crate::{CalcError, Cmp, Expr, Logic, Op, Show, Stmt, Value};
 use craft_units::{Dim, Precision, Quantity, Scale, UnitError, UnitSystem, lookup, parse_unit};
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// How deep user functions may call each other.
 const MAX_CALL_DEPTH: usize = 32;
@@ -417,11 +417,16 @@ impl<'a> Cx<'a> {
 /// `e` evaluated with element failures kept per element (see [`array::zip`]): a branch worked out
 /// over whole arrays, of which each element may pick only some. What takes a grid whole still
 /// refuses a failed element ([`Data::strict`]). How lenient `cx` was is restored, even on error.
-#[cfg_attr(not(test), expect(dead_code, reason = "the piecewise branches call it"))]
 pub(crate) fn eval_lenient(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, CalcError> {
+    leniently(cx, || eval(cx, fr, e, depth))
+}
+
+/// `f` run with element failures kept per element, as in [`eval_lenient`]; how lenient `cx` was
+/// is restored, even on error.
+fn leniently<T>(cx: &Cx<'_>, f: impl FnOnce() -> Result<T, CalcError>) -> Result<T, CalcError> {
     let before = cx.lenient.get();
     cx.lenient.set(before.saturating_add(1));
-    let result = eval(cx, fr, e, depth);
+    let result = f();
     cx.lenient.set(before);
     result
 }
@@ -529,6 +534,7 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
         Expr::Call(name, args) => call(cx, fr, name, args, depth),
         Expr::Matrix { rows, cols, items } => matrix(cx, fr, *rows, *cols, items, depth),
         Expr::Index(name, at) => index(cx, fr, name, at, depth),
+        Expr::Cases { cases, otherwise } => cases_expr(cx, fr, cases, otherwise.as_deref(), depth),
         // A range is evaluated only as the whole right side of a variable's definition.
         Expr::Range { .. } => Err(range_only_defines_a_variable()),
     }
@@ -806,11 +812,7 @@ fn compare_texts(cx: &Cx<'_>, x: &Data, cmp: Cmp, y: &Data) -> Result<Data, Calc
         items.push(truth_val((array::text_key(a) == array::text_key(b)) == equal));
     }
     match shape {
-        Some((rows, cols)) => {
-            let mut g = Grid::new(rows, cols, items)?;
-            g.failed = failed;
-            Ok(Data::Grid(g))
-        }
+        Some((rows, cols)) => Grid::with_failed(rows, cols, items, failed).map(Data::Grid),
         None => items.pop().map(Data::One).ok_or(CalcError::NonFinite),
     }
 }
@@ -832,19 +834,19 @@ fn texts_of(d: &Data) -> &[String] {
     }
 }
 
-/// `a and b` or `a or b` as 1 or 0. A single left value that decides the result (false for `and`,
-/// true for `or`) leaves the right side unevaluated. A grid on the left evaluates both sides and
-/// combines them element by element.
+/// `a and b` or `a or b` as 1 or 0. A left value that decides the result (false for `and`, true for
+/// `or`) leaves the right side unevaluated. A grid on the left decides element by element
+/// ([`logic_per_element`]).
 // Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
 fn logic_op(cx: &Cx<'_>, fr: &Frame<'_>, logic: Logic, a: &Expr, b: &Expr, depth: usize) -> Result<Data, CalcError> {
     let x = eval(cx, fr, a, depth + 1)?;
     let left = truth(cx, &x)?;
     let decides = logic == Logic::Or;
-    if let Data::One(v) = &left
-        && (v.q.value != 0.0) == decides
-    {
-        return Ok(left);
+    match &left {
+        Data::One(v) if (v.q.value != 0.0) == decides => return Ok(left),
+        Data::Grid(g) => return logic_per_element(cx, fr, decides, g, b, depth),
+        Data::One(_) | Data::Text(_) | Data::TextGrid(_) => {}
     }
     let y = eval(cx, fr, b, depth + 1)?;
     let right = truth(cx, &y)?;
@@ -852,6 +854,374 @@ fn logic_op(cx: &Cx<'_>, fr: &Frame<'_>, logic: Logic, a: &Expr, b: &Expr, depth
         let (p, q) = (p.q.value != 0.0, q.q.value != 0.0);
         Ok(truth_val(if decides { p || q } else { p && q }))
     })
+}
+
+/// `left and b` or `left or b` for a grid `left` (already 1s and 0s) that decides each element
+/// where it is `decides` (true for `or`, false for `and`): elsewhere the element is the truth of
+/// the right side's element, which is worked out over whole arrays but only when some element is
+/// left to it ([`eval_lenient`]), so a right side that fails at an element the left decides
+/// doesn't fail it. The right side is a single value (broadcast) or of `left`'s shape.
+#[inline(never)]
+fn logic_per_element(cx: &Cx<'_>, fr: &Frame<'_>, decides: bool, left: &Grid, b: &Expr, depth: usize) -> Result<Data, CalcError> {
+    let (rows, cols) = (left.rows, left.cols);
+    let mut failures = array::Failures::of(Some(left));
+    let mut slots: Vec<Slot> = left
+        .items
+        .iter()
+        .enumerate()
+        .map(|(k, v)| match failures.at(k) {
+            Some(e) => Slot::Failed(e.clone()),
+            None if (v.q.value != 0.0) == decides => Slot::Num(truth_val(decides)),
+            None => Slot::Open,
+        })
+        .collect();
+    let open: Vec<usize> = slots.iter().enumerate().filter_map(|(k, s)| matches!(s, Slot::Open).then_some(k)).collect();
+    if !open.is_empty() {
+        let right = leniently(cx, || {
+            let y = eval(cx, fr, b, depth + 1)?;
+            truth(cx, &y)
+        })?;
+        same_shape((rows, cols), &right)?;
+        take(cx, &right, open, &mut slots)?;
+    }
+    assemble(cx, rows, cols, slots)
+}
+
+/// What one element of a result worked out per element is, as it is worked out.
+enum Slot {
+    /// Nothing has decided it yet.
+    Open,
+    /// It takes the branch with this index (a piecewise's `otherwise` is the one after its cases).
+    Case(usize),
+    /// A number.
+    Num(Val),
+    /// A text.
+    Text(String),
+    /// Its error (not naming the element).
+    Failed(CalcError),
+}
+
+/// The piecewise `cases` ([`piecewise`]).
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn cases_expr(cx: &Cx<'_>, fr: &Frame<'_>, cases: &[(Expr, Expr)], otherwise: Option<&Expr>, depth: usize) -> Result<Data, CalcError> {
+    let cases: Vec<(&Expr, &Expr)> = cases.iter().map(|(value, condition)| (value, condition)).collect();
+    piecewise(cx, fr, &cases, otherwise, depth)
+}
+
+/// A piecewise: the value of the first case (`(value, condition)`) whose condition holds, else
+/// `otherwise`'s, else [`CalcError::NoCase`]. Only the value picked is evaluated. Conditions are
+/// tried in order while they are single values; the first that is a grid decides per element
+/// from there on ([`per_element`]). The conditions here are evaluated as leniently as the caller.
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn piecewise(cx: &Cx<'_>, fr: &Frame<'_>, cases: &[(&Expr, &Expr)], otherwise: Option<&Expr>, depth: usize) -> Result<Data, CalcError> {
+    for (i, (value, condition)) in cases.iter().enumerate() {
+        let c = truth(cx, &eval(cx, fr, condition, depth + 1)?)?;
+        match c {
+            Data::One(v) if v.q.value != 0.0 => return eval(cx, fr, value, depth + 1),
+            Data::One(_) => {}
+            Data::Grid(g) => return per_element(cx, fr, cases, i, &g, otherwise, depth),
+            // `truth` refuses text.
+            Data::Text(_) | Data::TextGrid(_) => return Err(CalcError::NotCondition),
+        }
+    }
+    match otherwise {
+        Some(e) => eval(cx, fr, e, depth + 1),
+        None => Err(no_case(cx, &case_vars(cx.env, fr, cases, None), None)),
+    }
+}
+
+/// A piecewise from its case `first` on, whose condition is the grid `decider` (1s and 0s): each
+/// element takes the first case that holds for it. Later conditions are tried only while some
+/// element is undecided; elements left undecided take `otherwise`, or fail with
+/// [`CalcError::NoCase`]. Every condition after `first` and every value picked by some element is
+/// worked out once over whole arrays ([`eval_lenient`]), so `sum(x)` in a branch is the sum of
+/// all of `x`, and element k of the result is element k of the value it picks (or that value, when
+/// it is a single one). An element fails only when a condition it reached, or the value it picked,
+/// failed there; a condition or a picked value that fails as a whole fails the result, and so does
+/// one that is neither a single value nor of `decider`'s shape.
+///
+/// The elements' failures are the first one's error, naming it, unless the caller is lenient: then
+/// they are kept in the result's `failed` list.
+#[inline(never)]
+fn per_element(
+    cx: &Cx<'_>,
+    fr: &Frame<'_>,
+    cases: &[(&Expr, &Expr)],
+    first: usize,
+    decider: &Grid,
+    otherwise: Option<&Expr>,
+    depth: usize,
+) -> Result<Data, CalcError> {
+    let (rows, cols) = (decider.rows, decider.cols);
+    let mut slots: Vec<Slot> = std::iter::repeat_with(|| Slot::Open).take(decider.items.len()).collect();
+    let mut open = slots.len();
+    decide(&mut slots, &mut open, first, decider);
+    for (j, (_, condition)) in cases.iter().enumerate().skip(first.saturating_add(1)) {
+        if open == 0 {
+            break;
+        }
+        let c = leniently(cx, || {
+            let c = eval(cx, fr, condition, depth + 1)?;
+            truth(cx, &c)
+        })?;
+        same_shape((rows, cols), &c)?;
+        match c {
+            Data::One(v) if v.q.value != 0.0 => {
+                slots.iter_mut().filter(|s| matches!(s, Slot::Open)).for_each(|s| *s = Slot::Case(j));
+                open = 0;
+            }
+            Data::One(_) => {}
+            Data::Grid(g) => decide(&mut slots, &mut open, j, &g),
+            // `truth` refuses text.
+            Data::Text(_) | Data::TextGrid(_) => return Err(CalcError::NotCondition),
+        }
+    }
+    if open > 0 {
+        let vars = if otherwise.is_none() { case_vars(cx.env, fr, cases, Some((rows, cols))) } else { Vec::new() };
+        for (k, s) in slots.iter_mut().enumerate() {
+            if matches!(s, Slot::Open) {
+                *s = if otherwise.is_some() { Slot::Case(cases.len()) } else { Slot::Failed(no_case(cx, &vars, Some(k))) };
+            }
+        }
+    }
+    // Each value some element picks, worked out once; its elements taken in order.
+    let mut picks: Vec<(usize, usize)> =
+        slots.iter().enumerate().filter_map(|(k, s)| if let Slot::Case(j) = s { Some((*j, k)) } else { None }).collect();
+    picks.sort_unstable();
+    for group in picks.chunk_by(|a, b| a.0 == b.0) {
+        let Some(&(j, _)) = group.first() else { continue };
+        let Some(value) = cases.get(j).map(|(value, _)| *value).or(otherwise) else { continue };
+        let v = eval_lenient(cx, fr, value, depth + 1)?;
+        same_shape((rows, cols), &v)?;
+        take(cx, &v, group.iter().map(|&(_, k)| k), &mut slots)?;
+    }
+    assemble(cx, rows, cols, slots)
+}
+
+/// Mark the elements still open in `slots` that the condition `c` (1s and 0s, of their shape)
+/// decides: those it holds for take case `j`, and those it failed at fail; `open` counts down.
+fn decide(slots: &mut [Slot], open: &mut usize, j: usize, c: &Grid) {
+    let mut failures = array::Failures::of(Some(c));
+    for (k, (slot, v)) in slots.iter_mut().zip(&c.items).enumerate() {
+        // Read at every element, so the cursor never falls behind.
+        let failed = failures.at(k);
+        if !matches!(slot, Slot::Open) {
+            continue;
+        }
+        if let Some(e) = failed {
+            *slot = Slot::Failed(e.clone());
+        } else if v.q.value != 0.0 {
+            *slot = Slot::Case(j);
+        } else {
+            continue;
+        }
+        *open = open.saturating_sub(1);
+    }
+}
+
+/// [`CalcError::Shape`] unless `d` is a single value or of `shape`.
+fn same_shape(shape: (usize, usize), d: &Data) -> Result<(), CalcError> {
+    match d.shape() {
+        Some(other) if other != shape => Err(CalcError::Shape { left: shape, right: other }),
+        _ => Ok(()),
+    }
+}
+
+/// Set each element `k` of `ks` (in increasing order) in `slots` to element `k` of `v`, or to `v`
+/// itself when it is a single value; where `v` failed, to its failure. A text taken is copied, at
+/// a cost by its size.
+fn take(cx: &Cx<'_>, v: &Data, ks: impl IntoIterator<Item = usize>, slots: &mut [Slot]) -> Result<(), CalcError> {
+    let (mut numbers, mut texts) = (array::Failures::of(grid_of(v)), array::Failures::of(text_grid(v)));
+    let text = |t: &String| -> Result<Slot, CalcError> {
+        cx.pass.charge(array::text_steps(t))?;
+        Ok(Slot::Text(t.clone()))
+    };
+    for k in ks {
+        // Only reached with `v` of the slots' shape, so every element exists.
+        let missing = || Slot::Failed(CalcError::Shape { left: (slots.len(), 1), right: v.shape().unwrap_or((1, 1)) });
+        let slot = match v {
+            Data::One(x) => Slot::Num(*x),
+            Data::Text(t) => text(t)?,
+            Data::Grid(g) => match numbers.at(k) {
+                Some(e) => Slot::Failed(e.clone()),
+                None => g.items.get(k).map_or_else(missing, |x| Slot::Num(*x)),
+            },
+            Data::TextGrid(g) => match texts.at(k) {
+                Some(e) => Slot::Failed(e.clone()),
+                None => match g.items.get(k) {
+                    Some(t) => text(t)?,
+                    None => missing(),
+                },
+            },
+        };
+        if let Some(s) = slots.get_mut(k) {
+            *s = slot;
+        }
+    }
+    Ok(())
+}
+
+/// The `rows` × `cols` result of elements worked out one by one: numbers (each keeping what it
+/// stands for as a temperature) or texts, never a mix ([`array::mixed`]); a grid whose every
+/// element failed is of numbers. Failed elements are the first one's error, naming it, unless `cx`
+/// is lenient: then they are kept in the grid's `failed` list.
+fn assemble(cx: &Cx<'_>, rows: usize, cols: usize, slots: Vec<Slot>) -> Result<Data, CalcError> {
+    charge_elements(cx, slots.len())?;
+    let first_text = slots.iter().position(|s| matches!(s, Slot::Text(_)));
+    let first_number = slots.iter().position(|s| matches!(s, Slot::Num(_)));
+    let o = cx.env.origin;
+    if let (Some(t), Some(n)) = (first_text, first_number) {
+        return Err(array::mixed(rows, cols, t, n, o));
+    }
+    // Every element is decided and taken before this; were one not, it has no value.
+    let failure = |s: Slot| match s {
+        Slot::Failed(e) => e,
+        Slot::Open | Slot::Case(_) | Slot::Num(_) | Slot::Text(_) => CalcError::NoCase(Vec::new()),
+    };
+    let mut failed: Vec<(usize, CalcError)> = Vec::new();
+    let data = if first_text.is_some() {
+        let mut items = Vec::with_capacity(slots.len());
+        for (k, s) in slots.into_iter().enumerate() {
+            items.push(match s {
+                Slot::Text(t) => t,
+                s => {
+                    failed.push((k, failure(s)));
+                    String::new()
+                }
+            });
+        }
+        Elements::Texts(items)
+    } else {
+        let mut items = Vec::with_capacity(slots.len());
+        for (k, s) in slots.into_iter().enumerate() {
+            items.push(match s {
+                Slot::Num(v) => v,
+                s => {
+                    failed.push((k, failure(s)));
+                    array::placeholder()
+                }
+            });
+        }
+        Elements::Numbers(items)
+    };
+    if !cx.lenient() && !failed.is_empty() {
+        let (k, e) = failed.swap_remove(0);
+        return Err(array::element_error(rows, cols, k, o, e));
+    }
+    match data {
+        Elements::Numbers(items) => Grid::with_failed(rows, cols, items, failed).map(Data::Grid),
+        Elements::Texts(items) => Grid::with_failed(rows, cols, items, failed).map(Data::TextGrid),
+    }
+}
+
+/// A grid's elements before it is built: numbers or texts.
+enum Elements {
+    Numbers(Vec<Val>),
+    Texts(Vec<String>),
+}
+
+/// The grid of numbers `d` holds, if any.
+fn grid_of(d: &Data) -> Option<&Grid> {
+    match d {
+        Data::Grid(g) => Some(g),
+        Data::One(_) | Data::Text(_) | Data::TextGrid(_) => None,
+    }
+}
+
+/// How many variables a [`CalcError::NoCase`] names at most.
+const MAX_NO_CASE_VALUES: usize = 3;
+
+/// The variables (parameters and defined values, not units, functions or constants) that a
+/// piecewise's conditions name, in order of first use, for [`no_case`]: at most
+/// [`MAX_NO_CASE_VALUES`], and only those that can be shown, which are single values and texts and,
+/// for a piecewise decided per element over `shape`, grids of that shape.
+fn case_vars<'a>(env: &'a Env, fr: &'a Frame<'_>, cases: &[(&'a Expr, &'a Expr)], shape: Option<(usize, usize)>) -> Vec<(&'a str, &'a Data)> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    // An explicit stack keeps this safe on trees built by hand, deeper than the parser allows.
+    let mut stack: Vec<&Expr> = cases.iter().rev().map(|(_, condition)| *condition).collect();
+    while let Some(e) = stack.pop() {
+        if out.len() >= MAX_NO_CASE_VALUES {
+            break;
+        }
+        match e {
+            Expr::Name(n) => {
+                if !seen.insert(n.as_str()) {
+                    continue;
+                }
+                let Some(d) = fr.param(n).or_else(|| env.data(n)) else { continue };
+                let shown = match d {
+                    Data::One(_) | Data::Text(_) => true,
+                    Data::Grid(_) | Data::TextGrid(_) => shape.is_some() && d.shape() == shape,
+                };
+                if shown {
+                    out.push((n.as_str(), d));
+                }
+            }
+            Expr::Num(_) | Expr::Text(_) | Expr::Quantity(..) => {}
+            Expr::Unary(_, a) | Expr::Abs(a) | Expr::Not(a) => stack.push(a),
+            Expr::Binary(_, a, b) | Expr::Logic(_, a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+            Expr::Compare { first, rest } => {
+                stack.extend(rest.iter().rev().map(|(_, e)| e));
+                stack.push(first);
+            }
+            Expr::Call(_, items) | Expr::Index(_, items) | Expr::Matrix { items, .. } => stack.extend(items.iter().rev()),
+            Expr::Range { first, second, last } => {
+                stack.push(last);
+                stack.extend(second.as_deref());
+                stack.push(first);
+            }
+            Expr::Cases { cases, otherwise } => {
+                stack.extend(otherwise.as_deref());
+                for (value, condition) in cases.iter().rev() {
+                    stack.push(condition);
+                    stack.push(value);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`CalcError::NoCase`] naming `vars` (from [`case_vars`]) as `name = value`: for an element
+/// `at` of a piecewise decided per element, a grid's element there (none when it failed there).
+fn no_case(cx: &Cx<'_>, vars: &[(&str, &Data)], at: Option<usize>) -> CalcError {
+    let failed_at = |failed: &[(usize, CalcError)], k: usize| failed.binary_search_by_key(&k, |(j, _)| *j).is_ok();
+    let values = vars
+        .iter()
+        .filter_map(|(name, d)| {
+            let shown = match (d, at) {
+                (Data::One(v), _) => shown_value(cx, *v),
+                (Data::Text(t), _) => format!("\"{}\"", cut_text(t)),
+                (Data::Grid(g), Some(k)) if !failed_at(&g.failed, k) => shown_value(cx, *g.items.get(k)?),
+                (Data::TextGrid(g), Some(k)) if !failed_at(&g.failed, k) => format!("\"{}\"", cut_text(g.items.get(k)?)),
+                (Data::Grid(_) | Data::TextGrid(_), _) => return None,
+            };
+            Some(format!("{name} = {shown}"))
+        })
+        .collect();
+    CalcError::NoCase(values)
+}
+
+/// `v` as the document shows values (`1.6 in`), and an absolute temperature on the document's
+/// offset scale (`1000 °F`, `540 °C`).
+fn shown_value(cx: &Cx<'_>, v: Val) -> String {
+    let (system, precision) = (cx.env.system, cx.env.precision);
+    if v.t == Temp::Absolute {
+        let unit = if system == UnitSystem::Si { "°C" } else { "°F" };
+        if let Ok(scale) = parse_unit(unit)
+            && let Ok(f) = craft_units::format(v.q, Some(&scale), system, precision)
+        {
+            return format!("{} {}", crate::render::text_number(&f.number), f.unit);
+        }
+    }
+    let acx = array_funcs::Ctx { origin: cx.env.origin, pass: cx.pass, system, precision };
+    array_funcs::shown(v.q, &acx)
 }
 
 /// A condition checked: the plain numbers of `d` (nonzero is true) as 1 and 0, a grid for a grid.
@@ -949,7 +1319,9 @@ fn between(a: Temp, b: Temp) -> Temp {
 /// The indexed definition `name[i] := body`: `body` evaluated once for each element of the range
 /// variable `i`, with `i` bound to that element, setting element `i` of `name`. Every element from
 /// the origin up to the largest index must be set; a body that is a vector, or an `i` that isn't
-/// a vector of whole numbers, is an error.
+/// a vector of whole numbers, is an error. The body is worked out with element failures kept
+/// ([`eval_lenient`]), so a body that is a vector is that error even when one of its elements
+/// failed, and never an error naming an element of the body inside one naming an element of `name`.
 fn indexed(env: &Env, name: &str, i: &str, body: &Expr, pass: &Pass) -> Result<Data, CalcError> {
     let range = match env.entries.get(i) {
         Some(Entry::Var(d)) => d,
@@ -999,12 +1371,14 @@ fn indexed(env: &Env, name: &str, i: &str, body: &Expr, pass: &Pass) -> Result<D
     for (&k, v) in places.iter().zip(&g.items) {
         let bound = [Data::One(*v)];
         let frame = Frame { names: &names, values: &bound, calls: 0 };
-        let value = match eval(&cx, &frame, body, 0).and_then(|d| d.strict(o)).map_err(|e| array::element_error(size, 1, k, o, e))? {
+        let value = match eval_lenient(&cx, &frame, body, 0).map_err(|e| array::element_error(size, 1, k, o, e))? {
             value @ (Data::One(_) | Data::Text(_)) => value,
             Data::Grid(_) | Data::TextGrid(_) => {
                 return Err(CalcError::Syntax(format!("{name}[{i}] is one element — its right side can't be a vector")));
             }
         };
+        // A single value has no failed elements; this stays in case that ever changes.
+        let value = value.strict(o).map_err(|e| array::element_error(size, 1, k, o, e))?;
         if let Some(slot) = values.get_mut(k) {
             *slot = Some(value);
         }
@@ -1188,6 +1562,13 @@ fn copy(cx: &Cx<'_>, v: &Data) -> Result<Data, CalcError> {
 // Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
 fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) -> Result<Data, CalcError> {
+    // `if(c, a, b)` is the piecewise `a if c, b otherwise`: only the branch picked is evaluated.
+    if name == "if" {
+        let [condition, then, otherwise] = args else {
+            return Err(CalcError::Arity("if".to_string(), 3));
+        };
+        return piecewise(cx, fr, &[(then, condition)], Some(otherwise), depth);
+    }
     // Resolve what is being called before evaluating the arguments, so a missing name is reported
     // as missing rather than after unrelated errors in its arguments.
     let user = if fr.param(name).is_some() { None } else { cx.env.entries.get(name) };

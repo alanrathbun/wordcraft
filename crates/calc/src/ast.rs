@@ -94,6 +94,15 @@ pub enum Expr {
         /// The last value.
         last: Box<Expr>,
     },
+    /// A piecewise definition, `a if c, b if d, e otherwise`: the value of the first case whose
+    /// condition holds, else `otherwise`'s. The parser only produces one as the whole right side
+    /// of a definition. With a vector condition each element takes its own case.
+    Cases {
+        /// Each case as `(value, condition)`, in order; never empty.
+        cases: Vec<(Expr, Expr)>,
+        /// The value when no condition holds; with none, that is an error.
+        otherwise: Option<Box<Expr>>,
+    },
 }
 
 /// A comparison.
@@ -199,10 +208,18 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
             }
             Expr::Call(n, args) | Expr::Index(n, args) => {
                 stack.extend(args.iter().rev());
+                // `if(c, a, b)` is a keyword, not a function anything defines.
+                if matches!(e, Expr::Call(..)) && n == "if" {
+                    continue;
+                }
                 n
             }
             Expr::Matrix { items, .. } => {
                 stack.extend(items.iter().rev());
+                continue;
+            }
+            Expr::Cases { cases, otherwise } => {
+                push_cases(&mut stack, cases, otherwise.as_deref());
                 continue;
             }
             Expr::Range { first, second, last } => {
@@ -221,8 +238,18 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
     out
 }
 
+/// Push the parts of a piecewise onto a stack of expressions to visit, so they come off it in
+/// source order: each value then its condition, then `otherwise`.
+fn push_cases<'a>(stack: &mut Vec<&'a Expr>, cases: &'a [(Expr, Expr)], otherwise: Option<&'a Expr>) {
+    stack.extend(otherwise);
+    for (value, condition) in cases.iter().rev() {
+        stack.push(condition);
+        stack.push(value);
+    }
+}
+
 /// The keywords a statement uses as operators, without duplicates, in order of first use: `and`,
-/// `or` and `not` for now. A document that also defines one of these words as a name (written
+/// `or`, `not`, `if` (a piecewise's cases, and the `if(c, a, b)` function) and `otherwise`. A document that also defines one of these words as a name (written
 /// before the word became a keyword) has changed meaning, which [`crate::recalc`] reports.
 pub(crate) fn keywords_used(s: &Stmt) -> Vec<&'static str> {
     let body = match s {
@@ -258,12 +285,21 @@ pub(crate) fn keywords_used(s: &Stmt) -> Vec<&'static str> {
                 stack.push(first);
                 None
             }
-            Expr::Call(_, args) | Expr::Index(_, args) => {
+            Expr::Call(n, args) | Expr::Index(n, args) => {
                 stack.extend(args.iter().rev());
-                None
+                (matches!(e, Expr::Call(..)) && n == "if").then_some("if")
             }
             Expr::Matrix { items, .. } => {
                 stack.extend(items.iter().rev());
+                None
+            }
+            Expr::Cases { cases, otherwise } => {
+                push_cases(&mut stack, cases, otherwise.as_deref());
+                for word in ["if", "otherwise"].into_iter().take(if otherwise.is_some() { 2 } else { 1 }) {
+                    if !out.contains(&word) {
+                        out.push(word);
+                    }
+                }
                 None
             }
             Expr::Range { first, second, last } => {

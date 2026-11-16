@@ -147,6 +147,11 @@ pub enum CalcError {
     /// A data table this calculation depends on has an error.
     #[error("depends on table data with an error")]
     UpstreamTable,
+    /// No case of a piecewise definition holds and it has no `otherwise`. Holds `name = value`
+    /// for up to three of the variables its conditions name (for one element of a vector, that
+    /// element's values).
+    #[error("no case applies{}", no_case_values(.0))]
+    NoCase(Vec<String>),
     /// A text where only a number makes sense. `text` is cut to 40 characters, and `place` says
     /// what it was used in (`in arithmetic`, `with a unit`).
     #[error("\"{text}\" is text — it can't be used {place}")]
@@ -156,4 +161,9 @@ pub enum CalcError {
         /// Where it was used, as the end of the message.
         place: std::borrow::Cow<'static, str>,
     },
+}
+
+/// The values a [`CalcError::NoCase`] names, in parentheses after a space; nothing for none.
+fn no_case_values(values: &[String]) -> String {
+    if values.is_empty() { String::new() } else { format!(" ({})", values.join(", ")) }
 }

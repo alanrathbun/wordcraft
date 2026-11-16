@@ -107,7 +107,7 @@ fn finite(q: Quantity) -> Result<Quantity, CalcError> {
 
 /// `q` as the document shows values: `1.6 in` in a US customary document. A value too large for
 /// the document's units shows in SI units, and never as a number without its unit.
-fn shown(q: Quantity, cx: &Ctx<'_>) -> String {
+pub(crate) fn shown(q: Quantity, cx: &Ctx<'_>) -> String {
     let text =
         |f: Formatted| if f.unit.is_empty() { render::text_number(&f.number) } else { format!("{} {}", render::text_number(&f.number), f.unit) };
     match format(q, None, cx.system, cx.precision).or_else(|_| format(q, None, UnitSystem::Si, cx.precision)) {

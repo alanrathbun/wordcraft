@@ -446,9 +446,13 @@ fn quantity_variant_is_never_produced() {
             Expr::Call(_, args) | Expr::Index(_, args) => args.iter().any(has_quantity),
             Expr::Matrix { items, .. } => items.iter().any(has_quantity),
             Expr::Range { first, second, last } => has_quantity(first) || second.as_deref().is_some_and(has_quantity) || has_quantity(last),
+            Expr::Cases { cases, otherwise } => {
+                cases.iter().any(|(v, c)| has_quantity(v) || has_quantity(c)) || otherwise.as_deref().is_some_and(has_quantity)
+            }
         }
     }
     assert!(!has_quantity(&expr_of("5 kN·m + 2 ksi")));
+    assert!(!has_quantity(&body_of("y := 5 kN if a > 2 in, 3 m otherwise")));
 }
 
 #[test]
@@ -681,7 +685,7 @@ fn logic_binds_looser_than_comparison() {
     assert_eq!(expr("a or b and c"), expr("a or (b and c)"));
     assert_eq!(expr("a < b + 1"), expr("a < (b + 1)"));
     assert_eq!(expr("a or b or c"), expr("(a or b) or c"));
-    // A keyword is not a name: it starts no product, and `if` is not parsed yet.
+    // A keyword is not a name: it starts no product.
     assert!(parse("2 and =").is_err());
     assert!(parse("x := 2 or 3 4").is_err());
     assert!(parse("if =").is_err());
@@ -696,4 +700,52 @@ fn logic_binds_looser_than_comparison() {
 fn comparison_names_are_free_names() {
     let s = parse("x := a < b and not c or d == a").unwrap();
     assert_eq!(free_names(&s), vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn cases_parse() {
+    let Stmt::Define { body: Expr::Cases { cases, otherwise }, show, .. } =
+        parse("Y := 0.4 if T ≤ 900 °F, 0.5 if T ≤ 950 °F, 0.7 otherwise =").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(cases.len(), 2);
+    assert_eq!(otherwise.as_deref(), Some(&Expr::Num(0.7)));
+    assert!(show.is_some());
+    assert!(matches!(body_of("c := \"OK\" if m ≥ 0 in"), Expr::Cases { otherwise: None, .. }));
+    assert!(matches!(body_of("y := if(x > 0, 1, 2)"), Expr::Call(n, a) if n == "if" && a.len() == 3));
+    let misplaced = "a list of cases (a if c, b otherwise) can only be the whole right side of a definition";
+    assert_eq!(parse("y := (1 if a, 2 otherwise) + 1").unwrap_err().to_string(), misplaced);
+    assert_eq!(parse("1 if a, 2 otherwise =").unwrap_err().to_string(), misplaced);
+    assert!(parse("y := 1 otherwise").is_err());
+    assert!(parse("y := 1 if a, 2 otherwise, 3 if b").is_err());
+    assert!(!free_names(&parse("y := if(x > 0, 1, 2)").unwrap()).contains(&"if".to_string()));
+}
+
+#[test]
+fn cases_details() {
+    let misplaced = "a list of cases (a if c, b otherwise) can only be the whole right side of a definition";
+    // Each part of a case is a whole expression: commas end conditions, and a condition may use
+    // `and`, `or` and comparisons.
+    let Expr::Cases { cases, otherwise } = body_of("y := a + 1 if 0 ≤ x < 1 and z, b otherwise") else { panic!() };
+    assert_eq!(cases, vec![(expr("a + 1"), expr("0 ≤ x < 1 and z"))]);
+    assert_eq!(otherwise.as_deref(), Some(&Expr::Name("b".into())));
+    // A function definition may be piecewise; `if(` inside a case is the function.
+    assert!(matches!(parse("f(v) := sqrt(v) if v ≥ 0, 0 otherwise"), Ok(Stmt::Define { body: Expr::Cases { .. }, .. })));
+    assert!(matches!(body_of("y := if(a, 1, 2) if b"), Expr::Cases { cases, .. } if matches!(&cases[0].0, Expr::Call(n, _) if n == "if")));
+    // Anywhere else a case keyword is the misplaced-case error.
+    for src in ["y := f(1 if a)", "y := [1 if a, 2]", "y := |1 if a|", "if(a, 1, 2) if b =", "y := 0..5 if a", "y := otherwise", "y := if a"] {
+        assert_eq!(syntax_msg(src), misplaced, "{src}");
+    }
+    // Every case but the last needs `if`, and `otherwise` comes last.
+    assert!(parse("y := 1 if a, 2").is_err());
+    assert!(parse("y := 1 if a otherwise").is_err());
+    assert!(parse("y := 1 if a, 2 otherwise, 3 otherwise").is_err());
+    assert!(parse("y := 1 if a, 0..2 if b").is_err());
+    // Names in every value and condition are used, in order.
+    assert_eq!(free_names(&parse("y := a if b > c, d otherwise").unwrap()), vec!["a", "b", "c", "d"]);
+    assert_eq!(free_names(&parse("y := if(p, q, r)").unwrap()), vec!["p", "q", "r"]);
+    // Many cases are bounded by the token limit, not by recursion.
+    let many = (0..800).map(|k| format!("{k} if x < {k}")).collect::<Vec<_>>().join(", ");
+    assert!(matches!(parse(&format!("y := {many}, 0 otherwise")), Ok(Stmt::Define { body: Expr::Cases { .. }, .. })));
 }

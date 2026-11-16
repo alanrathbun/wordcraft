@@ -38,6 +38,16 @@ impl<T> Grid<T> {
         Ok(Grid { rows, cols, items, failed: Vec::new() })
     }
 
+    /// [`Grid::new`] with the elements in `failed` failed: their errors (not naming the element),
+    /// by element, each element at most once and in increasing order, and their items placeholders.
+    pub(crate) fn with_failed(rows: usize, cols: usize, items: Vec<T>, failed: Vec<(usize, CalcError)>) -> Result<Grid<T>, CalcError> {
+        debug_assert!(failed.windows(2).all(|w| matches!(w, [(a, _), (b, _)] if a < b)), "failed elements out of order");
+        debug_assert!(failed.last().is_none_or(|(k, _)| *k < items.len()), "a failed element outside the grid");
+        let mut g = Grid::new(rows, cols, items)?;
+        g.failed = failed;
+        Ok(g)
+    }
+
     /// The error of the first failed element, naming it; `None` when nothing failed.
     fn first_failure(&self, origin: u8) -> Option<CalcError> {
         let (k, e) = self.failed.first()?;
@@ -45,7 +55,9 @@ impl<T> Grid<T> {
     }
 }
 
-/// What a failed element's item holds: a value no one should read (not a number).
+/// What a failed element's item holds: a value that means nothing. Nothing about it guards against
+/// its being read (`truth` would even take its NaN as true), so whatever reads a grid's items
+/// skips its failed elements ([`Failures`]) or refuses the grid ([`Data::strict`]).
 pub(crate) fn placeholder() -> Val {
     Val::plain(Quantity::dimensionless(f64::NAN))
 }
@@ -162,11 +174,17 @@ impl Data {
         }
     }
 
-    /// The text itself, or a text grid's first element; `None` for numbers.
+    /// The text itself, or a text grid's first element that did not fail (so an error naming it
+    /// never shows a failed element's placeholder); `None` for numbers. A text grid always has
+    /// one: a grid whose every element failed is built as numbers.
     pub(crate) fn text(&self) -> Option<&str> {
         match self {
             Data::Text(s) => Some(s),
-            Data::TextGrid(g) => g.items.first().map(String::as_str),
+            Data::TextGrid(g) => {
+                let mut failures = Failures::of(Some(g));
+                let mut texts = g.items.iter().enumerate().filter(|(k, _)| failures.at(*k).is_none());
+                texts.next().or_else(|| g.items.first().map(|s| (0, s))).map(|(_, s)| s.as_str())
+            }
             Data::One(_) | Data::Grid(_) => None,
         }
     }
@@ -291,9 +309,7 @@ fn build(shape: &Grid, origin: u8, lenient: bool, results: impl Iterator<Item = 
             }
         });
     }
-    let mut g = Grid::new(rows, cols, items)?;
-    g.failed = failed;
-    Ok(Data::Grid(g))
+    Grid::with_failed(rows, cols, items, failed).map(Data::Grid)
 }
 
 /// Keep element `k`'s error `e` in `failed` when `lenient`; otherwise, and for running out of work
@@ -421,6 +437,13 @@ mod tests {
         // A single value broadcast over a grid with failures keeps them.
         let g = grid(zip(&Data::One(num(1.0)), &a, 0, true, add).unwrap());
         assert_eq!(g.failed, [(2, CalcError::Upstream)]);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "failed elements out of order")]
+    fn failed_elements_are_kept_in_order() {
+        let _ = Grid::with_failed(2, 1, vec![num(1.0), num(2.0)], vec![(1, CalcError::NonFinite), (0, CalcError::NonFinite)]);
     }
 
     #[test]

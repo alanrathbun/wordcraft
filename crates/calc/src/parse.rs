@@ -6,8 +6,10 @@
 //! statement := head ":=" body [ show ]                          define (and optionally show)
 //!            | expr show                                       evaluate and show
 //! head      := name | name "(" params ")" | name"[" name "]"   variable, function, indexed
-//! body      := range | expr
+//! body      := range | cases | expr
 //! range     := expr [ "," expr ] ".." expr                    first, second..last; `..` loosest
+//! cases     := case { "," case } [ "," expr "otherwise" ]      the first case that holds wins
+//! case      := expr "if" expr                                  value if condition
 //! show      := "=" [ "?" ] [ unit text ]                       the rest of the text is the unit
 //! expr      := or
 //! or        := and { ("or" | "∨") and }
@@ -20,14 +22,18 @@
 //! unary     := "-" unary | power                               so -x^2 is -(x^2)
 //! power     := atom [ "^" unary ]                              right-associative
 //! atom      := number | text | name | name"(" args ")" | name"[" args "]" | "(" expr ")"
+//!            | "if(" expr "," expr "," expr ")"                  if(condition, then, else)
 //!            | "[" rows "]" | "|" expr "|" | "√" atom
 //! rows      := items { ";" items }                             every row the same length
 //! items     := expr { "," expr }
 //! postfix   := atom { "²" | "³" | "⁻¹" ... }                   one superscript digit, like `^`
 //! ```
 //!
-//! `and`, `or`, `not`, `if` and `otherwise` are keywords, never names (`if` and `otherwise` are
-//! lexed but not yet parsed). A `==` is a comparison; a lone `=` still ends the statement.
+//! `and`, `or`, `not`, `if` and `otherwise` are keywords, never names. A `==` is a comparison; a
+//! lone `=` still ends the statement. `if` touching a `(` at the start of an operand is the
+//! function `if(c, a, b)`; anywhere else `if` and `otherwise` belong to a list of cases, which,
+//! like a range, can only be the whole right side of a definition, so its commas are never
+//! confused with list or argument commas.
 //!
 //! A text is written between quotes, `"OK"` or `“OK”`, and is at most [`MAX_TEXT_CHARS`] characters.
 //! It never multiplies by adjacency (`2 "OK"` is an error).
@@ -113,9 +119,19 @@ fn syntax(msg: impl Into<String>) -> CalcError {
     CalcError::Syntax(msg.into())
 }
 
+/// An `otherwise` with no case before it, or a case's value with neither `if` nor `otherwise`.
+fn no_case_before_otherwise() -> CalcError {
+    syntax("each case is a value and a condition, like a if x > 0, and only the last may be b otherwise")
+}
+
 /// A `..` anywhere but between the ends of a definition's whole right side.
 fn misplaced_range() -> CalcError {
     syntax("a range like 0..5 can only be the whole right side of a definition")
+}
+
+/// An `if` or `otherwise` anywhere but in the cases of a definition's whole right side.
+fn misplaced_cases() -> CalcError {
+    syntax("a list of cases (a if c, b otherwise) can only be the whole right side of a definition")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -567,11 +583,14 @@ struct Parser<'a> {
     /// Whether a `..` ends the current expression, as it ends a value of a range at the top of
     /// a definition's right side; anywhere else it is an error.
     in_range_end: bool,
+    /// Whether an `if` or `otherwise` ends the current expression, as they end the parts of a
+    /// list of cases at the top of a definition's right side; anywhere else they are an error.
+    in_cases: bool,
 }
 
 impl<'a> Parser<'a> {
     fn new(toks: &'a [Tok]) -> Self {
-        Parser { toks, pos: 0, depth: 0, bar_closes: false, in_range_end: false }
+        Parser { toks, pos: 0, depth: 0, bar_closes: false, in_range_end: false, in_cases: false }
     }
 
     fn peek(&self) -> Option<&'a Tok> {
@@ -599,6 +618,7 @@ impl<'a> Parser<'a> {
                 let unit = rest.strip_prefix('?').unwrap_or(rest).trim();
                 Ok(Some(Show { unit: if unit.is_empty() { None } else { Some(unit.to_string()) } }))
             }
+            Some(Tok { kind: Kind::If | Kind::Otherwise, .. }) => Err(misplaced_cases()),
             Some(t) => Err(syntax(format!("unexpected {}", t.kind.describe()))),
         }
     }
@@ -616,12 +636,22 @@ impl<'a> Parser<'a> {
         self.expr_inner(0)
     }
 
-    /// Parse the right side of a definition: a range, or else an ordinary expression. `..` is the
-    /// loosest operator and is only accepted here, at the top: each value of a range is a whole
-    /// expression (`0..n-1`, `1, 1+0.5..n`).
+    /// Parse the right side of a definition: a range, a list of cases, or else an ordinary
+    /// expression. `..`, `if` and `otherwise` are the loosest and are only accepted here, at the
+    /// top: each value of a range, and each value and condition of a case, is a whole expression
+    /// (`0..n-1`, `1, 1+0.5..n`, `a + 1 if 0 ≤ x < 1 and y, b otherwise`).
     fn body(&mut self) -> Result<Node, CalcError> {
+        let outer = std::mem::replace(&mut self.in_cases, true);
+        let r = self.body_inner();
+        self.in_cases = outer;
+        r
+    }
+
+    fn body_inner(&mut self) -> Result<Node, CalcError> {
         let first = self.range_value()?;
         let second = match self.peek_kind() {
+            Some(Kind::If) => return self.cases(first),
+            Some(Kind::Otherwise) => return Err(no_case_before_otherwise()),
             Some(Kind::Comma) => {
                 self.pos += 1;
                 let second = self.range_value()?;
@@ -635,6 +665,48 @@ impl<'a> Parser<'a> {
         };
         self.pos += 1; // the `..`
         self.range_rhs(first, second)
+    }
+
+    /// The rest of a list of cases after its first value, at its first `if`: each condition, then
+    /// after a `,` the next value and its `if` or `otherwise`. The cases end at the end of the
+    /// statement or its `=`, or after `otherwise`. Each part is a whole expression, read in a loop,
+    /// so many cases cost no recursion.
+    fn cases(&mut self, first: Node) -> Result<Node, CalcError> {
+        let mut height = first.height;
+        let mut value = first.expr;
+        let mut cases = Vec::new();
+        loop {
+            match self.bump().map(|t| &t.kind) {
+                Some(Kind::If) => {}
+                Some(Kind::Otherwise) => {
+                    let otherwise = Some(Box::new(value));
+                    return Node::over(height, Expr::Cases { cases, otherwise });
+                }
+                _ => return Err(no_case_before_otherwise()),
+            }
+            let condition = self.case_part()?;
+            height = height.max(condition.height);
+            cases.push((value, condition.expr));
+            if self.peek_kind() != Some(&Kind::Comma) {
+                return Node::over(height, Expr::Cases { cases, otherwise: None });
+            }
+            self.pos += 1; // the `,`
+            let next = self.case_part()?;
+            height = height.max(next.height);
+            value = next.expr;
+            if !matches!(self.peek_kind(), Some(Kind::If | Kind::Otherwise)) {
+                return Err(no_case_before_otherwise());
+            }
+        }
+    }
+
+    /// A value or condition of a case: a whole expression (not counted as nesting) that a `,`, an
+    /// `if` or an `otherwise` at its top level ends. A `..` there is an error.
+    fn case_part(&mut self) -> Result<Node, CalcError> {
+        let outer = std::mem::replace(&mut self.in_range_end, false);
+        let r = self.expr_inner(0);
+        self.in_range_end = outer;
+        r
     }
 
     /// The rest of a range after its `..`: the last value, then the end of the statement or its
@@ -659,14 +731,16 @@ impl<'a> Parser<'a> {
         r
     }
 
-    /// Run `f` inside a bracket, where a `|` ends an absolute value only when `bar_closes` and a
-    /// `..` never ends a range's value.
+    /// Run `f` inside a bracket, where a `|` ends an absolute value only when `bar_closes`, and a
+    /// `..` never ends a range's value nor an `if` or `otherwise` a case's part.
     fn bracketed<T>(&mut self, bar_closes: bool, f: impl FnOnce(&mut Self) -> Result<T, CalcError>) -> Result<T, CalcError> {
         let outer_bar = std::mem::replace(&mut self.bar_closes, bar_closes);
         let outer_range = std::mem::replace(&mut self.in_range_end, false);
+        let outer_cases = std::mem::replace(&mut self.in_cases, false);
         let r = f(self);
         self.bar_closes = outer_bar;
         self.in_range_end = outer_range;
+        self.in_cases = outer_cases;
         r
     }
 
@@ -699,6 +773,12 @@ impl<'a> Parser<'a> {
                 }
                 lhs = self.compare(lhs, first)?;
                 continue;
+            }
+            if matches!(self.peek_kind(), Some(Kind::If | Kind::Otherwise)) {
+                if self.in_cases {
+                    break;
+                }
+                return Err(misplaced_cases());
             }
             let logic = match self.peek_kind() {
                 Some(Kind::And) => Some((Logic::And, AND_BP)),
@@ -843,6 +923,16 @@ impl<'a> Parser<'a> {
                 let operand = self.expr(SQRT_BP)?;
                 Node::over(operand.height, Expr::Call("sqrt".to_string(), vec![operand.expr]))
             }
+            // `if(` with no space is the function `if(c, a, b)`; any other `if` or `otherwise`
+            // here starts nothing.
+            Kind::If => match self.peek() {
+                Some(next) if next.kind == Kind::LParen && next.start == tok.end => {
+                    self.pos += 1;
+                    self.call("if".to_string())
+                }
+                _ => Err(misplaced_cases()),
+            },
+            Kind::Otherwise => Err(misplaced_cases()),
             other => Err(syntax(format!("expected a value but found {}", other.describe()))),
         }
     }

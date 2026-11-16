@@ -1963,3 +1963,57 @@ fn a_data_table_heading_that_is_a_word_fails_its_uses() {
     recalc(&mut d, &no_page);
     assert_eq!(region(&d, 1).0.state, err(CalcError::Keyword("not".into())));
 }
+
+#[test]
+fn a_use_of_if_or_otherwise_defined_as_a_name_fails_with_the_word() {
+    let word = |w: &str| err(CalcError::Keyword(w.into()));
+    let mut d = doc_with(&["if := 2", "a := 1", "x := 1 if a > 0, 2 otherwise =", "y := if(a > 0, 1, 2) =", "z := a + 1 ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 3).0.state, word("if"));
+    assert_eq!(region(&d, 4).0.state, word("if"));
+    assert_eq!(region(&d, 5).0.state, CalcState::Fresh);
+    let mut d = doc_with(&["otherwise := 2", "a := 1", "x := 1 if a > 0, 2 otherwise =", "y := 1 if a > 0 ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 3).0.state, word("otherwise"));
+    assert_eq!(region(&d, 4).0.state, CalcState::Fresh);
+}
+
+#[test]
+fn piecewise_definitions_recalculate() {
+    let mut d = doc_with(&["T := 1000 °F", "Y := 0.4 if T ≤ 900 °F, 0.5 if T ≤ 950 °F, 0.7 otherwise =", "Z := 1 if T < 0 °F ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 2).0.state, CalcState::Fresh);
+    assert!(region(&d, 2).1.ends_with(")┤=0.7"), "{}", region(&d, 2).1);
+    assert_eq!(region(&d, 3).0.state, CalcState::Error("no case applies (T = 1000 °F)".into()));
+    // Every name in every branch is a dependency: a failure upstream fails it, picked or not.
+    let mut d = doc_with(&["a := 1 in + 1 lbf", "Y := 1 if 1 > 0, a otherwise ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 2).0.state, err(CalcError::Upstream));
+}
+
+#[test]
+#[ignore = "timing: run with --release -- --ignored perf_1000_element_piecewise"]
+fn perf_1000_element_piecewise() {
+    let values: Vec<String> = (0..1000).map(|i| format!("{}.5", i % 37)).collect();
+    let mut rows: Vec<Vec<&str>> = vec![vec!["x (in)"]];
+    rows.extend(values.iter().map(|v| vec![v.as_str()]));
+    let rows: Vec<&[&str]> = rows.iter().map(Vec::as_slice).collect();
+    let mut sources = vec!["check := \"OK\" if x ≥ 10 in, \"NG\" otherwise".to_string(), "n_NG := sum(check == \"NG\") =".to_string()];
+    // Branches that fail for the elements that don't pick them: a negative root, and a division by
+    // zero at x = 0.5 in.
+    sources.extend((0..50).map(|k| format!("y_{k} := sqrt(x/(1 in) - {k}) if x ≥ {k} in, 1/(x/(1 in) - 0.5) if x > 0.5 in, 0 otherwise")));
+    let mut blocks = vec![table_block(data_table(1, &rows))];
+    blocks.extend(sources.iter().enumerate().map(|(i, s)| para_block(para(vec![calc_eq(i as u64 + 1, s)]))));
+    let mut d = doc_of(blocks);
+    recalc(&mut d, &no_page);
+    let _snapshot = d.clone();
+    set_cell(&mut d, 0, 1, 0, "2 in");
+    let start = Instant::now();
+    let report = recalc(&mut d, &no_page);
+    let took = start.elapsed();
+    println!("perf_1000_element_piecewise: {took:?}");
+    assert_eq!(report.regions, 52);
+    assert_eq!(report.errors, 0, "{:?}", regions(&d).iter().map(|r| r.0.state.clone()).collect::<Vec<_>>());
+    assert!(region(&d, 2).1.ends_with("=271"), "{}", region(&d, 2).1);
+    assert!(took.as_millis() < 100, "recalc took {took:?}");
+}
