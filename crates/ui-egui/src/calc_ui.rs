@@ -282,7 +282,7 @@ pub const SYMBOL_GROUPS: &[(&str, &[&str])] = &[
             "Φ", "Ψ", "Ω",
         ],
     ),
-    ("Operators", &["≔", "·", "×", "±", "√", "²", "³", "⁻¹", "|", "°"]),
+    ("Operators", &["≔", "·", "×", "±", "√", "²", "³", "⁻¹", "|", "°", "≤", "≥", "≠", "∑", "∧", "∨", "¬"]),
     ("Units", &["gm", "°F", "°C", "Δ°F", "Δ°C", "µm", "Ω"]),
     ("Constants", &["π", "e", "g", "g_0", "c_0", "R_u"]),
 ];
@@ -327,6 +327,13 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("times", "×"),
     ("pm", "±"),
     ("deg", "°"),
+    ("le", "≤"),
+    ("ge", "≥"),
+    ("ne", "≠"),
+    ("sum", "∑"),
+    ("wedge", "∧"),
+    ("vee", "∨"),
+    ("neg", "¬"),
 ];
 
 /// A `\name` just finished at char index `cursor` (the character before the cursor ends it) turned

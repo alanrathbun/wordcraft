@@ -59,11 +59,12 @@ refused; write `gm`.
 
 ## Symbols
 
-In the calculation box, **Insert Symbol** lists Greek letters, operators (`≔ · × ± √ ² ³`), the
-temperature units and the constants; picking one puts it at the cursor. You can also type a
-backslash name followed by a space, as in Word: `\sigma` → σ, `\theta` → θ, `\Delta` → Δ, `\mu` → μ,
-`\omega` → ω, `\sqrt` → √, `\cdot` → ·, `\times` → ×, `\pm` → ±, `\deg` → °. Any Greek letter's
-name works, with a capital for the capital letter.
+In the calculation box, **Insert Symbol** lists Greek letters, operators (`≔ · × ± √ ² ³ ≤ ≥ ≠ ∑
+∧ ∨ ¬`), the temperature units and the constants; picking one puts it at the cursor. You can also
+type a backslash name followed by a space, as in Word: `\sigma` → σ, `\theta` → θ, `\Delta` → Δ,
+`\mu` → μ, `\omega` → ω, `\sqrt` → √, `\cdot` → ·, `\times` → ×, `\pm` → ±, `\deg` → °. Any
+Greek letter's name works, with a capital for the capital letter. For conditions and sums: `\le` →
+≤, `\ge` → ≥, `\ne` → ≠, `\sum` → ∑, `\wedge` → ∧, `\vee` → ∨, `\neg` → ¬.
 
 ## Units
 
@@ -345,6 +346,203 @@ so the change never goes unnoticed.
 
 A typed list longer than 1,000 rows (or wider than 64 columns) doesn't survive the trip through
 Word: it comes back marked as edited in Word. Keep long data in a data table.
+
+## Conditions, text and sums
+
+A calculation can compare values, choose between cases, give a word such as "OK" or "NG", and add
+up a series of terms. The everyday uses are a code check (a coefficient that depends on
+temperature, a pass or fail for each pipe size) and a sum over a bolt pattern.
+
+### Text values
+
+A text is written in double quotes, straight (`"OK"`) or curly (`“OK”`):
+
+```
+verdict := "OK" =                    → "OK"
+grades := ["A106 B", "A312 TP316"]
+```
+
+- A text can be up to 1,000 characters and can't contain a quote mark.
+- Text goes where a word belongs: a definition, a vector of texts, the result of a case or of
+  `if(…)`, a `lookup` key or result, and `==` or `≠`. Indexing, `length`, `rows`, `cols` and
+  `transpose` work on a vector of texts as on numbers.
+- Text can't be used in arithmetic, with a unit, in `<`, `>`, `≤`, `≥`, or in `min`, `max`, `sum`,
+  `mean`, `linterp` or `spline`. The error says so and names the text (`"OK" is text — it can't be
+  used in arithmetic`); a text is never turned into a number.
+- Two texts are equal when they match after ignoring spaces at either end and treating a run of
+  spaces as one. Capital letters count: `"a" == "A"` is 0.
+- A text result shows in quotes (`check = "OK"`), and a vector of texts as a bracketed column. A
+  quoted value (Insert › Calculated Value) shows the text without quotes: "the check is OK", and a
+  vector as a list, "OK, OK, NG".
+
+### Comparisons
+
+| You type | Shown as | Meaning |
+| --- | --- | --- |
+| `<` `>` | `<` `>` | less than, greater than |
+| `<=` or `≤` | `≤` | at most |
+| `>=` or `≥` | `≥` | at least |
+| `==` | a bold `=` | equal (so it can't be mistaken for a result) |
+| `!=` or `≠` | `≠` | not equal |
+
+- Units are checked first: `1 in ≥ 1 lbf` is an error, not true or false. Values are compared after
+  converting units, so `38.1 mm == 1.5 in` is true and `100 °C == 212 °F` is true.
+- A comparison gives 1 (true) or 0 (false), and works in arithmetic: `sum(check == "NG")` counts
+  the failures, and `2 + (x > 3)` is 3 when `x` is 5. On vectors, a comparison works element by
+  element, like arithmetic.
+- Values within a relative 1e-12 of each other count as equal for all six operators, so a check
+  that lands exactly on its limit doesn't flip because of unit conversion: `38.1 mm > 1.5 in` is
+  false and `38.1 mm ≤ 1.5 in` is true. Zero is equal only to exactly zero. To compare with zero,
+  use a tolerance: `abs(x) < 1e-9 m`, not `x == 0 m`.
+- Comparisons chain: `0 ≤ x < 1` means `0 ≤ x and x < 1`.
+- An absolute temperature (a `°C` or `°F` value, or one plus or minus a difference) compares with
+  another absolute temperature or with a `K` or `°R` value: `T ≤ 900 °F` and `T ≤ 755 K` both
+  work. It can't be compared with a temperature difference, or with an average written
+  `(T_1 + T_2)/2`: that is an error, because the comparison would give a wrong answer that looks
+  right. Write an average as `T_1 + (T_2 − T_1)/2`. Two differences compare directly
+  (`ΔT ≤ 10 Δ°F`).
+
+### And, or and not
+
+`and`, `or` and `not` (also typed `∧`, `∨`, `¬`, or with `\wedge`, `\vee`, `\neg`) combine
+comparisons. They are always shown as `∧`, `∨` and `¬`, however they were typed, and give 1 or 0.
+They take dimensionless numbers, where any nonzero value counts as true.
+
+```
+ok := P ≤ P_max and T ≤ T_max =
+```
+
+- `not` binds looser than a comparison, so `not x < 3` means `not (x < 3)`. `and` binds tighter than
+  `or`.
+- When the left side already decides the result, the right side isn't worked out:
+  `b ≠ 0 and 1/b > 1` is 0, not an error, when `b` is 0. On vectors this happens per element.
+
+### Cases
+
+A definition can choose its value from cases, tried in order. The first true condition wins:
+
+```
+Y := 0.4 if T ≤ 900 °F, 0.5 if T ≤ 950 °F, 0.7 otherwise =
+```
+
+The coefficients here only illustrate the syntax; take the real ones from the code. With
+`T := 925 °F` the result is 0.5, and `T := 500 °C` gives 0.5 as well (932 °F). It is shown with a
+left brace, one line per case.
+
+- Cases can only be the whole right side of a definition, including a function definition
+  (`Y(T) := 0.4 if T ≤ 900 °F, 0.7 otherwise`). They can't be used inside parentheses or in a
+  larger formula; use `if(…)` there. Their commas would be confused with list commas.
+- `otherwise` is optional, but if no case is true the result is an error, never 0:
+  `no case applies (T = 1000 °F)`.
+- A condition that starts with a parenthesis needs a space after `if`:
+  `1 if (a > b), 2 otherwise`. Written `if(a > b)` with nothing between, it is the `if` function
+  instead (below).
+- With a vector, each element picks its own case, and an element only fails if the case it picks
+  fails: `sqrt(x) if x ≥ 0, 0 otherwise` works for a vector `x` with negative entries, giving the
+  square root where `x ≥ 0` and 0 elsewhere.
+- Inside a case, whole arrays stay whole. `sum(x)`, `x[0]` and `lookup(xs, …)` see all of `x`, as
+  they do outside a case; only the choice of result is per element.
+- The results can be text: `"OK" if margin ≥ 0 in, "NG" otherwise`. A single value may be text in
+  one case and a number in another, but a vector can't mix them: if one element picks a number and
+  another picks text, the result is an error that names the element ("element 1 is text but
+  element 0 is a number").
+
+### The `if` function
+
+`if(c, a, b)` gives `a` where `c` is true and `b` where it is false. It is for use inside a
+larger expression, and it is how a pasted Mathcad `if(…)` works. It works out only the branch it
+picks, per element for vectors, so `if(x ≠ 0, 1/x, 0)` doesn't fail on a zero element. It is shown
+as a function call.
+
+### Sums
+
+`∑(i = first..last) term` adds `term` for each `i`. Type `∑` with `\sum`.
+
+```
+n := 3
+a := [1, 2, 3, 4]
+b := [5, 6, 7, 8]
+∑(i = 1..n) a[i]·b[i] =              → 65
+∑(i = 1, 3..9) i =                   → 25 (1 + 3 + 5 + 7 + 9)
+```
+
+The range follows the rules of a range definition: `first..last`, or `first, second..last` to
+step, with both ends included. The sum is drawn as a real ∑ with the limits below and above,
+including in Word.
+
+A bolt-pattern sum, the moment of inertia of the bolt areas about the center:
+
+```
+A_b := 0.3 in^2
+r := [4 in, 8 in]
+I_b := ∑(i = 0..length(r) − 1) A_b·r[i]^2 =      → 24 in^4
+```
+
+- The index belongs to that sum alone, so two sums can both use `i`, and sums can be nested
+  (`∑(i = 0..1) ∑(j = 0..1) a[i]·b[j]`). It can't be a name already defined in the document, a
+  parameter of the function around it, or the index of a sum it is inside; each of those is an
+  error asking for another name.
+- A sum covers one product term, like `·`: `∑(i = 1..n) a[i]·b[i] + 1` is the sum plus 1. To sum
+  more, use parentheses: `∑(i = 1..n) (a[i] + 1)`. The display draws the parentheses, so how it
+  was read is visible.
+- The terms must be addable under the unit rules. They can be vectors of one shape, which add
+  element by element.
+- A range whose last value is below its first is an error ("the sum's range is empty — its last
+  value is below its first"), never a sum of 0. A huge range is refused ("more than 10,000
+  elements") rather than left to hang.
+
+### Text columns in data tables
+
+A heading ending in `(text)` makes a column of texts instead of numbers:
+
+| Material (text) | S_table (ksi) |
+| --- | --- |
+| A106 B | 20 |
+| A312 TP316 | 20 |
+| A333 6 | 20 |
+
+```
+S_allow := lookup(Material, S_table, "A106 B") = ? ksi      → 20 ksi
+```
+
+Without `= ? ksi` the result shows in the document's unit system (20000 psi in US customary).
+Every other column stays strictly numeric, so a typo in a number cell is still an error and never
+quietly becomes text. In a text column:
+
+- a cell's value is its text with the spaces at either end removed, and a number is text (`"6"`);
+- a cell can't be empty (an error, as in a number column) or hold a quote mark of any kind: `"`,
+  `“` or `”`, so a smart quote counts;
+- `lookup` by text matches as `==` does, ignoring spaces at the ends and runs of spaces but not
+  capitals, so `"a106 b"` doesn't find `A106 B`. A text that isn't in the column, or that matches
+  more than one cell, is an error.
+
+### Example: a check for each pipe size
+
+Add these to the ASME B31.3 example under [Data tables](#data-tables):
+
+```
+check := "OK" if margin ≥ 0 in, "NG" otherwise =    → ["OK"; "OK"; "OK"]
+n_NG := sum(check == "NG") =                        → 0
+```
+
+`check` has one verdict per pipe size, and `n_NG` counts the failures. Change the 3/4" `t_nom` to
+`0.020` and the second verdict becomes "NG" and `n_NG` becomes 1. A sentence can quote `check`
+("the checks are OK, NG, OK").
+
+### Reserved words
+
+`if`, `otherwise`, `and`, `or` and `not` can't be names, like the units and functions. A document
+that already defined one of them as a variable shows `or is a reserved word — choose another name`
+on that definition, and the same message on each calculation that uses the word as an operator,
+rather than quietly changing what the document means. Rename the variable to fix it. A variable
+named `text` is fine; only a heading ending in `(text)` is special.
+
+### In Word
+
+Text, comparisons, cases (as a left brace, one line per case) and sums are saved as ordinary Word
+math that reads correctly in Word, and reopen live in WordCraft. A text column's cells are an
+ordinary Word table; if one is edited in Word, the new values are used and the status bar says so,
+as for other calculation data.
 
 ## Example
 

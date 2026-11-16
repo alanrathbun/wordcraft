@@ -543,6 +543,16 @@ fn backslash_names_become_symbols() {
 }
 
 #[test]
+fn condition_shortcuts_expand() {
+    for (typed, symbol) in [("\\le ", "≤"), ("\\ge ", "≥"), ("\\ne ", "≠"), ("\\sum ", "∑"), ("\\wedge ", "∧"), ("\\vee ", "∨"), ("\\neg ", "¬")]
+    {
+        let n = typed.chars().count();
+        assert_eq!(calc_ui::expand_shortcut(typed, n), Some((symbol.to_string(), 1)), "{typed}");
+    }
+    assert_eq!(calc_ui::expand_shortcut("\\nu ", 4), Some(("ν".to_string(), 1)), "Greek still wins its own names");
+}
+
+#[test]
 fn symbol_menu_inserts_at_the_cursor() {
     let mut b = calc_ui::CalcBox::new(None, "x := 2", None);
     b.cursor = Some(1);
