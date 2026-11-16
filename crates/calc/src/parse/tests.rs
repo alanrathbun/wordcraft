@@ -749,3 +749,18 @@ fn cases_details() {
     let many = (0..800).map(|k| format!("{k} if x < {k}")).collect::<Vec<_>>().join(", ");
     assert!(matches!(parse(&format!("y := {many}, 0 otherwise")), Ok(Stmt::Define { body: Expr::Cases { .. }, .. })));
 }
+
+#[test]
+fn an_if_call_is_a_factor() {
+    // `if(` touching its parenthesis is the function, so after a value it is an implied product,
+    // like `2 sqrt(x)`; `if` followed by anything else starts a case.
+    assert_eq!(body_of("y := 2 if(x > 0, 1, 2)"), body_of("y := 2·if(x > 0, 1, 2)"));
+    assert!(matches!(body_of("y := 2 if(x > 0, 1, 2)"), Expr::Binary(Op::Mul, _, b) if matches!(&*b, Expr::Call(n, a) if n == "if" && a.len() == 3)));
+    let Expr::Cases { cases, otherwise } = body_of("y := 2 if x > 0, 3 otherwise") else { panic!() };
+    assert_eq!(cases, vec![(Expr::Num(2.0), expr("x > 0"))]);
+    assert_eq!(otherwise.as_deref(), Some(&Expr::Num(3.0)));
+    let Expr::Cases { cases, .. } = body_of("y := 2 if (x > 0), 3 otherwise") else { panic!() };
+    assert_eq!(cases[0].1, expr("x > 0"));
+    // In an evaluation too.
+    assert_eq!(expr("2 if(x > 0, 1, 2)"), expr("2·if(x > 0, 1, 2)"));
+}

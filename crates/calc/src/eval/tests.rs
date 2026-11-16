@@ -1527,7 +1527,7 @@ fn logic_short_circuits_per_element() {
 }
 
 #[test]
-fn piecewise_failures_reach_the_strict_boundaries_named_once() {
+fn piecewise_element_errors_are_named_once_at_a_strict_caller() {
     let mut env = Env::new();
     run(&mut env, "x := [4, -1, 9, 0]").unwrap();
     let want = "element 3: result isn't a finite number";
@@ -1625,4 +1625,26 @@ fn no_case_messages_are_written_only_when_they_can_be_seen() {
     run(&mut env, "x := [0, 5, -1]").unwrap();
     assert_eq!(err_in(&mut env, "n := 1/x if x < 1"), "element 0: result isn't a finite number");
     assert_eq!(err_in(&mut env, "n := 1/x if x < 0"), "element 0: no case applies (x = 0)");
+}
+
+#[test]
+fn statement_boundaries_refuse_a_failed_grid() {
+    // No strict evaluation hands these boundaries a grid with failed elements (it names the
+    // element itself), so the grid is put in the environment directly, as the smallest seam that
+    // reaches each `strict` call.
+    let mut env = Env::new();
+    let items = vec![Val::plain(Quantity::dimensionless(1.0)), crate::array::placeholder(), Val::plain(Quantity::dimensionless(3.0))];
+    let failed = Grid::with_failed(3, 1, items, vec![(1, CalcError::NonFinite)]).unwrap();
+    env.entries.insert("f".into(), super::Entry::Var(Data::Grid(failed)));
+    let want = "element 1: result isn't a finite number".to_string();
+    // `eval_expr`.
+    assert_eq!(eval_expr(&env, &Expr::Name("f".into())).map_err(|e| e.to_string()), Err(want.clone()));
+    // `run_stmt_in`: an evaluation, and a definition with and without show; nothing is defined.
+    assert_eq!(err_in(&mut env, "f ="), want);
+    assert_eq!(err_in(&mut env, "y := f ="), want);
+    assert_eq!(err_in(&mut env, "y := f"), want);
+    assert!(env.data("y").is_none());
+    // An indexed body that is a failed grid is a vector, checked before its failures.
+    run(&mut env, "i := 0..2").unwrap();
+    assert_eq!(err_in(&mut env, "t[i] := f"), "t[i] is one element — its right side can't be a vector");
 }

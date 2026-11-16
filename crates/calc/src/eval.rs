@@ -256,6 +256,7 @@ fn is_constant(name: &str) -> bool {
 /// Evaluate an expression against the defined names.
 pub fn eval_expr(env: &Env, e: &Expr) -> Result<Value, CalcError> {
     let pass = Pass::new(u64::MAX);
+    // Defensive (see `run_stmt_in`).
     eval_data(env, e, &pass).and_then(|d| d.strict(env.origin)).map(|d| d.value())
 }
 
@@ -302,6 +303,10 @@ pub fn run_stmt(env: &mut Env, s: &Stmt) -> Result<Option<Value>, CalcError> {
 pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option<Data>, CalcError> {
     match s {
         Stmt::Eval { expr, show } => {
+            // Defensive: evaluated strictly, an element's failure is the error where it happens
+            // (`array::build`, a piecewise's `assemble`), so no grid with failed elements gets here
+            // today. Should one ever (a value stored with them), its placeholders must never be
+            // shown or defined.
             let v = eval_data(env, expr, pass)?.strict(env.origin)?;
             check_show(env, show, &v)?;
             Ok(Some(v))
@@ -333,6 +338,7 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
                 }
                 (None, _) => eval_data(env, body, pass)?,
             }
+            // Defensive, as for `Stmt::Eval` above.
             .strict(env.origin)?;
             if let Some(show) = show {
                 check_show(env, show, &v)?;
@@ -1404,7 +1410,9 @@ fn indexed(env: &Env, name: &str, i: &str, body: &Expr, pass: &Pass) -> Result<D
                 return Err(CalcError::Syntax(format!("{name}[{i}] is one element — its right side can't be a vector")));
             }
         };
-        // A single value has no failed elements; this stays in case that ever changes.
+        // Defensive: a single value has no failed elements, so this never fails today; it stays
+        // so a value with failures could never be stored. The vector check above comes first, so
+        // a vector body with a failed element is reported as a vector.
         let value = value.strict(o).map_err(|e| array::element_error(size, 1, k, o, e))?;
         if let Some(slot) = values.get_mut(k) {
             *slot = Some(value);

@@ -30,8 +30,8 @@
 //! ```
 //!
 //! `and`, `or`, `not`, `if` and `otherwise` are keywords, never names. A `==` is a comparison; a
-//! lone `=` still ends the statement. `if` touching a `(` at the start of an operand is the
-//! function `if(c, a, b)`; anywhere else `if` and `otherwise` belong to a list of cases, which,
+//! lone `=` still ends the statement. `if` touching a `(` is the function `if(c, a, b)`, which
+//! like any call can be a factor of an implied product (`2 if(c, a, b)`); anywhere else `if` and `otherwise` belong to a list of cases, which,
 //! like a range, can only be the whole right side of a definition, so its commas are never
 //! confused with list or argument commas.
 //!
@@ -774,7 +774,8 @@ impl<'a> Parser<'a> {
                 lhs = self.compare(lhs, first)?;
                 continue;
             }
-            if matches!(self.peek_kind(), Some(Kind::If | Kind::Otherwise)) {
+            // `if(` touching its parenthesis is the function, a factor like `sqrt(`.
+            if matches!(self.peek_kind(), Some(Kind::If | Kind::Otherwise)) && !self.if_call_next() {
                 if self.in_cases {
                     break;
                 }
@@ -857,6 +858,15 @@ impl<'a> Parser<'a> {
         match self.peek_kind() {
             Some(Kind::Num(_) | Kind::Name(_) | Kind::LParen | Kind::LBracket | Kind::Sqrt) => true,
             Some(Kind::Bar) => !self.bar_closes,
+            Some(Kind::If) => self.if_call_next(),
+            _ => false,
+        }
+    }
+
+    /// Whether the next tokens are `if(`, the `(` touching the `if`: the function `if(c, a, b)`.
+    fn if_call_next(&self) -> bool {
+        match (self.toks.get(self.pos), self.toks.get(self.pos.saturating_add(1))) {
+            (Some(Tok { kind: Kind::If, end, .. }), Some(Tok { kind: Kind::LParen, start, .. })) => end == start,
             _ => false,
         }
     }
