@@ -578,9 +578,9 @@ fn builtins_apply_element_wise() {
     // A per-element error names the element.
     column(&mut env, "w", &[1.0, -1.0], "1");
     assert!(run_value(&mut env, "sqrt(w) =").expect_err("sqrt(-1)").to_string().starts_with("element 1: "));
-    // min and max take single values for now: an array is an error, never a number.
-    assert!(matches!(run_value(&mut env, "max(v) ="), Err(CalcError::Syntax(_))));
-    assert!(matches!(run_value(&mut env, "min(v, 1) ="), Err(CalcError::Syntax(_))));
+    // min and max reduce an array to one value rather than applying element-wise.
+    close(shown(&mut env, "max(v) ="), 9.0, Dim::ONE);
+    close(shown(&mut env, "min(v, 1) ="), 1.0, Dim::ONE);
 }
 
 #[test]
@@ -857,4 +857,187 @@ fn nested_indexes_are_bounded_not_a_stack_overflow() {
         assert_eq!(eval_expr(&env, &matrices(3000)), Err(CalcError::TooComplex));
     };
     std::thread::Builder::new().stack_size(4 << 20).spawn(deep).expect("spawns").join().expect("no panic");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Array functions
+// ---------------------------------------------------------------------------------------------
+
+/// `q` is close to `want`, dimension and value.
+fn close_to(q: Quantity, want: Quantity) {
+    close(q, want.value, want.dim);
+}
+
+/// One value in `unit`, as an SI quantity.
+fn quantity(value: f64, unit: &str) -> Quantity {
+    quantities(&[value], unit).into_iter().next().expect("one quantity")
+}
+
+/// An env holding `NPS := [0.5, 0.75, 1, 1.5] in` and the flange torques
+/// `T := [30, 45, 60, 90] ft·lbf`.
+fn flanges() -> Env {
+    let mut env = Env::new();
+    run(&mut env, "NPS := [0.5, 0.75, 1, 1.5] in").expect("defines NPS");
+    run(&mut env, "T := [30, 45, 60, 90] ft·lbf").expect("defines T");
+    env
+}
+
+#[test]
+fn size_functions() {
+    let mut env = Env::new();
+    run(&mut env, "M := [1, 2; 3, 4; 5, 6]").expect("defines M");
+    close(shown(&mut env, "length(M) ="), 6.0, Dim::ONE);
+    close(shown(&mut env, "rows(M) ="), 3.0, Dim::ONE);
+    close(shown(&mut env, "cols(M) ="), 2.0, Dim::ONE);
+    close(shown(&mut env, "length(5 in) ="), 1.0, Dim::ONE);
+    assert_eq!(run(&mut env, "length(M, M) ="), Err(CalcError::Arity("length".into(), 1)));
+}
+
+#[test]
+fn reductions() {
+    let mut env = pipes(0);
+    close(shown(&mut env, "min([3, 1, 2] in) ="), INCH, Dim::LENGTH);
+    close(shown(&mut env, "max(D, 2 in) ="), 2.0 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "max(D) ="), 1.315 * INCH, Dim::LENGTH);
+    close_to(shown(&mut env, "sum([1, 2] lbf) ="), quantity(3.0, "lbf"));
+    close(shown(&mut env, "mean([1, 2, 3] in) ="), 2.0 * INCH, Dim::LENGTH);
+    assert!(matches!(run(&mut env, "min([1 in, 2 lbf]) ="), Err(CalcError::Unit(_))));
+    assert!(matches!(run(&mut env, "sum([1 in, 2 lbf]) ="), Err(CalcError::Unit(_))));
+    assert_eq!(run(&mut env, "sum(D, D) ="), Err(CalcError::Arity("sum".into(), 1)));
+}
+
+#[test]
+fn products() {
+    let mut env = Env::new();
+    close_to(shown(&mut env, "dot([1, 2] in, [3, 4] lbf) ="), quantity(11.0, "lbf·in"));
+    let (shape, items) = grid(&mut env, "mmul([1, 2; 3, 4], [5; 6]) =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[17.0, 39.0], Dim::ONE);
+    assert!(matches!(run_value(&mut env, "mmul([1, 2, 3; 4, 5, 6], [1, 2, 3; 4, 5, 6]) ="), Err(CalcError::Shape { .. })));
+    let (shape, items) = grid(&mut env, "transpose([1, 2, 3]) =");
+    assert_eq!(shape, (1, 3));
+    close_all(&items, &[1.0, 2.0, 3.0], Dim::ONE);
+    let (shape, items) = grid(&mut env, "transpose([1, 2; 3, 4; 5, 6]) =");
+    assert_eq!(shape, (2, 3));
+    close_all(&items, &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0], Dim::ONE);
+    assert_eq!(syntax_msg(run(&mut env, "dot([1, 2], [1, 2, 3]) =").expect_err("lengths")), "dot needs a and b of the same length (2 and 3)");
+}
+
+#[test]
+fn lookup_is_exact() {
+    let mut env = flanges();
+    let t90 = quantity(90.0, "ft·lbf");
+    assert_eq!(shown(&mut env, "lookup(NPS, T, 1.5 in) ="), t90);
+    close_to(shown(&mut env, "lookup(NPS, T, 38.1 mm) ="), t90);
+    assert_eq!(run(&mut env, "lookup(NPS, T, 2 in) ="), Err(CalcError::Syntax("2 in isn't in NPS".into())));
+    // A vector x gives one result per element; a miss names the element.
+    let (shape, items) = grid(&mut env, "lookup(NPS, T, [0.5, 1] in) =");
+    assert_eq!(shape, (2, 1));
+    assert_eq!(items, vec![quantity(30.0, "ft·lbf"), quantity(60.0, "ft·lbf")]);
+    let e = run_value(&mut env, "lookup(NPS, T, [0.5, 0.6] in) =").expect_err("0.6 in isn't a size");
+    assert_eq!(e.to_string(), "element 1: 0.6 in isn't in NPS");
+    assert!(matches!(run(&mut env, "lookup(NPS, T, 1 lbf) ="), Err(CalcError::Unit(UnitError::Mismatch { .. }))));
+}
+
+#[test]
+fn linterp_and_spline_never_extrapolate() {
+    let mut env = flanges();
+    close_to(shown(&mut env, "linterp(NPS, T, 1.25 in) ="), quantity(75.0, "ft·lbf"));
+    close_to(shown(&mut env, "linterp(NPS, T, 38.1 mm) ="), quantity(90.0, "ft·lbf"));
+    for f in ["linterp", "spline"] {
+        let outside = run(&mut env, &format!("{f}(NPS, T, 1.6 in) =")).expect_err("past the end");
+        assert_eq!(outside, CalcError::Syntax("1.6 in is outside NPS (0.5 in to 1.5 in)".into()), "{f}");
+        let below = run(&mut env, &format!("{f}(NPS, T, 0.25 in) =")).expect_err("before the start");
+        assert_eq!(below, CalcError::Syntax("0.25 in is outside NPS (0.5 in to 1.5 in)".into()), "{f}");
+    }
+    column(&mut env, "X", &[0.0, 1.0, 2.0, 3.0, 4.0], "1");
+    column(&mut env, "L", &[1.0, 3.0, 5.0, 7.0, 9.0], "1");
+    column(&mut env, "S", &[0.0, 1.0, 4.0, 9.0, 16.0], "1");
+    // A natural spline reproduces a line exactly.
+    assert_eq!(shown(&mut env, "spline(X, L, 1.5) ="), Quantity::dimensionless(4.0));
+    // Through y = x², it gives the knot values at the knots and lies between neighbours elsewhere.
+    for k in 0..5 {
+        assert_eq!(shown(&mut env, &format!("spline(X, S, {k}) =")).value, f64::from(k * k), "x = {k}");
+    }
+    let between = shown(&mut env, "spline(X, S, 1.5) =").value;
+    assert!(between > 1.0 && between < 4.0, "{between}");
+    // A vector x gives one result per element.
+    let (shape, items) = grid(&mut env, "spline(X, L, [0.5, 1.5, 2.5]) =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[2.0, 4.0, 6.0], Dim::ONE);
+    let (shape, items) = grid(&mut env, "linterp(NPS, T, [0.5, 1.25] in) =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[quantity(30.0, "ft·lbf").value, quantity(75.0, "ft·lbf").value], quantity(1.0, "ft·lbf").dim);
+    let e = run_value(&mut env, "linterp(NPS, T, [1, 1.6] in) =").expect_err("1.6 in is past the end");
+    assert_eq!(e.to_string(), "element 1: 1.6 in is outside NPS (0.5 in to 1.5 in)");
+}
+
+#[test]
+fn interp_needs_increasing_xs() {
+    let mut env = flanges();
+    column(&mut env, "NPS_2", &[0.5, 1.0, 1.0, 1.5], "in");
+    column(&mut env, "T_3", &[30.0, 45.0, 60.0], "ft·lbf");
+    for f in ["linterp", "spline"] {
+        let e = run(&mut env, &format!("{f}(NPS_2, T, 1.25 in) =")).expect_err("not increasing");
+        assert_eq!(syntax_msg(e), format!("{f} needs NPS_2 strictly increasing — element 2 isn't more than element 1"));
+        let e = run(&mut env, &format!("{f}(NPS, T_3, 1 in) =")).expect_err("lengths differ");
+        assert_eq!(syntax_msg(e), format!("{f} needs NPS and T_3 of the same length (4 and 3)"));
+    }
+    let e = run(&mut env, "lookup(NPS, T_3, 1 in) =").expect_err("lengths differ");
+    assert_eq!(syntax_msg(e), "lookup needs NPS and T_3 of the same length (4 and 3)");
+    // An argument that isn't a bare name is called by what it is.
+    let e = run(&mut env, "lookup([1, 2, 3, 4], [1, 2, 3], 1) =").expect_err("lengths differ");
+    assert_eq!(syntax_msg(e), "lookup needs xs and ys of the same length (4 and 3)");
+    let e = run(&mut env, "linterp([1, 3, 2], [1, 2, 3], 1.5) =").expect_err("not increasing");
+    assert_eq!(syntax_msg(e), "linterp needs xs strictly increasing — element 2 isn't more than element 1");
+}
+
+#[test]
+fn new_function_names_are_reserved() {
+    for name in ["sum", "length", "rows", "cols", "mean", "dot", "mmul", "transpose", "lookup", "linterp", "spline"] {
+        assert_eq!(check_name(name), Err(CalcError::ReservedName(name.into())), "{name}");
+    }
+}
+
+#[test]
+fn products_are_bounded() {
+    let stmt = |src: &str| parse(src).expect("parses");
+    let mut env = Env::new();
+    env.define_array("C", 10_000, 1, vec![Quantity::dimensionless(1.0); 10_000]).expect("defines C");
+    env.define_array("R", 1, 10_000, vec![Quantity::dimensionless(1.0); 10_000]).expect("defines R");
+    // 10,000 × 10,000 elements: too large, before any of the product is worked out. The pass has
+    // paid only for the three nodes and for reading C and R.
+    let pass = Pass::new(u64::MAX);
+    assert_eq!(run_stmt_in(&mut env, &stmt("p := mmul(C, R)"), &pass), Err(CalcError::TooLarge));
+    assert_eq!(pass.spent.get(), 3 + 20_000);
+    // A product charges rows · cols · inner.
+    env.define_array("A", 2, 3, vec![Quantity::dimensionless(1.0); 6]).expect("defines A");
+    env.define_array("B", 3, 2, vec![Quantity::dimensionless(1.0); 6]).expect("defines B");
+    let pass = Pass::new(u64::MAX);
+    run_stmt_in(&mut env, &stmt("q := mmul(A, B)"), &pass).expect("runs");
+    assert_eq!(pass.spent.get(), 3 + 12 + 2 * 2 * 3);
+    // One element, but 10,000 products to sum.
+    let pass = Pass::new(u64::MAX);
+    run_stmt_in(&mut env, &stmt("r := mmul(R, C)"), &pass).expect("runs");
+    assert_eq!(pass.spent.get(), 3 + 20_000 + 10_000);
+    assert_eq!(run_stmt_in(&mut env, &stmt("r := mmul(R, C)"), &Pass::new(25_000)), Err(CalcError::TooMuchWork));
+}
+
+#[test]
+fn array_messages_use_the_display_format() {
+    let mut env = flanges();
+    env.set_display(UnitSystem::Si, Precision::new(4));
+    let e = run(&mut env, "linterp(NPS, T, 1.6 in) =").expect_err("past the end");
+    assert_eq!(syntax_msg(e), "0.0406 m is outside NPS (0.0127 m to 0.0381 m)");
+}
+
+#[test]
+fn reductions_of_temperatures_keep_what_they_stand_for() {
+    let mut env = Env::new();
+    // The smallest, largest or mean of temperatures is one; a sum isn't.
+    for src in ["min([300 K, 310 K]) = ? °C", "max([300 K, 310 K], 305 K) = ? °C", "mean([300 K, 310 K]) = ? °C"] {
+        assert!(run(&mut env, src).is_ok(), "{src}");
+    }
+    assert_eq!(run(&mut env, "sum([300 K, 310 K]) = ? °C"), Err(CalcError::NotAbsolute("°C".into())));
+    assert_eq!(run(&mut env, "max([300 K, 310 K], 5 Δ°C) = ? °C"), Err(CalcError::NotAbsolute("°C".into())));
 }

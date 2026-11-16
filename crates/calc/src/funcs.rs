@@ -3,15 +3,19 @@
 use crate::CalcError;
 use craft_units::{Dim, Quantity, UnitError};
 
-/// Every built-in function name.
+/// Every scalar built-in function name (`min` and `max` also reduce grids, in
+/// [`crate::array_funcs`]).
 const BUILTINS: &[&str] = &[
     "sqrt", "abs", "exp", "ln", "log", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "min", "max", "round", "floor",
     "ceil", "mod",
 ];
 
-/// Whether `name` is a built-in function.
+/// The array functions' names: built-ins that take whole grids ([`crate::array_funcs`]).
+const ARRAY_BUILTINS: &[&str] = &["length", "rows", "cols", "sum", "mean", "dot", "mmul", "transpose", "lookup", "linterp", "spline"];
+
+/// Whether `name` is a built-in function, scalar or array.
 pub(crate) fn is_builtin(name: &str) -> bool {
-    BUILTINS.contains(&name)
+    BUILTINS.contains(&name) || ARRAY_BUILTINS.contains(&name)
 }
 
 /// Call the built-in `name` on evaluated arguments, or `None` when there is no such built-in.
@@ -52,7 +56,8 @@ fn dispatch(name: &str, args: &[Quantity]) -> Result<Quantity, CalcError> {
         "max" => extreme(name, args, f64::max),
         "round" => round(args),
         "mod" => modulo(args),
-        // `call` only dispatches names in `BUILTINS`.
+        // `call` only dispatches built-in names, and the evaluator sends the array functions to
+        // `array_funcs` instead.
         _ => Err(CalcError::Undefined(name.to_string())),
     }
 }

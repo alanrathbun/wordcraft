@@ -10,12 +10,14 @@
 //! the recalculation's work. A grid is written as a literal (`[1, 2; 3, 4]`), as a range
 //! (`i := 0..5`, which may only define a variable), or element by element in an indexed definition
 //! (`t[i] := 2·D[i]`); an element is read by index (`D[2]`, `M[1, 0]`), counted from the
-//! document's origin.
+//! document's origin. The array functions (`length`, `sum`, `mmul`, `lookup`, `linterp`…, see
+//! [`crate::array_funcs`]) take whole grids rather than applying element by element.
 
 use crate::array::{self, Data, Grid, MAX_ELEMENTS};
+use crate::array_funcs;
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, Op, Show, Stmt, Value};
-use craft_units::{Dim, Quantity, Scale, UnitError, lookup, parse_unit};
+use craft_units::{Dim, Precision, Quantity, Scale, UnitError, UnitSystem, lookup, parse_unit};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
@@ -64,7 +66,7 @@ pub(crate) struct Val {
 }
 
 impl Val {
-    fn plain(q: Quantity) -> Val {
+    pub(crate) fn plain(q: Quantity) -> Val {
         Val { q, t: Temp::Plain }
     }
 }
@@ -92,6 +94,10 @@ pub struct Env {
     g_is_gravity: bool,
     /// What an array's first element is numbered: 0 (Mathcad's convention) or 1.
     origin: u8,
+    /// The unit system values in messages are shown in (`1.6 in is outside NPS …`).
+    system: UnitSystem,
+    /// The decimal places values in messages are shown with.
+    precision: Precision,
 }
 
 impl Env {
@@ -124,6 +130,13 @@ impl Env {
     /// else is 0.
     pub fn set_origin(&mut self, origin: u8) {
         self.origin = if origin == 1 { 1 } else { 0 };
+    }
+
+    /// Show values in messages as the document shows results: in `system`'s units, to
+    /// `precision` decimal places (US customary to 3 places until this is called).
+    pub fn set_display(&mut self, system: UnitSystem, precision: Precision) {
+        self.system = system;
+        self.precision = precision.clamped();
     }
 
     /// Define a variable (not an absolute temperature: see [`Temp`]).
@@ -846,7 +859,13 @@ fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) ->
     if !funcs::is_builtin(name) {
         return if is_constant(name) || lookup(name).is_some() { Err(not_callable(name)) } else { Err(CalcError::Undefined(name.to_string())) };
     }
-    let args = eval_args(cx, fr, args, depth)?;
+    let exprs = args;
+    let args = eval_args(cx, fr, exprs, depth)?;
+    let env = cx.env;
+    let acx = array_funcs::Ctx { origin: env.origin, pass: cx.pass, system: env.system, precision: env.precision };
+    if let Some(result) = array_funcs::call_array(name, &args, exprs, &acx) {
+        return result;
+    }
     let values: Vec<Val> = args.iter().filter_map(|a| if let Data::One(v) = a { Some(*v) } else { None }).collect();
     if values.len() < args.len() {
         return call_each(cx, name, &args);
@@ -854,23 +873,27 @@ fn call(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, args: &[Expr], depth: usize) ->
     let quantities: Vec<Quantity> = values.iter().map(|v| v.q).collect();
     let q = funcs::call(name, &quantities).unwrap_or_else(|| Err(CalcError::Undefined(name.to_string())))?;
     // The smaller or larger of absolute temperatures is one of them; any other result is plain.
-    let picks = matches!(name, "min" | "max") && !values.is_empty() && values.iter().all(|v| v.t != Temp::Plain);
-    let t = if !picks {
+    let t = if matches!(name, "min" | "max") { picked(&values) } else { Temp::Plain };
+    Ok(Data::One(Val { q, t }))
+}
+
+/// What a value picked from `values` (their smallest, largest, or one between them) stands for
+/// as a temperature: absolute when they are all temperatures and one is absolute, a bare `K`
+/// temperature when they all are, and plain otherwise (and for no values).
+pub(crate) fn picked(values: &[Val]) -> Temp {
+    if values.is_empty() || values.iter().any(|v| v.t == Temp::Plain) {
         Temp::Plain
     } else if values.iter().any(|v| v.t == Temp::Absolute) {
         Temp::Absolute
     } else {
         Temp::Either
-    };
-    Ok(Data::One(Val { q, t }))
+    }
 }
 
-/// A built-in called with a grid among its arguments: applied element by element over every
-/// argument, a single value broadcast. The result of each is not an absolute temperature.
+/// A scalar built-in called with a grid among its arguments: applied element by element over
+/// every argument, a single value broadcast. The result of each is not an absolute temperature.
+/// (`min`, `max` and the array functions take whole grids, in [`array_funcs::call_array`].)
 fn call_each(cx: &Cx<'_>, name: &str, args: &[Data]) -> Result<Data, CalcError> {
-    if matches!(name, "min" | "max") {
-        return Err(CalcError::Syntax(format!("{name} takes single values, not arrays")));
-    }
     let builtin = |qs: &[Quantity]| funcs::call(name, qs).unwrap_or_else(|| Err(CalcError::Undefined(name.to_string()))).map(Val::plain);
     // The number of arguments is checked once, before any element: not "element 0: sqrt expects 1".
     let firsts: Vec<Quantity> = args.iter().filter_map(first).map(|v| v.q).collect();
@@ -880,8 +903,8 @@ fn call_each(cx: &Cx<'_>, name: &str, args: &[Data]) -> Result<Data, CalcError> 
     match args {
         [x] => each(cx, x, |x| builtin(&[x.q])),
         [x, y] => pair(cx, x, y, |x, y| builtin(&[x.q, y.q])),
-        // Every built-in but `min` and `max` takes one or two arguments, so the check above
-        // reported any other count.
+        // Every scalar built-in but `min` and `max` (which never get here) takes one or two
+        // arguments, so the check above reported any other count.
         _ => Err(CalcError::Arity(name.to_string(), 2)),
     }
 }
