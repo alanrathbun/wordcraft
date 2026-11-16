@@ -282,3 +282,26 @@ fn a_comparison_result_reads_back() {
     assert!(d.linear.contains("a==1=1"), "{}", d.linear);
     assert_eq!(shown_result(&d.linear), Some(one));
 }
+
+#[test]
+fn looser_operators_keep_their_parentheses_as_operands() {
+    let lin = |src: &str| display_of(src, None).linear;
+    // Left and right of a sum.
+    assert!(lin("c := (a < b) + 1").contains("(a<b)+1"));
+    assert!(lin("c := (x > 0) + (y > 0)").contains("(x>0)+(y>0)"));
+    assert!(lin("c := (p or q) - 1").contains("(p∨q)-1"));
+    assert!(lin("c := (not p) - 1").contains("(¬p)-1"));
+    assert!(lin("c := 1 + (a < b)").contains("1+(a<b)"));
+    // Products, quotients, powers, negation, roots, calls, indexes and absolute values.
+    assert!(lin("c := (a < b)·2").contains("(a<b)·2"));
+    assert!(lin("c := 2·(a < b)").contains("(a<b)"));
+    assert!(lin("c := (a < b)/2").contains("(a<b)/2"));
+    assert!(lin("c := 2/(a < b)").contains("2/(a<b)"));
+    assert!(lin("c := (a < b)^2").contains("(a<b)^2"));
+    assert!(lin("c := 2^(a < b)").contains("2^(a<b)"));
+    assert!(lin("c := -(a < b)").contains("-(a<b)"));
+    assert!(lin("c := √(a < b)").contains("√(a<b)"));
+    assert!(lin("c := f(a < b, p or q)").contains("(a<b,p∨q)"));
+    assert!(lin("c := D[a < b]").contains("(a<b)"));
+    assert!(lin("c := |a < b|").contains("|a<b|"));
+}

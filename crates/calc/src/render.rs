@@ -1040,7 +1040,9 @@ fn write_expr(root: &Expr, out: &mut Out) {
                 Op::Add | Op::Sub | Op::Neg => {
                     wrap(&mut todo, b, prec(b) <= SUM || matches!(&**b, Expr::Unary(..)));
                     todo.push(Step::Text(if *op == Op::Add { "+" } else { "-" }));
-                    todo.push(Step::Expr(a));
+                    // A comparison, `not`, `and` or `or` is looser than a sum, so on the left it
+                    // keeps its parentheses too: `(a < b) + 1`.
+                    wrap(&mut todo, a, prec(a) < SUM);
                 }
                 Op::Mul => {
                     // A quotient on the right needs no parentheses: UnicodeMath's numerator stops

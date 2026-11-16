@@ -220,3 +220,66 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
     }
     out
 }
+
+/// The keywords a statement uses as operators, without duplicates, in order of first use: `and`,
+/// `or` and `not` for now. A document that also defines one of these words as a name (written
+/// before the word became a keyword) has changed meaning, which [`crate::recalc`] reports.
+pub(crate) fn keywords_used(s: &Stmt) -> Vec<&'static str> {
+    let body = match s {
+        Stmt::Define { body, .. } => body,
+        Stmt::Eval { expr, .. } => expr,
+    };
+    let mut out: Vec<&'static str> = Vec::new();
+    // An explicit stack keeps this safe on trees built by hand, deeper than the parser allows.
+    let mut stack: Vec<&Expr> = vec![body];
+    while let Some(e) = stack.pop() {
+        let word = match e {
+            Expr::Num(_) | Expr::Text(_) | Expr::Name(_) | Expr::Quantity(..) => None,
+            Expr::Unary(_, a) | Expr::Abs(a) => {
+                stack.push(a);
+                None
+            }
+            Expr::Not(a) => {
+                stack.push(a);
+                Some("not")
+            }
+            Expr::Binary(_, a, b) => {
+                stack.push(b);
+                stack.push(a);
+                None
+            }
+            Expr::Logic(logic, a, b) => {
+                stack.push(b);
+                stack.push(a);
+                Some(if *logic == Logic::And { "and" } else { "or" })
+            }
+            Expr::Compare { first, rest } => {
+                stack.extend(rest.iter().rev().map(|(_, e)| e));
+                stack.push(first);
+                None
+            }
+            Expr::Call(_, args) | Expr::Index(_, args) => {
+                stack.extend(args.iter().rev());
+                None
+            }
+            Expr::Matrix { items, .. } => {
+                stack.extend(items.iter().rev());
+                None
+            }
+            Expr::Range { first, second, last } => {
+                stack.push(last);
+                if let Some(second) = second {
+                    stack.push(second);
+                }
+                stack.push(first);
+                None
+            }
+        };
+        if let Some(word) = word
+            && !out.contains(&word)
+        {
+            out.push(word);
+        }
+    }
+    out
+}

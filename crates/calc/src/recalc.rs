@@ -22,6 +22,7 @@ use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph, Row, Table};
 
 use crate::array::{self, Data};
+use crate::ast::keywords_used;
 use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, check_element, run_stmt_in};
 use crate::render::{self, MAX_SHOWN_COLS, MAX_SHOWN_ROWS, Rendered, Shown, rendered, shown_result, shows_value};
 use crate::tables;
@@ -801,6 +802,27 @@ impl Index {
                 *slot = error;
             }
         }
+        // A word that is a keyword now but that a definition tries to use as a name (a document
+        // from before it was a keyword): every calculation using it as an operator fails with the
+        // word named, rather than quietly changing meaning.
+        let defined_words: Vec<&str> = parsed
+            .iter()
+            .filter_map(|s| match s {
+                Err(CalcError::Keyword(word)) => Some(word.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !defined_words.is_empty() {
+            for (i, stmt) in parsed.iter().enumerate() {
+                let edited = regions.get(i).is_some_and(|r| r.state == CalcState::EditedOutside);
+                let word = stmt.as_ref().ok().filter(|_| !edited).and_then(|s| keywords_used(s).into_iter().find(|w| defined_words.contains(w)));
+                if let (Some(word), Some(slot)) = (word, early.get_mut(i))
+                    && slot.is_none()
+                {
+                    *slot = Some(CalcError::Keyword(word.to_string()));
+                }
+            }
+        }
         let edited = regions.iter().map(|r| r.state == CalcState::EditedOutside).chain(columns.iter().map(|_| false)).collect();
         let precision = regions.iter().map(|r| r.precision).chain(columns.iter().map(|_| None)).collect();
         let mut index = Index { parsed, early, owners, edited, precision, names, regions: regions.len(), columns, order };
@@ -890,9 +912,18 @@ fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<b
         }
     };
     // A data table's column whose values don't read, but which owns its name, has failed already.
-    for (i, node) in nodes.iter_mut().enumerate().skip(index.regions) {
-        if node.outcome.is_some() {
+    for (i, node) in nodes.iter_mut().enumerate() {
+        if node.outcome.is_none() {
+            continue;
+        }
+        if !index.is_region(i) {
             node.table = true;
+            fail(&mut env, node, i);
+        } else if let Some(Some(name)) = index.names.get(i)
+            && index.owners.get(name) == Some(&i)
+        {
+            // A region that owns its name but failed before running (it uses a word that another
+            // definition tries to name): using its name is an upstream error.
             fail(&mut env, node, i);
         }
     }

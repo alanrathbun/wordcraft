@@ -1922,3 +1922,44 @@ fn a_reserved_word_name_fails_alone() {
     assert_eq!(region(&d, 2).0.state, CalcState::Error("or is a reserved word — choose another name".into()));
     assert_eq!(region(&d, 3).0.state, CalcState::Fresh);
 }
+
+#[test]
+fn a_use_of_a_word_defined_as_a_name_fails_with_the_word() {
+    let word = |w: &str| err(CalcError::Keyword(w.into()));
+    // `or` and `not` defined as names (before they were keywords): every use as an operator fails.
+    let mut d = doc_with(&["or := 2", "not := 3", "a := 1", "b := 0", "x := a or b =", "y := not b =", "z := a and b =", "w := a + b ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 5).0.state, word("or"));
+    assert_eq!(region(&d, 6).0.state, word("not"));
+    // `and` is not defined as a name here.
+    assert_eq!(region(&d, 7).0.state, CalcState::Fresh);
+    assert_eq!(region(&d, 8).0.state, CalcState::Fresh);
+    // Anything built on a failed calculation is upstream, as ever.
+    let mut d = doc_with(&["or := 2", "a := 1", "b := 0", "x := a or b", "c := x + 1 ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 4).0.state, word("or"));
+    assert_eq!(region(&d, 5).0.state, err(CalcError::Upstream));
+    // The same document with no such definition computes.
+    let mut d = doc_with(&["a := 1", "b := 0", "x := a or b =", "y := not b ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 3).0.state, CalcState::Fresh);
+    assert!(region(&d, 3).1.ends_with("=1"), "{}", region(&d, 3).1);
+    assert_eq!(region(&d, 4).0.state, CalcState::Fresh);
+    assert!(region(&d, 4).1.ends_with("=1"), "{}", region(&d, 4).1);
+}
+
+#[test]
+fn a_function_parameter_that_is_a_word_fails_its_uses() {
+    let mut d = doc_with(&["f(or) := or + 1", "a := 1", "x := a or 0 ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, err(CalcError::Keyword("or".into())));
+    assert_eq!(region(&d, 3).0.state, err(CalcError::Keyword("or".into())));
+}
+
+#[test]
+fn a_data_table_heading_that_is_a_word_fails_its_uses() {
+    let mut d = doc_of(vec![table_block(data_table(1, &[&["not", "x"], &["1", "2"]]))]);
+    d.body.push(Arc::new(Block::Para(para(vec![calc_eq(1, "y := not 0 =")]))));
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, err(CalcError::Keyword("not".into())));
+}
