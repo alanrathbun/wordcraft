@@ -22,7 +22,7 @@ use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph, Row, Table};
 
 use crate::array::{self, Data};
-use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, check_element, run_stmt_in};
+use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, check_element, run_stmt_in, text_use};
 use crate::render::{self, MAX_SHOWN_COLS, MAX_SHOWN_ROWS, Rendered, Shown, rendered, shown_result, shows_value};
 use crate::tables;
 use crate::{CalcError, Env, Stmt, check_name, defined_name, free_names, parse};
@@ -1101,6 +1101,8 @@ fn format_data(d: &Data, unit: Option<&str>, sys: UnitSystem, p: Precision, orig
             })?;
             Ok(Shown::Grid { rows, cols, items, unit, total_rows: g.rows, total_cols: g.cols })
         }
+        // Showing text is a later step.
+        Data::Text(_) | Data::TextGrid(_) => Err(text_use(d.text().unwrap_or_default(), "in a display")),
     }
 }
 
@@ -1155,6 +1157,8 @@ fn field_result(f: &FoundField, index: &Index, env: &Env, failed: &[bool], setti
             Err(_) => "?".to_string(),
         },
         Data::Grid(g) => quoted_list(g, unit, sys, p).unwrap_or_else(|| "?".to_string()),
+        // Showing text is a later step.
+        Data::Text(_) | Data::TextGrid(_) => "?".to_string(),
     }
 }
 

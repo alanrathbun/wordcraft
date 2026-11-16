@@ -439,7 +439,7 @@ fn quantity_variant_is_never_produced() {
     fn has_quantity(e: &Expr) -> bool {
         match e {
             Expr::Quantity(..) => true,
-            Expr::Num(_) | Expr::Name(_) => false,
+            Expr::Num(_) | Expr::Text(_) | Expr::Name(_) => false,
             Expr::Unary(_, a) | Expr::Abs(a) => has_quantity(a),
             Expr::Binary(_, a, b) => has_quantity(a) || has_quantity(b),
             Expr::Call(_, args) | Expr::Index(_, args) => args.iter().any(has_quantity),
@@ -638,4 +638,14 @@ fn error_messages() {
     );
     assert_eq!(CalcError::Circular("a, b".into()).to_string(), "a, b depend on each other");
     assert_eq!(CalcError::from(craft_units::UnitError::Overflow).to_string(), "dimension exponent overflow");
+}
+
+#[test]
+fn text_literals() {
+    assert_eq!(body_of("c := \"OK\""), Expr::Text("OK".into()));
+    assert_eq!(body_of("c := “Use Schedule 80”"), Expr::Text("Use Schedule 80".into()));
+    assert_eq!(body_of("c := [\"A\", \"B\"]"), Expr::Matrix { rows: 2, cols: 1, items: vec![Expr::Text("A".into()), Expr::Text("B".into())] });
+    assert_eq!(parse("c := \"OK").unwrap_err().to_string(), "a text needs a closing quote, like \"OK\"");
+    assert_eq!(parse(&format!("c := \"{}\"", "x".repeat(1001))).unwrap_err().to_string(), "a text is at most 1,000 characters");
+    assert!(parse("c := 2 \"OK\"").is_err(), "text never multiplies by adjacency");
 }

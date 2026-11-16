@@ -1,4 +1,4 @@
-use super::{Env, Pass, check_name, eval_expr, run_stmt, run_stmt_in};
+use super::{Env, Pass, Val, check_name, eval_expr, run_stmt, run_stmt_in};
 use crate::array::{Grid, element_name};
 use crate::{CalcError, Expr, Op, Value, parse};
 use craft_units::{Dim, Precision, Quantity, UnitError, UnitSystem, format};
@@ -601,11 +601,11 @@ fn arrays_are_bounded() {
     assert_eq!(e.to_string(), "more than 10,000 elements");
     assert!(env.define_array("big", 100, 101, Vec::new()).is_err_and(|e| e == CalcError::TooLarge));
     // The cap is checked before the size, and an overflowing shape is too large rather than a panic.
-    assert_eq!(Grid::new(101, 100, Vec::new()), Err(CalcError::TooLarge));
-    assert_eq!(Grid::new(usize::MAX, 2, Vec::new()), Err(CalcError::TooLarge));
+    assert_eq!(Grid::<Val>::new(101, 100, Vec::new()), Err(CalcError::TooLarge));
+    assert_eq!(Grid::<Val>::new(usize::MAX, 2, Vec::new()), Err(CalcError::TooLarge));
     // A size that doesn't match the shape, or no elements at all, is refused.
-    assert!(Grid::new(2, 2, Vec::new()).is_err());
-    assert!(Grid::new(0, 1, Vec::new()).is_err());
+    assert!(Grid::<Val>::new(2, 2, Vec::new()).is_err());
+    assert!(Grid::<Val>::new(0, 1, Vec::new()).is_err());
     // 10,000 is allowed, and so is arithmetic on it.
     column(&mut env, "D", &vec![1.0; 10_000], "in");
     assert_eq!(grid(&mut env, "D + D =").0, (10_000, 1));
@@ -1113,4 +1113,60 @@ fn array_messages_always_show_a_unit() {
     // 10^307 m is too many inches to show: it shows in metres rather than as a bare number.
     let e = run(&mut env, "linterp(NPS, T, 10^307 m) =").expect_err("past the end");
     assert_eq!(syntax_msg(e), "1×10³⁰⁷ m is outside NPS (0.5 in to 1.5 in)");
+}
+
+#[test]
+fn text_values() {
+    let mut env = Env::new();
+    assert_eq!(run_value(&mut env, "c := \"OK\" ="), Ok(Some(Value::Text("OK".into()))));
+    assert_eq!(
+        run_value(&mut env, "v := [\"A\", \"B\"; \"C\", \"D\"] ="),
+        Ok(Some(Value::TextGrid { rows: 2, cols: 2, items: vec!["A".into(), "B".into(), "C".into(), "D".into()] }))
+    );
+    assert_eq!(run_value(&mut env, "v[1, 0] ="), Ok(Some(Value::Text("C".into()))));
+    run_value(&mut env, "w := transpose(v)").unwrap();
+    assert_eq!(run_value(&mut env, "w[0, 1] ="), Ok(Some(Value::Text("C".into()))));
+    assert_eq!(val("length([\"A\", \"B\", \"C\"]) ="), Quantity::dimensionless(3.0));
+    assert_eq!(err("\"OK\" + 1 =").to_string(), "\"OK\" is text — it can't be used in arithmetic");
+    assert_eq!(err("-\"OK\" =").to_string(), "\"OK\" is text — it can't be used in arithmetic");
+    assert_eq!(err("sqrt(\"OK\") =").to_string(), "\"OK\" is text — it can't be used in sqrt");
+    assert_eq!(err("sum([\"A\", \"B\"]) =").to_string(), "\"A\" is text — it can't be used in sum");
+    assert_eq!(err("\"OK\" = ? in").to_string(), "\"OK\" is text — it can't be used with a unit");
+    assert_eq!(err("[\"A\", 2] =").to_string(), "element 1 is a number but element 0 is text");
+    let long = "y".repeat(60);
+    assert_eq!(err(&format!("\"{long}\" + 1 =")).to_string(), format!("\"{}…\" is text — it can't be used in arithmetic", "y".repeat(40)));
+    // Functions pass text through; indexed definitions build text vectors.
+    run_value(&mut env, "label(x) := \"size\"").unwrap();
+    assert_eq!(run_value(&mut env, "label(2) ="), Ok(Some(Value::Text("size".into()))));
+}
+
+#[test]
+fn text_in_vectors_and_other_places() {
+    let mut env = Env::new();
+    run_value(&mut env, "i := 0..2").unwrap();
+    run_value(&mut env, "t[i] := \"n\"").unwrap();
+    assert_eq!(run_value(&mut env, "t ="), Ok(Some(Value::TextGrid { rows: 3, cols: 1, items: vec!["n".into(), "n".into(), "n".into()] })));
+    // A user function maps text through its parameter, and an element can be read back.
+    run_value(&mut env, "id(x) := x").unwrap();
+    assert_eq!(run_value(&mut env, "id(\"A\") ="), Ok(Some(Value::Text("A".into()))));
+    // Numbers and text never share a vector.
+    let mixed = |env: &mut Env, src: &str| run_value(env, src).unwrap_err().to_string();
+    assert_eq!(mixed(&mut env, "[1, \"A\"] ="), "element 1 is text but element 0 is a number");
+    assert_eq!(mixed(&mut env, "[1, 2; 3, \"A\"] ="), "element [1, 1] is text but element [0, 0] is a number");
+    // Other places that need a number.
+    assert_eq!(mixed(&mut env, "r := \"A\"..3"), "\"A\" is text — it can't be used in a range");
+    assert_eq!(mixed(&mut env, "max([\"B\", \"A\"]) ="), "\"B\" is text — it can't be used in max");
+    assert_eq!(mixed(&mut env, "mmul([\"B\"], [1]) ="), "\"B\" is text — it can't be used in mmul");
+    assert_eq!(mixed(&mut env, "|\"A\"| ="), "\"A\" is text — it can't be used in arithmetic");
+    assert_eq!(mixed(&mut env, "[\"A\", \"B\"] + 1 ="), "\"A\" is text — it can't be used in arithmetic");
+    assert_eq!(mixed(&mut env, "[t, t] ="), "a matrix element can't be a vector");
+    assert_eq!(val("rows([\"A\", \"B\"; \"C\", \"D\"]) ="), Quantity::dimensionless(2.0));
+    assert_eq!(val("cols([\"A\", \"B\"; \"C\", \"D\"]) ="), Quantity::dimensionless(2.0));
+    // Indexing text that isn't a vector, and past the end, are the usual index errors.
+    run_value(&mut env, "c := \"OK\"").unwrap();
+    assert_eq!(mixed(&mut env, "c[0] ="), "c isn't a vector");
+    assert_eq!(mixed(&mut env, "t[3] ="), "index 3 is outside t (0 to 2)");
+    // The error for a mix names the later element first, counted from the origin.
+    assert_eq!(crate::array::mixed(2, 1, 1, 0, 1).to_string(), "element 2 is text but element 1 is a number");
+    assert_eq!(crate::array::mixed(2, 1, 0, 1, 0).to_string(), "element 1 is a number but element 0 is text");
 }

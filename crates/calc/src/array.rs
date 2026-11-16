@@ -6,24 +6,27 @@
 //! whole result an error naming that element. A grid holds at most [`MAX_ELEMENTS`], checked before
 //! its elements are built.
 
-use crate::eval::Val;
+use crate::eval::{Val, text_use};
 use crate::{CalcError, Value};
 
 /// How many elements a grid may hold.
 pub(crate) const MAX_ELEMENTS: usize = 10_000;
 
-/// `rows` × `cols` values, row by row.
+/// How many characters a text may hold.
+pub(crate) const MAX_TEXT_CHARS: usize = 1000;
+
+/// `rows` × `cols` values, row by row: numbers (the default) or texts.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Grid {
+pub(crate) struct Grid<T = Val> {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
-    pub(crate) items: Vec<Val>,
+    pub(crate) items: Vec<T>,
 }
 
-impl Grid {
+impl<T> Grid<T> {
     /// A grid of `items`, row by row: [`CalcError::TooLarge`] beyond [`MAX_ELEMENTS`], and an
     /// error for no elements or a count that isn't `rows · cols`.
-    pub(crate) fn new(rows: usize, cols: usize, items: Vec<Val>) -> Result<Grid, CalcError> {
+    pub(crate) fn new(rows: usize, cols: usize, items: Vec<T>) -> Result<Grid<T>, CalcError> {
         check_size(rows, cols, items.len())?;
         Ok(Grid { rows, cols, items })
     }
@@ -55,11 +58,13 @@ pub(crate) fn element_at(g: &Grid, origin: u8, at: (u32, Option<u32>)) -> Option
     g.items.get(k).copied()
 }
 
-/// An evaluated value: one value, or a grid of them.
+/// An evaluated value: one value, or a grid of them; a number or a text.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Data {
     One(Val),
     Grid(Grid),
+    Text(String),
+    TextGrid(Grid<String>),
 }
 
 impl Data {
@@ -68,16 +73,40 @@ impl Data {
         match self {
             Data::One(v) => Value::One(v.q),
             Data::Grid(g) => Value::Grid { rows: g.rows, cols: g.cols, items: g.items.iter().map(|v| v.q).collect() },
+            Data::Text(s) => Value::Text(s.clone()),
+            Data::TextGrid(g) => Value::TextGrid { rows: g.rows, cols: g.cols, items: g.items.clone() },
         }
     }
 
-    /// A grid's rows and columns; `None` for a single value.
+    /// A grid's rows and columns; `None` for a single value or text.
     pub(crate) fn shape(&self) -> Option<(usize, usize)> {
         match self {
-            Data::One(_) => None,
+            Data::One(_) | Data::Text(_) => None,
             Data::Grid(g) => Some((g.rows, g.cols)),
+            Data::TextGrid(g) => Some((g.rows, g.cols)),
         }
     }
+
+    /// The text itself, or a text grid's first element; `None` for numbers.
+    pub(crate) fn text(&self) -> Option<&str> {
+        match self {
+            Data::Text(s) => Some(s),
+            Data::TextGrid(g) => g.items.first().map(String::as_str),
+            Data::One(_) | Data::Grid(_) => None,
+        }
+    }
+}
+
+/// The error for a `rows` × `cols` grid that would hold both texts and numbers: it names the later
+/// of the element `text_at` (a text) and the element `number_at` (a number), then the earlier.
+/// Elements are named as [`element_name`] does, counted from `origin`.
+pub(crate) fn mixed(rows: usize, cols: usize, text_at: usize, number_at: usize, origin: u8) -> CalcError {
+    let (t, n) = (element_name(rows, cols, text_at, origin), element_name(rows, cols, number_at, origin));
+    CalcError::Syntax(if text_at > number_at {
+        format!("element {t} is text but element {n} is a number")
+    } else {
+        format!("element {n} is a number but element {t} is text")
+    })
 }
 
 /// The shape of combining `a` and `b` element by element: `None` for two single values, a grid's
@@ -100,6 +129,8 @@ pub(crate) fn zip(a: &Data, b: &Data, origin: u8, mut f: impl FnMut(Val, Val) ->
         (Data::Grid(g), Data::One(y)) => build(g, origin, g.items.iter().map(|x| f(*x, *y))),
         (Data::One(x), Data::Grid(g)) => build(g, origin, g.items.iter().map(|y| f(*x, *y))),
         (Data::Grid(g), Data::Grid(h)) => build(g, origin, g.items.iter().zip(&h.items).map(|(x, y)| f(*x, *y))),
+        // The evaluator refuses text before it gets here, with the place it was used.
+        _ => Err(not_numbers(&[a, b])),
     }
 }
 
@@ -109,6 +140,15 @@ pub(crate) fn map(a: &Data, origin: u8, mut f: impl FnMut(Val) -> Result<Val, Ca
     match a {
         Data::One(x) => f(*x).map(Data::One),
         Data::Grid(g) => build(g, origin, g.items.iter().map(|x| f(*x))),
+        Data::Text(_) | Data::TextGrid(_) => Err(not_numbers(&[a])),
+    }
+}
+
+/// The error for text among `operands` of an element-wise operation.
+fn not_numbers(operands: &[&Data]) -> CalcError {
+    match operands.iter().find_map(|d| d.text()) {
+        Some(text) => text_use(text, "in arithmetic"),
+        None => CalcError::Syntax("an array operation needs numbers".to_string()),
     }
 }
 

@@ -18,6 +18,7 @@ use crate::array_funcs;
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, Op, Show, Stmt, Value};
 use craft_units::{Dim, Precision, Quantity, Scale, UnitError, UnitSystem, lookup, parse_unit};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
@@ -68,6 +69,27 @@ pub(crate) struct Val {
 impl Val {
     pub(crate) fn plain(q: Quantity) -> Val {
         Val { q, t: Temp::Plain }
+    }
+}
+
+/// How many characters of a text an error shows.
+const SHOWN_TEXT_CHARS: usize = 40;
+
+/// The error for the text `text` used where only a number makes sense, at `place` (`in
+/// arithmetic`, `with a unit`): the text is shown cut to [`SHOWN_TEXT_CHARS`] characters.
+pub(crate) fn text_use(text: &str, place: impl Into<Cow<'static, str>>) -> CalcError {
+    let mut shown: String = text.chars().take(SHOWN_TEXT_CHARS).collect();
+    if text.chars().nth(SHOWN_TEXT_CHARS).is_some() {
+        shown.push('…');
+    }
+    CalcError::TextUse { text: shown, place: place.into() }
+}
+
+/// Refuse text among `operands`, which are used at `place`: the first text is named.
+fn no_text(operands: &[&Data], place: &'static str) -> Result<(), CalcError> {
+    match operands.iter().find_map(|d| d.text()) {
+        Some(text) => Err(text_use(text, place)),
+        None => Ok(()),
     }
 }
 
@@ -314,8 +336,9 @@ fn check_show(env: &Env, show: &Show, v: &Data) -> Result<(), CalcError> {
 }
 
 /// Whether `v` can be shown in the unit `text` ([`check_unit_for`]); for a grid, every element,
-/// the first that can't named in the error.
+/// the first that can't named in the error. Text has no unit.
 pub(crate) fn check_display(env: &Env, text: &str, v: &Data) -> Result<(), CalcError> {
+    no_text(&[v], "with a unit")?;
     env.check_display_unit(text)?;
     match v {
         Data::One(v) => check_unit_for(*v, text),
@@ -326,6 +349,8 @@ pub(crate) fn check_display(env: &Env, text: &str, v: &Data) -> Result<(), CalcE
                 .enumerate()
                 .try_for_each(|(k, v)| fits(*v, &scale, text).map_err(|e| array::element_error(g.rows, g.cols, k, env.origin, e)))
         }
+        // Refused above.
+        Data::Text(_) | Data::TextGrid(_) => no_text(&[v], "with a unit"),
     }
 }
 
@@ -388,6 +413,7 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
     tick(cx)?;
     match e {
         Expr::Num(v) => finite(*v).map(|q| Data::One(Val::plain(q))),
+        Expr::Text(s) => Ok(Data::Text(s.clone())),
         Expr::Name(n) => resolve(cx, fr, n),
         Expr::Quantity(v, text) => {
             let scale = parse_unit(text).map_err(unit)?;
@@ -397,11 +423,13 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
         Expr::Unary(Op::Neg, a) => {
             refuse_offset_operand(cx, fr, &[a])?;
             let x = eval(cx, fr, a, depth + 1)?;
+            no_text(&[&x], "in arithmetic")?;
             each(cx, &x, |v| v.q.neg().map(Val::plain).map_err(unit))
         }
         Expr::Unary(..) => Err(CalcError::Syntax("unsupported operator".to_string())),
         Expr::Abs(a) => {
             let x = eval(cx, fr, a, depth + 1)?;
+            no_text(&[&x], "in arithmetic")?;
             each(cx, &x, |v| finite_q(Quantity::new(v.q.value.abs(), v.q.dim)).map(Val::plain))
         }
         Expr::Binary(op, a, b) => {
@@ -427,6 +455,7 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
             }
             let x = eval(cx, fr, a, depth + 1)?;
             let y = eval(cx, fr, b, depth + 1)?;
+            no_text(&[&x, &y], "in arithmetic")?;
             // `5 K` is a temperature literal: what it stands for comes from its syntax.
             let literal = match op {
                 Op::Mul => unit_literal(cx, fr, a, b).map_or(Temp::Plain, |(_, scale, name)| literal_temp(name, &scale)),
@@ -462,19 +491,25 @@ const WHOLE: f64 = 1e-9;
 /// counted: past it, rounding in the values could move where the range ends.
 const MAX_RANGE_SLACK: f64 = 0.05;
 
-/// A literal `[…]` of `rows` × `cols` items, row by row. Each item is one value.
+/// A literal `[…]` of `rows` × `cols` items, row by row. Each item is one value, and they are all
+/// numbers or all texts.
 // Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
 fn matrix(cx: &Cx<'_>, fr: &Frame<'_>, rows: usize, cols: usize, items: &[Expr], depth: usize) -> Result<Data, CalcError> {
     array::check_size(rows, cols, items.len())?;
-    let values = items
-        .iter()
-        .map(|e| match eval(cx, fr, e, depth + 1)? {
-            Data::One(v) => Ok(v),
-            Data::Grid(_) => Err(CalcError::Syntax("a matrix element can't be a vector".to_string())),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Grid::new(rows, cols, values).map(Data::Grid)
+    let (mut numbers, mut texts): (Vec<Val>, Vec<String>) = (Vec::new(), Vec::new());
+    let o = cx.env.origin;
+    for (k, e) in items.iter().enumerate() {
+        // After the first item, one of the two is empty, and that kind has no item before this one.
+        match eval(cx, fr, e, depth + 1)? {
+            Data::One(v) if texts.is_empty() => numbers.push(v),
+            Data::Text(s) if numbers.is_empty() => texts.push(s),
+            Data::One(_) => return Err(array::mixed(rows, cols, 0, k, o)),
+            Data::Text(_) => return Err(array::mixed(rows, cols, k, 0, o)),
+            Data::Grid(_) | Data::TextGrid(_) => return Err(CalcError::Syntax("a matrix element can't be a vector".to_string())),
+        }
+    }
+    if texts.is_empty() { Grid::new(rows, cols, numbers).map(Data::Grid) } else { Grid::new(rows, cols, texts).map(Data::TextGrid) }
 }
 
 /// The element `name[at]`: one index into a vector, or a row and a column. Only the element is
@@ -484,17 +519,22 @@ fn matrix(cx: &Cx<'_>, fr: &Frame<'_>, rows: usize, cols: usize, items: &[Expr],
 // (`eval` → `index` → `index_value` → `eval`) stay small: their depth is bounded by `MAX_EVAL_DEPTH`.
 #[inline(never)]
 fn index(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, at: &[Expr], depth: usize) -> Result<Data, CalcError> {
-    let g = indexed_grid(cx, fr, name, at.len())?;
+    let target = indexed_grid(cx, fr, name, at.len())?;
     let mut idx = [0.0; 2];
     for (slot, e) in idx.iter_mut().zip(at) {
         *slot = index_value(cx, fr, e, depth)?;
     }
-    element(g, name, cx.env.origin, idx.get(..at.len()).unwrap_or_default())
+    let idx = idx.get(..at.len()).unwrap_or_default();
+    match target {
+        Data::Grid(g) => element(g, name, cx.env.origin, idx).map(Data::One),
+        Data::TextGrid(g) => element(g, name, cx.env.origin, idx).map(Data::Text),
+        Data::One(_) | Data::Text(_) => Err(not_a_vector(name)),
+    }
 }
 
-/// The grid `name` holds, when it can be read with `count` indexes.
+/// The grid `name` holds (of numbers or of texts), when it can be read with `count` indexes.
 #[inline(never)]
-fn indexed_grid<'a>(cx: &'a Cx<'_>, fr: &'a Frame<'_>, name: &str, count: usize) -> Result<&'a Grid, CalcError> {
+fn indexed_grid<'a>(cx: &'a Cx<'_>, fr: &'a Frame<'_>, name: &str, count: usize) -> Result<&'a Data, CalcError> {
     let target = match fr.param(name) {
         Some(d) => d,
         None => match cx.env.entries.get(name) {
@@ -508,18 +548,18 @@ fn indexed_grid<'a>(cx: &'a Cx<'_>, fr: &'a Frame<'_>, name: &str, count: usize)
             }
         },
     };
-    let Data::Grid(g) = target else {
+    let Some((rows, cols)) = target.shape() else {
         return Err(not_a_vector(name));
     };
-    index_count(g, name, count)?;
-    Ok(g)
+    index_count(rows, cols, name, count)?;
+    Ok(target)
 }
 
-/// Whether `g` (named `name`) can be read with `count` indexes: one into a vector, two into any
-/// grid.
-fn index_count(g: &Grid, name: &str, count: usize) -> Result<(), CalcError> {
+/// Whether a grid of `rows` × `cols` (named `name`) can be read with `count` indexes: one into a
+/// vector, two into any grid.
+fn index_count(rows: usize, cols: usize, name: &str, count: usize) -> Result<(), CalcError> {
     match count {
-        1 if g.rows == 1 || g.cols == 1 => Ok(()),
+        1 if rows == 1 || cols == 1 => Ok(()),
         1 => Err(CalcError::IndexRange(format!("{name} is a matrix — give a row and a column, like {name}[1, 0]"))),
         2 => Ok(()),
         _ => Err(CalcError::Syntax("an index is one number, or a row and a column, like D[2] or M[1, 0]".to_string())),
@@ -530,21 +570,26 @@ fn index_count(g: &Grid, name: &str, count: usize) -> Result<(), CalcError> {
 /// of `data`, the value of `name`, counted from `origin`; the error is the one `name[…]` would
 /// give in a calculation.
 pub(crate) fn check_element(data: &Data, name: &str, origin: u8, at: (u32, Option<u32>)) -> Result<(), CalcError> {
-    let Data::Grid(g) = data else {
+    let Some((rows, cols)) = data.shape() else {
         return Err(not_a_vector(name));
     };
     let (idx, count) = match at {
         (i, None) => ([f64::from(i), 0.0], 1),
         (r, Some(c)) => ([f64::from(r), f64::from(c)], 2),
     };
-    index_count(g, name, count)?;
-    element(g, name, origin, idx.get(..count).unwrap_or_default()).map(|_| ())
+    index_count(rows, cols, name, count)?;
+    let at = idx.get(..count).unwrap_or_default();
+    match data {
+        Data::Grid(g) => element(g, name, origin, at).map(|_| ()),
+        Data::TextGrid(g) => element(g, name, origin, at).map(|_| ()),
+        Data::One(_) | Data::Text(_) => Err(not_a_vector(name)),
+    }
 }
 
 /// The element of `g` (named `name`) at the whole-number indexes `at`, counted from `origin`: one
 /// index into a vector, or a row and a column.
 #[inline(never)]
-fn element(g: &Grid, name: &str, origin: u8, at: &[f64]) -> Result<Data, CalcError> {
+fn element<T: Clone>(g: &Grid<T>, name: &str, origin: u8, at: &[f64]) -> Result<T, CalcError> {
     let o = origin;
     let last = |n: usize| n.saturating_sub(1).saturating_add(usize::from(o));
     let k = match *at {
@@ -564,7 +609,7 @@ fn element(g: &Grid, name: &str, origin: u8, at: &[f64]) -> Result<Data, CalcErr
         },
         _ => return Err(CalcError::Syntax("an index is one number, or a row and a column, like D[2] or M[1, 0]".to_string())),
     };
-    g.items.get(k).map(|v| Data::One(*v)).ok_or_else(|| CalcError::IndexRange(format!("{name} has no element {k}")))
+    g.items.get(k).cloned().ok_or_else(|| CalcError::IndexRange(format!("{name} has no element {k}")))
 }
 
 fn not_a_vector(name: &str) -> CalcError {
@@ -613,6 +658,7 @@ fn range(cx: &Cx<'_>, first: &Expr, second: Option<&Expr>, last: &Expr) -> Resul
     let end = |e: &Expr| match eval(cx, &Frame::GLOBAL, e, 1)? {
         Data::One(v) => Ok(v),
         Data::Grid(_) => Err(CalcError::Syntax("a range's values are single values, like 0..5".to_string())),
+        d @ (Data::Text(_) | Data::TextGrid(_)) => Err(text_use(d.text().unwrap_or_default(), "in a range")),
     };
     let a = end(first)?;
     let b = second.map(end).transpose()?;
@@ -736,20 +782,39 @@ fn indexed(env: &Env, name: &str, i: &str, body: &Expr, pass: &Pass) -> Result<D
         return Err(unset(k));
     }
     let names = [i.to_string()];
-    let mut values: Vec<Option<Val>> = vec![None; size];
+    let mut values: Vec<Option<Data>> = vec![None; size];
     for (&k, v) in places.iter().zip(&g.items) {
         let bound = [Data::One(*v)];
         let frame = Frame { names: &names, values: &bound, calls: 0 };
         let value = match eval(&cx, &frame, body, 0).map_err(|e| array::element_error(size, 1, k, o, e))? {
-            Data::One(v) => v,
-            Data::Grid(_) => return Err(CalcError::Syntax(format!("{name}[{i}] is one element — its right side can't be a vector"))),
+            value @ (Data::One(_) | Data::Text(_)) => value,
+            Data::Grid(_) | Data::TextGrid(_) => {
+                return Err(CalcError::Syntax(format!("{name}[{i}] is one element — its right side can't be a vector")));
+            }
         };
         if let Some(slot) = values.get_mut(k) {
             *slot = Some(value);
         }
     }
     let values = values.into_iter().enumerate().map(|(k, v)| v.ok_or_else(|| unset(k))).collect::<Result<Vec<_>, _>>()?;
-    Grid::new(size, 1, values).map(Data::Grid)
+    collect_elements(values, o)
+}
+
+/// The vector of `values`, one element each: of numbers, or of texts. A mix is an error naming the
+/// first element of the kind the first isn't.
+fn collect_elements(values: Vec<Data>, origin: u8) -> Result<Data, CalcError> {
+    let rows = values.len();
+    let (mut numbers, mut texts): (Vec<Val>, Vec<String>) = (Vec::new(), Vec::new());
+    for (k, v) in values.into_iter().enumerate() {
+        match v {
+            Data::One(v) if texts.is_empty() => numbers.push(v),
+            Data::Text(s) if numbers.is_empty() => texts.push(s),
+            Data::One(_) => return Err(array::mixed(rows, 1, 0, k, origin)),
+            Data::Text(_) => return Err(array::mixed(rows, 1, k, 0, origin)),
+            Data::Grid(_) | Data::TextGrid(_) => return Err(CalcError::Syntax("an element is a single value".to_string())),
+        }
+    }
+    if texts.is_empty() { Grid::new(rows, 1, numbers).map(Data::Grid) } else { Grid::new(rows, 1, texts).map(Data::TextGrid) }
 }
 
 /// `f` over every element of `x`, each counted as a step of the pass's work.
@@ -961,6 +1026,9 @@ pub(crate) fn picked(values: &[Val]) -> Temp {
 /// every argument, a single value broadcast. The result of each is not an absolute temperature.
 /// (`min`, `max` and the array functions take whole grids, in [`array_funcs::call_array`].)
 fn call_each(cx: &Cx<'_>, name: &str, args: &[Data]) -> Result<Data, CalcError> {
+    if let Some(text) = args.iter().find_map(Data::text) {
+        return Err(text_use(text, format!("in {name}")));
+    }
     let builtin = |qs: &[Quantity]| funcs::call(name, qs).unwrap_or_else(|| Err(CalcError::Undefined(name.to_string()))).map(Val::plain);
     // The number of arguments is checked once, before any element: not "element 0: sqrt expects 1".
     let firsts: Vec<Quantity> = args.iter().filter_map(first).map(|v| v.q).collect();
@@ -981,6 +1049,7 @@ fn first(d: &Data) -> Option<Val> {
     match d {
         Data::One(v) => Some(*v),
         Data::Grid(g) => g.items.first().copied(),
+        Data::Text(_) | Data::TextGrid(_) => None,
     }
 }
 

@@ -45,6 +45,8 @@ pub struct Show {
 pub enum Expr {
     /// A number.
     Num(f64),
+    /// A text literal, without its quotes: `"OK"`.
+    Text(String),
     /// A variable, unit or constant; the evaluator decides which.
     Name(String),
     /// A number with a unit. The parser never produces this (`5 kN` parses as `5 * kN`); it is for
@@ -127,7 +129,7 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
     let mut stack: Vec<&Expr> = vec![body];
     while let Some(e) = stack.pop() {
         let name = match e {
-            Expr::Num(_) | Expr::Quantity(..) => continue,
+            Expr::Num(_) | Expr::Text(_) | Expr::Quantity(..) => continue,
             Expr::Name(n) => n,
             Expr::Unary(_, a) | Expr::Abs(a) => {
                 stack.push(a);

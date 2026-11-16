@@ -7,13 +7,15 @@
 //! - **Interpolation:** `linterp(xs, ys, x)` (linear) and `spline(xs, ys, x)` (natural cubic
 //!   spline), over `xs` strictly increasing.
 //!
+//! `length`, `rows`, `cols` and `transpose` also take text; every other one refuses it.
+//!
 //! None of them guesses: a lookup that matches no `xs` and an interpolation outside `xs` are
 //! errors, never the nearest value or an extrapolation. `x` may be a grid, giving one result per
 //! element. An error about an argument names it as written when it is a bare name (`NPS`), else
 //! by its role (`xs`). Each function charges its element work to the pass before doing it.
 
 use crate::array::{self, Data, Grid, MAX_ELEMENTS};
-use crate::eval::{Pass, Val, picked};
+use crate::eval::{Pass, Val, picked, text_use};
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, render};
 use craft_units::{Dim, Formatted, Precision, Quantity, UnitError, UnitSystem, format};
@@ -38,6 +40,12 @@ pub(crate) struct Ctx<'a> {
 /// Call the array function `name` on evaluated `args`, written as `exprs`; `None` when `name`
 /// isn't one, and for `min`/`max` of single values only (those are scalar built-ins).
 pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Option<Result<Data, CalcError>> {
+    // Numbers only, but for the sizes and `transpose`.
+    if matches!(name, "min" | "max" | "sum" | "mean" | "dot" | "mmul" | "lookup" | "linterp" | "spline")
+        && let Some(text) = args.iter().find_map(Data::text)
+    {
+        return Some(Err(text_use(text, format!("in {name}"))));
+    }
     let result = match name {
         "min" | "max" if args.iter().all(|a| matches!(a, Data::One(_))) => return None,
         "min" | "max" => extreme(name, args, cx),
@@ -53,11 +61,13 @@ pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>
     Some(result)
 }
 
-/// The elements of `d`: a single value is one.
+/// The numbers of `d`: a single value is one. Text has none, so a function that takes numbers
+/// refuses text before it gets here.
 fn items(d: &Data) -> &[Val] {
     match d {
         Data::One(v) => std::slice::from_ref(v),
         Data::Grid(g) => &g.items,
+        Data::Text(_) | Data::TextGrid(_) => &[],
     }
 }
 
@@ -216,20 +226,26 @@ fn mmul(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError> 
     Grid::new(rows, cols, out).map(Data::Grid)
 }
 
-/// `transpose(A)`: rows become columns. A single value is itself.
+/// `transpose(A)`: rows become columns, of numbers or of texts. A single value is itself.
 fn transpose(args: &[Data], cx: &Ctx<'_>) -> Result<Data, CalcError> {
     let [a] = args else {
         return Err(CalcError::Arity("transpose".to_string(), 1));
     };
-    let Data::Grid(g) = a else {
-        return Ok(a.clone());
-    };
+    match a {
+        Data::Grid(g) => transposed(g, cx).map(Data::Grid),
+        Data::TextGrid(g) => transposed(g, cx).map(Data::TextGrid),
+        Data::One(_) | Data::Text(_) => Ok(a.clone()),
+    }
+}
+
+/// `g` with its rows as columns.
+fn transposed<T: Clone>(g: &Grid<T>, cx: &Ctx<'_>) -> Result<Grid<T>, CalcError> {
     charge(cx, g.items.len())?;
     let items = (0..g.cols)
-        .flat_map(|j| (0..g.rows).map(move |i| g.items.get(i * g.cols + j).copied()))
+        .flat_map(|j| (0..g.rows).map(move |i| g.items.get(i * g.cols + j).cloned()))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| CalcError::Syntax("an array is missing an element".to_string()))?;
-    Grid::new(g.cols, g.rows, items).map(Data::Grid)
+    Grid::new(g.cols, g.rows, items)
 }
 
 /// Whether `a` and `b` are equal to within [`EQUAL`] of the larger.

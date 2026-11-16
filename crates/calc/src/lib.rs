@@ -31,7 +31,8 @@ pub use recalc::{
     defined_columns, defined_names, freeze_outside_body, is_calc_object, mark_stale, recalc,
 };
 
-/// What a calculation evaluates to: one value, or a grid of values (a vector or matrix).
+/// What a calculation evaluates to: one value, or a grid of values (a vector or matrix), of
+/// numbers or of texts.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// A single value.
@@ -44,6 +45,17 @@ pub enum Value {
         cols: usize,
         /// The `rows · cols` elements, row-major.
         items: Vec<craft_units::Quantity>,
+    },
+    /// A text.
+    Text(String),
+    /// `rows` × `cols` texts, row by row. A column vector has one column.
+    TextGrid {
+        /// How many rows.
+        rows: usize,
+        /// How many columns.
+        cols: usize,
+        /// The `rows · cols` elements, row-major.
+        items: Vec<String>,
     },
 }
 
@@ -126,4 +138,13 @@ pub enum CalcError {
     /// A data table this calculation depends on has an error.
     #[error("depends on table data with an error")]
     UpstreamTable,
+    /// A text where only a number makes sense. `text` is cut to 40 characters, and `place` says
+    /// what it was used in (`in arithmetic`, `with a unit`).
+    #[error("\"{text}\" is text — it can't be used {place}")]
+    TextUse {
+        /// The text, cut to 40 characters plus `…`.
+        text: String,
+        /// Where it was used, as the end of the message.
+        place: std::borrow::Cow<'static, str>,
+    },
 }

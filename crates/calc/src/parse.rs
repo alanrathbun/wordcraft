@@ -13,12 +13,15 @@
 //! term      := unary { ("*" | "/" | adjacency) unary }
 //! unary     := "-" unary | power                               so -x^2 is -(x^2)
 //! power     := atom [ "^" unary ]                              right-associative
-//! atom      := number | name | name"(" args ")" | name"[" args "]" | "(" expr ")"
+//! atom      := number | text | name | name"(" args ")" | name"[" args "]" | "(" expr ")"
 //!            | "[" rows "]" | "|" expr "|" | "√" atom
 //! rows      := items { ";" items }                             every row the same length
 //! items     := expr { "," expr }
 //! postfix   := atom { "²" | "³" | "⁻¹" ... }                   one superscript digit, like `^`
 //! ```
+//!
+//! A text is written between quotes, `"OK"` or `“OK”`, and is at most [`MAX_TEXT_CHARS`] characters.
+//! It never multiplies by adjacency (`2 "OK"` is an error).
 //!
 //! A `(` or `[` right after a name, with no space, is a call or an index (`f(x)`, `D[2]`); after
 //! a space it starts a factor (`D [2]` is `D` times a one-element literal). A literal with no `;`
@@ -34,6 +37,7 @@
 //! the token list at most [`MAX_TOKENS`], the parser's recursion (nesting) at most [`MAX_DEPTH`] and
 //! the height of the tree it builds at most [`MAX_HEIGHT`], so nothing downstream recurses deeply.
 
+use crate::array::MAX_TEXT_CHARS;
 use crate::{CalcError, Expr, Op, Show, Stmt};
 
 #[cfg(test)]
@@ -105,6 +109,8 @@ fn misplaced_range() -> CalcError {
 #[derive(Debug, Clone, PartialEq)]
 enum Kind {
     Num(f64),
+    /// A text literal's content, without its quotes.
+    Text(String),
     Name(String),
     Plus,
     Minus,
@@ -134,6 +140,7 @@ impl Kind {
     fn describe(&self) -> String {
         match self {
             Kind::Num(_) => "a number".into(),
+            Kind::Text(_) => "a text".into(),
             Kind::Name(n) => format!("`{n}`"),
             Kind::Plus => "`+`".into(),
             Kind::Minus => "`-`".into(),
@@ -233,6 +240,11 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
             ';' => Kind::Semi,
             '√' => Kind::Sqrt,
             '≔' => Kind::Define,
+            '"' | '“' => {
+                let (text, text_end) = lex_text(src, start, c, &mut chars)?;
+                end = text_end;
+                Kind::Text(text)
+            }
             ':' => match chars.next_if(|&(_, n)| n == '=') {
                 Some((i, n)) => {
                     end = i + n.len_utf8();
@@ -286,6 +298,28 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
 }
 
 type Chars<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
+
+/// The text literal that starts at `start` with the opening quote `open`: its content, and the
+/// offset after its closing quote. The content may not hold a quote, so the first `"` or `”` closes
+/// it; a `“` inside, or no closing quote, is an unclosed text. At most [`MAX_TEXT_CHARS`]
+/// characters, counted as they are read.
+fn lex_text(src: &str, start: usize, open: char, chars: &mut Chars<'_>) -> Result<(String, usize), CalcError> {
+    let from = start + open.len_utf8();
+    let mut count = 0usize;
+    for (i, c) in chars.by_ref() {
+        match c {
+            '"' | '”' => return Ok((src.get(from..i).unwrap_or_default().to_string(), i + c.len_utf8())),
+            '“' => break,
+            _ => {
+                count += 1;
+                if count > MAX_TEXT_CHARS {
+                    return Err(syntax("a text is at most 1,000 characters"));
+                }
+            }
+        }
+    }
+    Err(syntax("a text needs a closing quote, like \"OK\""))
+}
 
 /// Whether the source at `at` is a range's `..`.
 fn starts_range(src: &str, at: usize) -> bool {
@@ -563,13 +597,16 @@ impl<'a> Parser<'a> {
         self.pos.checked_sub(1).and_then(|i| self.toks.get(i))
     }
 
-    /// Whether the token just consumed ends a value: a number, name, closing bracket or bar, or a
-    /// superscript.
+    /// Whether the token just consumed ends a value: a number, text, name, closing bracket or bar, or
+    /// a superscript.
     fn after_value(&self) -> bool {
-        self.prev().is_some_and(|t| matches!(t.kind, Kind::Num(_) | Kind::Name(_) | Kind::RParen | Kind::RBracket | Kind::Bar | Kind::Sup(_)))
+        self.prev().is_some_and(|t| {
+            matches!(t.kind, Kind::Num(_) | Kind::Text(_) | Kind::Name(_) | Kind::RParen | Kind::RBracket | Kind::Bar | Kind::Sup(_))
+        })
     }
 
-    /// Whether the next token starts a factor, which after a value is an implied product.
+    /// Whether the next token starts a factor, which after a value is an implied product. A text
+    /// never does, so `2 "OK"` ends the expression and the text is reported as unexpected.
     fn starts_factor(&self) -> bool {
         match self.peek_kind() {
             Some(Kind::Num(_) | Kind::Name(_) | Kind::LParen | Kind::LBracket | Kind::Sqrt) => true,
@@ -600,6 +637,7 @@ impl<'a> Parser<'a> {
         };
         match &tok.kind {
             Kind::Num(v) => Ok(Node::leaf(Expr::Num(*v))),
+            Kind::Text(s) => Ok(Node::leaf(Expr::Text(s.clone()))),
             Kind::Name(n) => {
                 // `f(` with no space is a call and `D[` an index; `f (` is `f` times a
                 // parenthesised factor and `D [` is `D` times a literal.

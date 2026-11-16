@@ -707,7 +707,7 @@ fn prec(e: &Expr) -> u8 {
         Expr::Unary(..) => 3,
         Expr::Binary(Op::Pow, ..) => 4,
         Expr::Binary(Op::Neg, ..) => 1,
-        Expr::Num(_) | Expr::Name(_) | Expr::Call(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Index(..) => 5,
+        Expr::Num(_) | Expr::Text(_) | Expr::Name(_) | Expr::Call(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Index(..) => 5,
     }
 }
 
@@ -795,7 +795,7 @@ fn ends_in_script(e: &Expr) -> bool {
         match e {
             Expr::Num(v) => return exponential(*v),
             Expr::Name(n) => return n.contains('_') && !is_unit(n),
-            Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } => return false,
+            Expr::Text(_) | Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } => return false,
             Expr::Call(..) => return is_sqrt(e),
             Expr::Index(..) | Expr::Binary(Op::Pow | Op::Div, ..) => return true,
             Expr::Unary(_, a) | Expr::Binary(_, _, a) => e = a,
@@ -842,6 +842,8 @@ fn write_expr(root: &Expr, out: &mut Out) {
         };
         match e {
             Expr::Num(v) => out.text(&num_text(*v)),
+            // Plainly quoted for now; the display of text is a later step.
+            Expr::Text(s) => out.text(&format!("“{s}”")),
             Expr::Name(n) if is_unit(n) => out.unit(n),
             Expr::Name(n) => out.name(n),
             Expr::Quantity(v, unit) => {
