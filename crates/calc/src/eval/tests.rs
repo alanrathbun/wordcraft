@@ -743,6 +743,45 @@ fn ranges_evaluate() {
     close_all(&grid(&mut env, "ev := 0, 2..5 =").1, &[0.0, 2.0, 4.0], Dim::ONE);
     // 10,000 elements is allowed.
     assert_eq!(grid(&mut env, "big := 1..10000 =").0, (10_000, 1));
+    // A step that lands on the last value includes it, however the step rounds.
+    let tenths = grid(&mut env, "x := 0, 0.1..1 =").1;
+    assert_eq!(tenths.len(), 11, "{tenths:?}");
+    assert_eq!(tenths.last().map(|q| q.value), Some(1.0));
+}
+
+/// The ends of a range, and so its step, carry rounding error in proportion to their size: a
+/// range of large values whose step lands on its last value still ends on it.
+#[test]
+fn a_range_of_large_values_keeps_its_last_element() {
+    let mut env = Env::new();
+    for (src, count, first, last) in [
+        ("x := 100000, 100000.1..100002 =", 21, 100_000.0, 100_002.0),
+        ("x := 1000000, 1000000.01..1000000.1 =", 11, 1_000_000.0, 1_000_000.1),
+        ("x := 100002, 100001.9..100000 =", 21, 100_002.0, 100_000.0),
+        ("x := 500000, 500000.001..500000.1 =", 101, 500_000.0, 500_000.1),
+        ("x := 250000, 250000.05..250010 =", 201, 250_000.0, 250_010.0),
+    ] {
+        let (shape, items) = grid(&mut env, src);
+        assert_eq!(shape, (count, 1), "{src}");
+        assert_eq!(items.first().map(|q| q.value), Some(first), "{src}");
+        // The last element is the last value as written, exactly.
+        assert_eq!(items.last().map(|q| q.value), Some(last), "{src}");
+    }
+    // A step that doesn't land still stops short of the last value, at any size.
+    let (shape, items) = grid(&mut env, "x := 1000000, 1000002..1000005 =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[1_000_000.0, 1_000_002.0, 1_000_004.0], Dim::ONE);
+    // Counting by 1 from a large value is exact.
+    let (shape, items) = grid(&mut env, "x := 1000000000000..1000000000005 =");
+    assert_eq!(shape, (6, 1));
+    assert_eq!(items.last().map(|q| q.value), Some(1e12 + 5.0));
+    // The small ranges are as they were.
+    close_all(&grid(&mut env, "x := 1, 1.5..3 =").1, &[1.0, 1.5, 2.0, 2.5, 3.0], Dim::ONE);
+    close_all(&grid(&mut env, "x := 0..5 =").1, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], Dim::ONE);
+    // A step too small for its values to tell where the range ends is an error, not a guess:
+    // 1e15 + 0.1 is 1e15 + 0.125 in a double.
+    let fine = run(&mut env, "x := 1e15, 1e15 + 0.1..1e15 + 1").expect_err("a step below the values' precision");
+    assert_eq!(syntax_msg(fine), "a range's step is too small next to its values to tell exactly where it ends");
 }
 
 #[test]

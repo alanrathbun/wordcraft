@@ -458,6 +458,10 @@ fn range_only_defines_a_variable() -> CalcError {
 /// element count).
 const WHOLE: f64 = 1e-9;
 
+/// The most a range's count of steps may be uncertain by, as a fraction of a step, and still be
+/// counted: past it, rounding in the values could move where the range ends.
+const MAX_RANGE_SLACK: f64 = 0.05;
+
 /// A literal `[…]` of `rows` × `cols` items, row by row. Each item is one value.
 // Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
 #[inline(never)]
@@ -627,19 +631,49 @@ fn range(cx: &Cx<'_>, first: &Expr, second: Option<&Expr>, last: &Expr) -> Resul
     if ratio.is_nan() {
         return Err(CalcError::NonFinite);
     }
-    if ratio + WHOLE < 0.0 {
+    // More steps than a grid holds elements (an infinite count too) is too large, however the
+    // count rounds.
+    if ratio > MAX_ELEMENTS as f64 {
+        return Err(CalcError::TooLarge);
+    }
+    // The values carry rounding error in proportion to their size, and so does a step taken from
+    // two of them: `100000.1 − 100000` is 0.1 within about 1.5e-11, so the 20 steps to 100002
+    // count 19.9999999997. How far the count may be from a whole number and still be it: a few
+    // ulps of the largest value over the step (the span's error), plus, for a step that is the
+    // difference of two values, the step's own error once for each step.
+    let scale = a.q.value.abs().max(z.q.value.abs()).max(b.map_or(0.0, |b| b.q.value.abs()));
+    let per_step = if b.is_some() { ratio.abs() } else { 0.0 };
+    let tol = WHOLE.max(8.0 * f64::EPSILON * scale / step.value.abs() * (1.0 + per_step));
+    if ratio.is_infinite() || ratio < -tol {
         return Err(CalcError::Syntax("a range's step goes away from its last value — like 1, 1.5..3 or 3, 2.5..1".to_string()));
     }
-    // An infinite or huge count is too large; the cast below is then of a number at most 10,000.
-    let count = (ratio + WHOLE).floor() + 1.0;
-    if !count.is_finite() || count > MAX_ELEMENTS as f64 {
+    // A step so small next to the values that their rounding could move the end by a fair part
+    // of a step: where the range ends would be a guess.
+    if tol.is_nan() || tol > MAX_RANGE_SLACK {
+        return Err(CalcError::Syntax("a range's step is too small next to its values to tell exactly where it ends".to_string()));
+    }
+    let nearest = ratio.round();
+    let lands = (ratio - nearest).abs() <= tol;
+    let steps = if lands { nearest.max(0.0) } else { ratio.floor() };
+    // At most 10,000 steps (checked above), so the cast below can't truncate.
+    let count = steps + 1.0;
+    if count > MAX_ELEMENTS as f64 {
         return Err(CalcError::TooLarge);
     }
     let n = count as usize;
     charge_elements(cx, n)?;
     let t = between(a.t, z.t);
-    let values =
+    let mut values =
         (0..n).map(|k| a.q.add(Quantity::new(k as f64 * step.value, step.dim)).map(|q| Val { q, t }).map_err(unit)).collect::<Result<Vec<_>, _>>()?;
+    // A step that lands on the last value ends on it exactly, not on the step's rounding added up
+    // (100000, 100000.1..100002 ends at 100002, not 100002.00000000003). Counting by 1 is exact.
+    if lands
+        && b.is_some()
+        && n > 1
+        && let Some(end) = values.last_mut()
+    {
+        end.q = z.q;
+    }
     Grid::new(n, 1, values).map(Data::Grid)
 }
 
