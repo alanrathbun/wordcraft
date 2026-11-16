@@ -121,6 +121,8 @@ verdict per pipe size.
 
   - Comparisons show as `<`, `>`, `≤`, `≥` and `≠`. `==` shows as a bold `=`, as in Mathcad, so it
     can't be mistaken for a result.
+  - `and`, `or` and `not` show as `∧`, `∨` and `¬`, as in Mathcad printouts, however they were
+    typed. `if(c, a, b)` shows as a function call. (Calls made while planning.)
 - **Quoted values:** text is quoted into a sentence without quote marks ("the check is OK"), and a
   text vector as a comma list ("OK, OK, NG").
 - **Word round trip:** text, comparisons, piecewise braces and sums are saved as ordinary Word math
@@ -245,7 +247,10 @@ verdict per pipe size.
   achieved is left to the builder (for example, evaluating each branch only on the elements that
   pick it).
 - **Dependencies:** the names in every branch and condition are dependencies, whichever branch is
-  picked, so recalculation stays correct when a condition flips. A sum's index is not a dependency.
+  picked, so recalculation stays correct when a condition flips. A sum's index counts as a use of
+  that name. Normally nothing in the document defines it, so it links to nothing; when something
+  does, the link makes sure that definition has run first, so the "already defined" error always
+  appears instead of depending on evaluation order.
   As today, a calculation that depends on a calculation with an error shows "depends on a
   calculation with an error", even if the failed name sits in a branch nothing picks. The per-element
   rule above is about errors while working the branches out, not about failed inputs.
