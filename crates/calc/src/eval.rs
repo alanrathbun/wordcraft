@@ -256,7 +256,7 @@ fn is_constant(name: &str) -> bool {
 /// Evaluate an expression against the defined names.
 pub fn eval_expr(env: &Env, e: &Expr) -> Result<Value, CalcError> {
     let pass = Pass::new(u64::MAX);
-    eval_data(env, e, &pass).map(|d| d.value())
+    eval_data(env, e, &pass).and_then(|d| d.strict(env.origin)).map(|d| d.value())
 }
 
 /// The work a whole recalculation may do, shared by every statement it runs.
@@ -283,12 +283,13 @@ impl Pass {
 }
 
 fn eval_data(env: &Env, e: &Expr, pass: &Pass) -> Result<Data, CalcError> {
-    let cx = Cx { env, steps: Cell::new(0), pass };
+    let cx = Cx::new(env, pass);
     eval(&cx, &Frame::GLOBAL, e, 0)
 }
 
 /// Run one statement: a definition adds to `env` and an evaluation does not. Returns the value
-/// when the statement shows one.
+/// when the statement shows one. A value with a failed element ([`Data::strict`]) is that
+/// element's error: it is neither shown nor defined.
 ///
 /// Nothing is defined unless the whole statement succeeds, including a `= ? unit` that does not
 /// match the value's dimension. The unit itself is applied by whoever formats the value.
@@ -301,7 +302,7 @@ pub fn run_stmt(env: &mut Env, s: &Stmt) -> Result<Option<Value>, CalcError> {
 pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option<Data>, CalcError> {
     match s {
         Stmt::Eval { expr, show } => {
-            let v = eval_data(env, expr, pass)?;
+            let v = eval_data(env, expr, pass)?.strict(env.origin)?;
             check_show(env, show, &v)?;
             Ok(Some(v))
         }
@@ -327,11 +328,12 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
             let v = match (index, body) {
                 (Some(i), _) => indexed(env, name, i, body, pass)?,
                 (None, Expr::Range { first, second, last }) => {
-                    let cx = Cx { env, steps: Cell::new(0), pass };
+                    let cx = Cx::new(env, pass);
                     range(&cx, first, second.as_deref(), last)?
                 }
                 (None, _) => eval_data(env, body, pass)?,
-            };
+            }
+            .strict(env.origin)?;
             if let Some(show) = show {
                 check_show(env, show, &v)?;
             }
@@ -351,8 +353,11 @@ fn check_show(env: &Env, show: &Show, v: &Data) -> Result<(), CalcError> {
 }
 
 /// Whether `v` can be shown in the unit `text` ([`check_unit_for`]); for a grid, every element,
-/// the first that can't named in the error. Text has no unit.
+/// the first that can't named in the error. Text has no unit, and a failed element is its error.
 pub(crate) fn check_display(env: &Env, text: &str, v: &Data) -> Result<(), CalcError> {
+    if let Some(e) = v.failure(env.origin) {
+        return Err(e);
+    }
     no_text(&[v], "with a unit")?;
     env.check_display_unit(text)?;
     match v {
@@ -394,10 +399,35 @@ pub(crate) struct Cx<'a> {
     steps: Cell<u32>,
     /// The whole recalculation's work.
     pass: &'a Pass,
+    /// Above 0 while a branch is worked out over whole arrays: an element-wise operation keeps an
+    /// element's error in the grid's `failed` list instead of stopping ([`eval_lenient`]).
+    lenient: Cell<u32>,
+}
+
+impl<'a> Cx<'a> {
+    fn new(env: &'a Env, pass: &'a Pass) -> Cx<'a> {
+        Cx { env, steps: Cell::new(0), pass, lenient: Cell::new(0) }
+    }
+
+    fn lenient(&self) -> bool {
+        self.lenient.get() > 0
+    }
+}
+
+/// `e` evaluated with element failures kept per element (see [`array::zip`]): a branch worked out
+/// over whole arrays, of which each element may pick only some. What takes a grid whole still
+/// refuses a failed element ([`Data::strict`]). How lenient `cx` was is restored, even on error.
+#[cfg_attr(not(test), expect(dead_code, reason = "the piecewise branches call it"))]
+pub(crate) fn eval_lenient(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, CalcError> {
+    let before = cx.lenient.get();
+    cx.lenient.set(before.saturating_add(1));
+    let result = eval(cx, fr, e, depth);
+    cx.lenient.set(before);
+    result
 }
 
 /// The parameters in scope, and how many user functions deep we are.
-struct Frame<'a> {
+pub(crate) struct Frame<'a> {
     names: &'a [String],
     values: &'a [Data],
     calls: usize,
@@ -562,7 +592,8 @@ fn index(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, at: &[Expr], depth: usize) -> 
     }
 }
 
-/// The grid `name` holds (of numbers or of texts), when it can be read with `count` indexes.
+/// The grid `name` holds (of numbers or of texts), when it can be read with `count` indexes and
+/// none of its elements failed ([`Data::strict`]): a function's parameter may hold failed elements.
 #[inline(never)]
 fn indexed_grid<'a>(cx: &'a Cx<'_>, fr: &'a Frame<'_>, name: &str, count: usize) -> Result<&'a Data, CalcError> {
     let target = match fr.param(name) {
@@ -582,7 +613,10 @@ fn indexed_grid<'a>(cx: &'a Cx<'_>, fr: &'a Frame<'_>, name: &str, count: usize)
         return Err(not_a_vector(name));
     };
     index_count(rows, cols, name, count)?;
-    Ok(target)
+    match target.failure(cx.env.origin) {
+        Some(e) => Err(e),
+        None => Ok(target),
+    }
 }
 
 /// Whether a grid of `rows` × `cols` (named `name`) can be read with `count` indexes: one into a
@@ -736,7 +770,8 @@ fn compare_values(a: Val, cmp: Cmp, b: Val) -> Result<bool, CalcError> {
 }
 
 /// `x cmp y` for texts, which are only equal or not: after [`array::text_key`] on both. Each
-/// element counts as a step of work, and so does the text's size.
+/// element counts as a step of work, and so does the text's size. An element that failed in either
+/// side fails in the result, as in [`array::zip`].
 #[inline(never)]
 fn compare_texts(cx: &Cx<'_>, x: &Data, cmp: Cmp, y: &Data) -> Result<Data, CalcError> {
     let equal = match cmp {
@@ -754,15 +789,37 @@ fn compare_texts(cx: &Cx<'_>, x: &Data, cmp: Cmp, y: &Data) -> Result<Data, Calc
     fn at(s: &[String], k: usize) -> &str {
         s.get(if s.len() == 1 { 0 } else { k }).map_or("", String::as_str)
     }
+    let (mut fx, mut fy) = (array::Failures::of(text_grid(x)), array::Failures::of(text_grid(y)));
+    let (rows, cols) = shape.unwrap_or((1, 1));
     let mut items = Vec::with_capacity(n);
+    let mut failed = Vec::new();
     for k in 0..n {
+        // Both sides' failures are read at every element, in order; the left side's wins.
+        let (ex, ey) = (fx.at(k), fy.at(k));
+        if let Some(e) = ex.or(ey) {
+            array::keep_failure(&mut failed, k, e.clone(), cx.lenient(), |e| array::element_error(rows, cols, k, cx.env.origin, e))?;
+            items.push(array::placeholder());
+            continue;
+        }
         let (a, b) = (at(xs, k), at(ys, k));
         cx.pass.charge(array::text_steps(a).saturating_add(array::text_steps(b)))?;
         items.push(truth_val((array::text_key(a) == array::text_key(b)) == equal));
     }
     match shape {
-        Some((rows, cols)) => Grid::new(rows, cols, items).map(Data::Grid),
+        Some((rows, cols)) => {
+            let mut g = Grid::new(rows, cols, items)?;
+            g.failed = failed;
+            Ok(Data::Grid(g))
+        }
         None => items.pop().map(Data::One).ok_or(CalcError::NonFinite),
+    }
+}
+
+/// The grid of texts `d` holds, if any.
+fn text_grid(d: &Data) -> Option<&Grid<String>> {
+    match d {
+        Data::TextGrid(g) => Some(g),
+        Data::One(_) | Data::Grid(_) | Data::Text(_) => None,
     }
 }
 
@@ -923,7 +980,7 @@ fn indexed(env: &Env, name: &str, i: &str, body: &Expr, pass: &Pass) -> Result<D
     }
     // At most `MAX_ELEMENTS`, so the casts are exact.
     let size = size as usize;
-    let cx = Cx { env, steps: Cell::new(0), pass };
+    let cx = Cx::new(env, pass);
     charge_elements(&cx, size)?;
     let places: Vec<usize> = places.into_iter().map(|k| k as usize).collect();
     let mut set = vec![false; size];
@@ -942,7 +999,7 @@ fn indexed(env: &Env, name: &str, i: &str, body: &Expr, pass: &Pass) -> Result<D
     for (&k, v) in places.iter().zip(&g.items) {
         let bound = [Data::One(*v)];
         let frame = Frame { names: &names, values: &bound, calls: 0 };
-        let value = match eval(&cx, &frame, body, 0).map_err(|e| array::element_error(size, 1, k, o, e))? {
+        let value = match eval(&cx, &frame, body, 0).and_then(|d| d.strict(o)).map_err(|e| array::element_error(size, 1, k, o, e))? {
             value @ (Data::One(_) | Data::Text(_)) => value,
             Data::Grid(_) | Data::TextGrid(_) => {
                 return Err(CalcError::Syntax(format!("{name}[{i}] is one element — its right side can't be a vector")));
@@ -980,7 +1037,7 @@ fn each(cx: &Cx<'_>, x: &Data, f: impl FnMut(Val) -> Result<Val, CalcError>) -> 
     if let Some((rows, cols)) = x.shape() {
         charge_elements(cx, rows.saturating_mul(cols))?;
     }
-    array::map(x, cx.env.origin, f)
+    array::map(x, cx.env.origin, cx.lenient(), f)
 }
 
 /// `f` over `x` and `y` element by element (a single value broadcast over a grid), each element
@@ -991,7 +1048,7 @@ fn pair(cx: &Cx<'_>, x: &Data, y: &Data, f: impl FnMut(Val, Val) -> Result<Val, 
     if let Some((rows, cols)) = array::result_shape(x, y)? {
         charge_elements(cx, rows.saturating_mul(cols))?;
     }
-    array::zip(x, y, cx.env.origin, f)
+    array::zip(x, y, cx.env.origin, cx.lenient(), f)
 }
 
 /// Count `n` elements' work against the pass.

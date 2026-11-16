@@ -3,11 +3,14 @@
 //! A grid is rows × cols values stored row by row; a column vector has one column. Operations work
 //! element by element, broadcasting a single value over a grid, so every rule that holds for single
 //! values (units, temperatures, finiteness) holds for each element. One element in error makes the
-//! whole result an error naming that element. A grid holds at most [`MAX_ELEMENTS`], checked before
-//! its elements are built.
+//! whole result an error naming that element, unless the operation is lenient: then the element's
+//! error is kept in the grid's `failed` list and the work goes on (for branches that pick per
+//! element). Whatever takes a grid whole refuses one with failures ([`Data::strict`]). A grid holds
+//! at most [`MAX_ELEMENTS`], checked before its elements are built.
 
 use crate::eval::{Val, text_use};
 use crate::{CalcError, Value};
+use craft_units::Quantity;
 
 /// How many elements a grid may hold.
 pub(crate) const MAX_ELEMENTS: usize = 10_000;
@@ -21,6 +24,10 @@ pub(crate) struct Grid<T = Val> {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
     pub(crate) items: Vec<T>,
+    /// The elements whose work failed in a lenient operation, with their errors (not yet naming
+    /// the element), sorted by element: at most one per element. A failed element's item is a
+    /// placeholder that means nothing. Running out of work is never kept here.
+    pub(crate) failed: Vec<(usize, CalcError)>,
 }
 
 impl<T> Grid<T> {
@@ -28,7 +35,43 @@ impl<T> Grid<T> {
     /// error for no elements or a count that isn't `rows · cols`.
     pub(crate) fn new(rows: usize, cols: usize, items: Vec<T>) -> Result<Grid<T>, CalcError> {
         check_size(rows, cols, items.len())?;
-        Ok(Grid { rows, cols, items })
+        Ok(Grid { rows, cols, items, failed: Vec::new() })
+    }
+
+    /// The error of the first failed element, naming it; `None` when nothing failed.
+    fn first_failure(&self, origin: u8) -> Option<CalcError> {
+        let (k, e) = self.failed.first()?;
+        Some(element_error(self.rows, self.cols, *k, origin, e.clone()))
+    }
+}
+
+/// What a failed element's item holds: a value no one should read (not a number).
+pub(crate) fn placeholder() -> Val {
+    Val::plain(Quantity::dimensionless(f64::NAN))
+}
+
+/// The failures of a grid's elements, read in element order.
+pub(crate) struct Failures<'a> {
+    rest: &'a [(usize, CalcError)],
+}
+
+impl<'a> Failures<'a> {
+    pub(crate) fn of<T>(d: Option<&'a Grid<T>>) -> Failures<'a> {
+        Failures { rest: d.map_or(&[], |g| &g.failed) }
+    }
+
+    /// The error of element `k`, if it failed; `k` must not go down between calls.
+    pub(crate) fn at(&mut self, k: usize) -> Option<&'a CalcError> {
+        while let Some(((j, e), rest)) = self.rest.split_first() {
+            if *j > k {
+                return None;
+            }
+            self.rest = rest;
+            if *j == k {
+                return Some(e);
+            }
+        }
+        None
     }
 }
 
@@ -68,6 +111,25 @@ pub(crate) enum Data {
 }
 
 impl Data {
+    /// The data unchanged when no element failed; otherwise the error of the first failed element,
+    /// naming it, counted from `origin`. What takes a grid whole (an array function, an index, a
+    /// stored or shown value) calls this, so a failed element's placeholder never becomes a value.
+    pub(crate) fn strict(self, origin: u8) -> Result<Data, CalcError> {
+        match self.failure(origin) {
+            Some(e) => Err(e),
+            None => Ok(self),
+        }
+    }
+
+    /// The error [`Data::strict`] would give, without taking the data.
+    pub(crate) fn failure(&self, origin: u8) -> Option<CalcError> {
+        match self {
+            Data::One(_) | Data::Text(_) => None,
+            Data::Grid(g) => g.first_failure(origin),
+            Data::TextGrid(g) => g.first_failure(origin),
+        }
+    }
+
     /// The public form, without what each value stands for as a temperature.
     pub(crate) fn value(&self) -> Value {
         match self {
@@ -151,27 +213,57 @@ pub(crate) fn result_shape(a: &Data, b: &Data) -> Result<Option<(usize, usize)>,
 }
 
 /// `f` over `a` and `b` element by element, a single value broadcast over a grid. Two single
-/// values give `f`'s result (and its error) as it is; an element's error names the element,
-/// counted from `origin`.
-pub(crate) fn zip(a: &Data, b: &Data, origin: u8, mut f: impl FnMut(Val, Val) -> Result<Val, CalcError>) -> Result<Data, CalcError> {
+/// values give `f`'s result (and its error) as it is. An element that failed in either input fails
+/// in the result with that error (`a`'s when both did), without calling `f`. When `lenient`, an
+/// element's error is kept in the result's `failed` list; otherwise the first is returned, naming
+/// the element, counted from `origin`.
+pub(crate) fn zip(a: &Data, b: &Data, origin: u8, lenient: bool, mut f: impl FnMut(Val, Val) -> Result<Val, CalcError>) -> Result<Data, CalcError> {
     result_shape(a, b)?;
+    if let (Data::One(x), Data::One(y)) = (a, b) {
+        return f(*x, *y).map(Data::One);
+    }
+    let (mut fa, mut fb) = (Failures::of(grid_of(a)), Failures::of(grid_of(b)));
+    // Both inputs' failures are read at every element, so neither falls behind.
+    let mut step = |k: usize, x: Val, y: Val| {
+        let (ea, eb) = (fa.at(k), fb.at(k));
+        match ea.or(eb) {
+            Some(e) => Err(e.clone()),
+            None => f(x, y),
+        }
+    };
     match (a, b) {
-        (Data::One(x), Data::One(y)) => f(*x, *y).map(Data::One),
-        (Data::Grid(g), Data::One(y)) => build(g, origin, g.items.iter().map(|x| f(*x, *y))),
-        (Data::One(x), Data::Grid(g)) => build(g, origin, g.items.iter().map(|y| f(*x, *y))),
-        (Data::Grid(g), Data::Grid(h)) => build(g, origin, g.items.iter().zip(&h.items).map(|(x, y)| f(*x, *y))),
+        (Data::Grid(g), Data::One(y)) => build(g, origin, lenient, g.items.iter().enumerate().map(|(k, x)| step(k, *x, *y))),
+        (Data::One(x), Data::Grid(g)) => build(g, origin, lenient, g.items.iter().enumerate().map(|(k, y)| step(k, *x, *y))),
+        (Data::Grid(g), Data::Grid(h)) => build(g, origin, lenient, g.items.iter().zip(&h.items).enumerate().map(|(k, (x, y))| step(k, *x, *y))),
         // The evaluator refuses text before it gets here, with the place it was used.
         _ => Err(not_numbers(&[a, b])),
     }
 }
 
 /// `f` over every element of `a` (or `a` itself when it is a single value, whose error is returned
-/// as it is); an element's error names the element, counted from `origin`.
-pub(crate) fn map(a: &Data, origin: u8, mut f: impl FnMut(Val) -> Result<Val, CalcError>) -> Result<Data, CalcError> {
+/// as it is). An element that failed in `a` fails in the result with that error, without calling
+/// `f`. When `lenient`, an element's error is kept in the result's `failed` list; otherwise the
+/// first is returned, naming the element, counted from `origin`.
+pub(crate) fn map(a: &Data, origin: u8, lenient: bool, mut f: impl FnMut(Val) -> Result<Val, CalcError>) -> Result<Data, CalcError> {
     match a {
         Data::One(x) => f(*x).map(Data::One),
-        Data::Grid(g) => build(g, origin, g.items.iter().map(|x| f(*x))),
+        Data::Grid(g) => {
+            let mut failures = Failures::of(Some(g));
+            let results = g.items.iter().enumerate().map(|(k, x)| match failures.at(k) {
+                Some(e) => Err(e.clone()),
+                None => f(*x),
+            });
+            build(g, origin, lenient, results)
+        }
         Data::Text(_) | Data::TextGrid(_) => Err(not_numbers(&[a])),
+    }
+}
+
+/// The grid of numbers `d` holds, if any.
+fn grid_of(d: &Data) -> Option<&Grid> {
+    match d {
+        Data::Grid(g) => Some(g),
+        Data::One(_) | Data::Text(_) | Data::TextGrid(_) => None,
     }
 }
 
@@ -183,11 +275,44 @@ fn not_numbers(operands: &[&Data]) -> CalcError {
     }
 }
 
-/// A grid of `shape`'s shape from per-element results, stopping at the first error.
-fn build(shape: &Grid, origin: u8, results: impl Iterator<Item = Result<Val, CalcError>>) -> Result<Data, CalcError> {
+/// A grid of `shape`'s shape from per-element results. Strict, it stops at the first error, naming
+/// its element. Lenient, an element's error is kept in `failed` with a placeholder item, but
+/// running out of work still stops it.
+fn build(shape: &Grid, origin: u8, lenient: bool, results: impl Iterator<Item = Result<Val, CalcError>>) -> Result<Data, CalcError> {
     let (rows, cols) = (shape.rows, shape.cols);
-    let items = results.enumerate().map(|(k, r)| r.map_err(|e| element_error(rows, cols, k, origin, e))).collect::<Result<Vec<_>, _>>()?;
-    Grid::new(rows, cols, items).map(Data::Grid)
+    let mut failed = Vec::new();
+    let mut items = Vec::with_capacity(shape.items.len());
+    for (k, r) in results.enumerate() {
+        items.push(match r {
+            Ok(v) => v,
+            Err(e) => {
+                keep_failure(&mut failed, k, e, lenient, |e| element_error(rows, cols, k, origin, e))?;
+                placeholder()
+            }
+        });
+    }
+    let mut g = Grid::new(rows, cols, items)?;
+    g.failed = failed;
+    Ok(Data::Grid(g))
+}
+
+/// Keep element `k`'s error `e` in `failed` when `lenient`; otherwise, and for running out of work
+/// (never about an element), the error to stop with: `e` as `name` names it.
+pub(crate) fn keep_failure(
+    failed: &mut Vec<(usize, CalcError)>,
+    k: usize,
+    e: CalcError,
+    lenient: bool,
+    name: impl FnOnce(CalcError) -> CalcError,
+) -> Result<(), CalcError> {
+    match e {
+        CalcError::TooMuchWork | CalcError::TooComplex => Err(e),
+        e if lenient => {
+            failed.push((k, e));
+            Ok(())
+        }
+        e => Err(name(e)),
+    }
 }
 
 /// `error` as the error of element `k` of a `rows` × `cols` grid. Running out of work isn't about
@@ -209,5 +334,100 @@ pub(crate) fn element_name(rows: usize, cols: usize, k: usize, origin: u8) -> St
     } else {
         let (r, c) = (k.checked_div(cols).unwrap_or(0), k.checked_rem(cols).unwrap_or(0));
         format!("[{}, {}]", r.saturating_add(o), c.saturating_add(o))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Data, Grid, map, zip};
+    use crate::CalcError;
+    use crate::eval::Val;
+    use craft_units::Quantity;
+
+    fn num(v: f64) -> Val {
+        Val::plain(Quantity::dimensionless(v))
+    }
+
+    fn column(values: &[f64]) -> Data {
+        Data::Grid(Grid { rows: values.len(), cols: 1, items: values.iter().map(|&v| num(v)).collect(), failed: Vec::new() })
+    }
+
+    /// Fails on negative elements, else doubles.
+    fn double(v: Val) -> Result<Val, CalcError> {
+        if v.q.value < 0.0 { Err(CalcError::NonFinite) } else { Ok(num(2.0 * v.q.value)) }
+    }
+
+    fn grid(d: Data) -> Grid {
+        match d {
+            Data::Grid(g) => g,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn lenient_map_keeps_going_past_an_error() {
+        let g = grid(map(&column(&[1.0, -1.0, 3.0, -2.0]), 0, true, double).unwrap());
+        assert_eq!(g.failed, [(1, CalcError::NonFinite), (3, CalcError::NonFinite)]);
+        assert_eq!((g.items[0].q.value, g.items[2].q.value), (2.0, 6.0));
+        // Strict, the first error names its element.
+        let e = map(&column(&[1.0, -1.0, 3.0]), 1, false, double).unwrap_err();
+        assert_eq!(e.to_string(), "element 2: result isn't a finite number");
+    }
+
+    #[test]
+    fn strict_map_returns_an_input_failure() {
+        let mut g = grid(column(&[1.0, 2.0, 3.0]));
+        g.failed = vec![(1, CalcError::Upstream)];
+        let input = Data::Grid(g);
+        let mut calls = 0;
+        let e = map(&input, 0, false, |v| {
+            calls += 1;
+            double(v)
+        })
+        .unwrap_err();
+        assert_eq!(e, CalcError::Element { at: "1".into(), error: Box::new(CalcError::Upstream) });
+        assert_eq!(calls, 1, "stops at the failed element");
+        // Lenient, the failure passes to the output element without calling `f` on it.
+        let mut seen = Vec::new();
+        let out = grid(
+            map(&input, 0, true, |v| {
+                seen.push(v.q.value);
+                double(v)
+            })
+            .unwrap(),
+        );
+        assert_eq!(seen, [1.0, 3.0]);
+        assert_eq!(out.failed, [(1, CalcError::Upstream)]);
+        assert_eq!(input.clone().strict(0), Err(CalcError::Element { at: "1".into(), error: Box::new(CalcError::Upstream) }));
+        assert_eq!(column(&[1.0]).strict(0), Ok(column(&[1.0])));
+    }
+
+    #[test]
+    fn zip_merges_failures_in_element_order() {
+        let mut a = grid(column(&[1.0, 2.0, 3.0, 4.0]));
+        a.failed = vec![(2, CalcError::Upstream)];
+        let mut b = grid(column(&[1.0, 2.0, 3.0, 4.0]));
+        b.failed = vec![(0, CalcError::TempCompare), (2, CalcError::NotCondition)];
+        let (a, b) = (Data::Grid(a), Data::Grid(b));
+        let add = |x: Val, y: Val| if x.q.value == 4.0 { Err(CalcError::NonFinite) } else { Ok(num(x.q.value + y.q.value)) };
+        let g = grid(zip(&a, &b, 0, true, add).unwrap());
+        // `a`'s failure wins where both failed.
+        assert_eq!(g.failed, [(0, CalcError::TempCompare), (2, CalcError::Upstream), (3, CalcError::NonFinite)]);
+        assert_eq!(g.items[1].q.value, 4.0);
+        assert_eq!(
+            zip(&a, &b, 0, false, add).unwrap_err().to_string(),
+            CalcError::Element { at: "0".into(), error: Box::new(CalcError::TempCompare) }.to_string()
+        );
+        // A single value broadcast over a grid with failures keeps them.
+        let g = grid(zip(&Data::One(num(1.0)), &a, 0, true, add).unwrap());
+        assert_eq!(g.failed, [(2, CalcError::Upstream)]);
+    }
+
+    #[test]
+    fn running_out_of_work_is_never_kept_per_element() {
+        let e = map(&column(&[1.0, 2.0]), 0, true, |_| Err(CalcError::TooMuchWork)).unwrap_err();
+        assert_eq!(e, CalcError::TooMuchWork);
+        let e = map(&column(&[1.0, 2.0]), 0, true, |_| Err(CalcError::TooComplex)).unwrap_err();
+        assert_eq!(e, CalcError::TooComplex);
     }
 }

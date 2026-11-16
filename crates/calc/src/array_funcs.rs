@@ -39,26 +39,33 @@ pub(crate) struct Ctx<'a> {
 
 /// Call the array function `name` on evaluated `args`, written as `exprs`; `None` when `name`
 /// isn't one, and for `min`/`max` of single values only (those are scalar built-ins).
+///
+/// They take their arguments whole, so an argument with a failed element ([`Data::strict`]) is that
+/// element's error.
 pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Option<Result<Data, CalcError>> {
+    type Run = fn(&str, &[Data], &[Expr], &Ctx<'_>) -> Result<Data, CalcError>;
+    let run: Run = match name {
+        "min" | "max" if args.iter().all(|a| matches!(a, Data::One(_))) => return None,
+        "min" | "max" => |name, args, _, cx| extreme(name, args, cx),
+        "length" | "rows" | "cols" => |name, args, _, _| size(name, args),
+        "sum" | "mean" => |name, args, _, cx| total(name, args, cx),
+        "dot" => |_, args, exprs, cx| dot(args, exprs, cx),
+        "mmul" => |_, args, exprs, cx| mmul(args, exprs, cx),
+        "transpose" => |_, args, _, cx| transpose(args, cx),
+        "lookup" => |_, args, exprs, cx| lookup(args, exprs, cx),
+        "linterp" | "spline" => interpolate,
+        _ => return None,
+    };
+    if let Some(e) = args.iter().find_map(|a| a.failure(cx.origin)) {
+        return Some(Err(e));
+    }
     // Numbers only, but for the sizes and `transpose`.
-    if matches!(name, "min" | "max" | "sum" | "mean" | "dot" | "mmul" | "lookup" | "linterp" | "spline")
+    if !matches!(name, "length" | "rows" | "cols" | "transpose")
         && let Some(text) = args.iter().find_map(Data::text)
     {
         return Some(Err(text_use(text, format!("in {name}"))));
     }
-    let result = match name {
-        "min" | "max" if args.iter().all(|a| matches!(a, Data::One(_))) => return None,
-        "min" | "max" => extreme(name, args, cx),
-        "length" | "rows" | "cols" => size(name, args),
-        "sum" | "mean" => total(name, args, cx),
-        "dot" => dot(args, exprs, cx),
-        "mmul" => mmul(args, exprs, cx),
-        "transpose" => transpose(args, cx),
-        "lookup" => lookup(args, exprs, cx),
-        "linterp" | "spline" => interpolate(name, args, exprs, cx),
-        _ => return None,
-    };
-    Some(result)
+    Some(run(name, args, exprs, cx))
 }
 
 /// The numbers of `d`: a single value is one. Text has none, so a function that takes numbers
@@ -285,7 +292,7 @@ fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError
     // Every element of `x` is compared with every element of `xs`.
     charge(cx, items(x).len().saturating_add(1).saturating_mul(xs.len()))?;
     let dim = one_dim(xs, xs_name, cx.origin)?;
-    array::map(x, cx.origin, |x| {
+    array::map(x, cx.origin, false, |x| {
         fits(x.q, dim)?;
         let mut matches = xs.iter().enumerate().filter(|(_, xi)| nearly_equal(xi.q.value, x.q.value)).map(|(i, _)| i);
         match (matches.next(), matches.next()) {
@@ -329,7 +336,7 @@ fn interpolate(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Resul
     let yv: Vec<f64> = ys.iter().map(|v| v.q.value).collect();
     let curve = if name == "spline" { second_derivatives(&xv, &yv) } else { Vec::new() };
     let t = picked(ys);
-    array::map(x, cx.origin, |x| {
+    array::map(x, cx.origin, false, |x| {
         fits(x.q, x_dim)?;
         let v = x.q.value;
         // The first point at or past `v`: `v` is between it and the one before.

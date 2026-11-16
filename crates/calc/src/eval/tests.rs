@@ -1,5 +1,5 @@
-use super::{Env, Pass, Val, check_name, eval_expr, run_stmt, run_stmt_in};
-use crate::array::{Grid, element_name};
+use super::{Cx, Env, Frame, Pass, Val, check_display, check_name, compare_texts, eval_expr, eval_lenient, run_stmt, run_stmt_in};
+use crate::array::{Data, Grid, element_name};
 use crate::{CalcError, Expr, Op, Value, parse};
 use craft_units::{Dim, Precision, Quantity, UnitError, UnitSystem, format};
 
@@ -1286,4 +1286,134 @@ fn keywords_are_not_names() {
     }
     assert_eq!(CalcError::Keyword("or".into()).to_string(), "or is a reserved word — choose another name");
     assert!(check_name("order").is_ok());
+}
+
+/// The expression of `src` (written without its `=`), parsed.
+fn expr_of(src: &str) -> Expr {
+    match parse(&format!("{src} =")) {
+        Ok(crate::Stmt::Eval { expr, .. }) => expr,
+        other => panic!("{src:?} is not an expression: {other:?}"),
+    }
+}
+
+/// `src` evaluated in `env` with element failures kept per element.
+fn lenient_result(env: &Env, src: &str) -> Result<Data, CalcError> {
+    let pass = Pass::new(u64::MAX);
+    let cx = Cx::new(env, &pass);
+    let result = eval_lenient(&cx, &Frame::GLOBAL, &expr_of(src), 0);
+    assert_eq!(cx.lenient.get(), 0, "eval_lenient restores the flag");
+    result
+}
+
+fn lenient(env: &Env, src: &str) -> Data {
+    lenient_result(env, src).unwrap_or_else(|e| panic!("{src:?} failed: {e}"))
+}
+
+fn lenient_err(env: &Env, src: &str) -> String {
+    match lenient_result(env, src) {
+        Err(e) => e.to_string(),
+        Ok(d) => panic!("{src:?} should fail: {d:?}"),
+    }
+}
+
+/// The error of running `src` in `env`, as shown.
+fn err_in(env: &mut Env, src: &str) -> String {
+    match run(env, src) {
+        Err(e) => e.to_string(),
+        other => panic!("{src:?} should fail: {other:?}"),
+    }
+}
+
+fn failed_at<T>(g: &Grid<T>) -> Vec<usize> {
+    g.failed.iter().map(|(k, _)| *k).collect()
+}
+
+#[test]
+fn lenient_grids_keep_element_failures() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 0, 2]").unwrap();
+    let d = lenient(&env, "1/x");
+    let Data::Grid(g) = &d else { panic!("{d:?}") };
+    assert_eq!(g.failed.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [1]);
+    // Element-wise work carries the failure along; whole-array use refuses it.
+    let Data::Grid(g) = lenient(&env, "2·(1/x) + 1") else { panic!() };
+    assert_eq!(g.failed.len(), 1);
+    assert_eq!(g.items[2].q.value, 2.0);
+    assert!(lenient_err(&env, "sum(1/x)").starts_with("element 1:"));
+    // Strict evaluation is unchanged.
+    assert!(err_in(&mut env, "1/x =").starts_with("element 1:"));
+}
+
+#[test]
+fn lenient_failures_are_named_once() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 0, 2]").unwrap();
+    let strict = err_in(&mut env, "1/x =");
+    assert_eq!(lenient_err(&env, "sum(1/x)"), strict);
+    assert_eq!(lenient_err(&env, "sum(2·(1/x) + 1)"), strict);
+    // The raw error is kept, not one already naming the element.
+    let Data::Grid(g) = lenient(&env, "1/x") else { panic!() };
+    assert!(!matches!(g.failed[0].1, CalcError::Element { .. }), "{:?}", g.failed[0].1);
+}
+
+#[test]
+fn lenient_failures_pass_through_element_wise_operations() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 0, 4]").unwrap();
+    run(&mut env, "y := [1, 0, -4]").unwrap();
+    run(&mut env, "f(v) := v·2").unwrap();
+    // Built-ins applied element by element, comparisons, logic, `not`, user functions.
+    for src in
+        ["sqrt(1/x)", "-(1/x)", "|1/x|", "1/x > 0", "not (1/x > 0)", "1/x > 0 and x > 0", "x > 0 or 1/x > 0", "f(1/x)", "1/x + 1/x", "1/x < 2 < 3"]
+    {
+        let Data::Grid(g) = lenient(&env, src) else { panic!("{src}") };
+        assert_eq!(failed_at(&g), [1], "{src}");
+    }
+    // Each element keeps its own failure, in element order.
+    let Data::Grid(g) = lenient(&env, "sqrt(y)/y") else { panic!() };
+    assert_eq!(failed_at(&g), [1, 2]);
+    // The left side's failure wins where both fail.
+    let Data::Grid(g) = lenient(&env, "1/y + sqrt(y - 1)") else { panic!() };
+    assert_eq!(failed_at(&g), [1, 2]);
+    assert_eq!(g.failed[0].1, CalcError::NonFinite);
+}
+
+#[test]
+fn whole_array_uses_refuse_lenient_failures() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 0, 2]").unwrap();
+    run(&mut env, "M := [1, 0; 2, 3]").unwrap();
+    run(&mut env, "first(v) := v[0]").unwrap();
+    for src in ["sum(1/x)", "length(1/x)", "transpose(1/x)", "max(1/x)", "lookup(x, 1/x, 2)", "first(1/x)"] {
+        assert!(lenient_err(&env, src).starts_with("element 1:"), "{src}: {}", lenient_err(&env, src));
+    }
+    assert!(lenient_err(&env, "sum(1/M)").starts_with("element [0, 1]:"), "{}", lenient_err(&env, "sum(1/M)"));
+    // Work that runs out is never kept per element.
+    let big = Env::new();
+    let pass = Pass::new(10);
+    let cx = Cx::new(&big, &pass);
+    assert_eq!(eval_lenient(&cx, &Frame::GLOBAL, &expr_of("1/[1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]"), 0), Err(CalcError::TooMuchWork));
+    assert_eq!(cx.lenient.get(), 0);
+}
+
+#[test]
+fn strict_boundaries_refuse_failed_grids() {
+    let env = Env::new();
+    let failed = Grid { rows: 2, cols: 1, items: vec![Val::plain(Quantity::dimensionless(1.0)); 2], failed: vec![(1, CalcError::NonFinite)] };
+    let d = Data::Grid(failed);
+    let want = "element 1: result isn't a finite number";
+    assert_eq!(d.clone().strict(0).map_err(|e| e.to_string()), Err(want.to_string()));
+    assert_eq!(check_display(&env, "m", &d).map_err(|e| e.to_string()).err().as_deref(), Some(want));
+    // Text grids too: a comparison keeps or refuses their failures like numbers.
+    let texts =
+        Data::TextGrid(Grid { rows: 3, cols: 1, items: vec!["a".into(), String::new(), "b".into()], failed: vec![(1, CalcError::NonFinite)] });
+    assert!(texts.clone().strict(0).is_err());
+    let pass = Pass::new(u64::MAX);
+    let cx = Cx::new(&env, &pass);
+    let b = Data::Text("b".into());
+    assert_eq!(compare_texts(&cx, &texts, crate::Cmp::Eq, &b).map_err(|e| e.to_string()), Err(want.to_string()));
+    cx.lenient.set(1);
+    let Ok(Data::Grid(g)) = compare_texts(&cx, &b, crate::Cmp::Eq, &texts) else { panic!() };
+    assert_eq!(failed_at(&g), [1]);
+    assert_eq!(g.items[2].q.value, 1.0);
 }
