@@ -739,4 +739,6 @@ fn resolve_edited(s: &mut Session, v: &Value) -> CmdResult {
 #[cfg(test)]
 mod flange_bolt_sample;
 #[cfg(test)]
+mod pipe_wall_sample;
+#[cfg(test)]
 mod tests;
