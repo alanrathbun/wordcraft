@@ -225,3 +225,26 @@ fn malformed_text_results_read_back_as_nothing() {
     }
     assert_eq!(shown_result("x≔\"a=b\"≈\"c\""), Some(Shown::Text("c".into())));
 }
+
+#[test]
+fn the_largest_text_grid_reads_back() {
+    // Every cell shown, each as long as a text gets, of 4-byte characters: the longest result.
+    let text = "😀".repeat(crate::array::MAX_TEXT_CHARS);
+    let shown = Shown::TextGrid { rows: 50, cols: 50, items: vec![text; 2_500], total_rows: 50, total_cols: 50 };
+    let linear = shown_linear(&shown);
+    assert!(linear.len() > 4 << 20 && linear.len() < MAX_RESULT_BYTES, "{}", linear.len());
+    assert_eq!(shown_result(&linear), Some(shown));
+}
+
+#[test]
+fn the_result_is_found_from_the_end() {
+    // An unbalanced quote in the expression (stored text edited outside WordCraft) before the result.
+    assert_eq!(shown_result("a \"b ≔ 2=\"OK\""), Some(Shown::Text("OK".into())));
+    assert_eq!(shown_result("a \"b ≔ 2=600 \"psi\""), Some(Shown::One(f("600", "psi"))));
+    assert_eq!(
+        shown_result("\"\"\" x=[■(\"a=b\"@\"c\")]"),
+        Some(Shown::TextGrid { rows: 2, cols: 1, items: vec!["a=b".into(), "c".into()], total_rows: 2, total_cols: 1 })
+    );
+    // Nothing from the end back to a relation within the longest result: no result.
+    assert_eq!(shown_result(&format!("x={}", "a".repeat(MAX_RESULT_BYTES + 1))), None);
+}

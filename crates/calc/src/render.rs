@@ -60,9 +60,11 @@ const CUT: &str = "⋮";
 const COL_CUT: &str = "⋯";
 /// Where the cut row and the cut column meet.
 const CORNER: &str = "⋱";
-/// Longest result text [`shown_result`] reads back, bytes: well over what [`rendered`] writes for
-/// the largest grid, so anything longer came from somewhere else.
-const MAX_RESULT_BYTES: usize = 4 << 20;
+/// Longest result text [`shown_result`] reads back, bytes: what [`rendered`] writes for the
+/// largest grid (every cell shown, the cut row and column, each text as long as a text gets, all
+/// of 4-byte characters, with its quotes and separator), and a margin for the unit and size notes.
+/// Anything longer came from somewhere else.
+const MAX_RESULT_BYTES: usize = (MAX_SHOWN_ROWS + 1) * (MAX_SHOWN_COLS + 1) * (4 * MAX_TEXT_CHARS + 8) + 4096;
 
 /// A result as shown after `=`: formatted, ready to display.
 #[derive(Debug, Clone, PartialEq)]
@@ -342,24 +344,28 @@ pub(crate) fn unnumbered(nodes: &[MNode]) -> Option<Arg> {
 /// in a result [`rendered`] could have written. The text comes from files, so the work is bounded
 /// by its length, and a result longer than any [`rendered`] writes is no result.
 ///
-/// The result follows the last `=` or `≈` outside quotes: units and texts are quoted and have no
-/// quote inside, so a text holding an `=` (or an `&`, `@`, `)`) is never taken for the result's
-/// start or end.
+/// The result follows the last `=` or `≈` outside quotes, found scanning back from the end, so it
+/// depends on the result's own quotes alone (whatever the expression before it holds, quoted or
+/// not). Units and texts are quoted and have no quote inside, so a text holding an `=` (or an `&`,
+/// `@`, `)`) is never taken for the result's start or end.
 pub(crate) fn shown_result(linear: &str) -> Option<Shown> {
     let linear = linear.strip_suffix('#').unwrap_or(linear);
     let mut quoted = false;
     let mut start = None;
-    for (i, c) in linear.char_indices() {
+    for (i, c) in linear.char_indices().rev() {
+        if linear.len().saturating_sub(i) > MAX_RESULT_BYTES {
+            return None;
+        }
         match c {
             '"' => quoted = !quoted,
-            '=' | '≈' if !quoted => start = Some(i + c.len_utf8()),
+            '=' | '≈' if !quoted => {
+                start = Some(i + c.len_utf8());
+                break;
+            }
             _ => {}
         }
     }
     let tail = linear.get(start?..)?;
-    if tail.len() > MAX_RESULT_BYTES {
-        return None;
-    }
     if let Some(grid) = tail.strip_prefix("[■(") {
         return grid_result(grid);
     }
