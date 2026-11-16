@@ -85,8 +85,10 @@ verdict per pipe size.
     element k of the result takes element k of the branch it picks.
   - **Element failures are kept per element:** an element that fails inside a branch (`1/x` at
     `x = 0`) fails the result only if that element picks that branch.
-  - **Whole-branch failures:** a branch that fails as a whole (a shape mismatch, or a lookup with no
-    match) fails the result only if some element picks it.
+  - **Whole-branch failures:** a branch that fails as a whole (a shape mismatch, or a lookup of a
+    single key with no match) fails the result only if some element picks it. A lookup or
+    interpolation over a vector of keys fails per element, so a key outside the table fails only an
+    element that picks that branch.
   - Results combine into one vector.
   - A vector that would mix text and numbers is an error naming the element ("element 3 is text but
     element 1 is a number").
