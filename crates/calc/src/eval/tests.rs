@@ -1597,3 +1597,32 @@ fn deep_piecewise_is_refused_not_a_stack_overflow() {
     };
     std::thread::Builder::new().stack_size(8 << 20).spawn(deep).expect("spawns").join().expect("no panic");
 }
+
+#[test]
+fn no_case_messages_are_written_only_when_they_can_be_seen() {
+    let spent = |env: &mut Env, src: &str| {
+        let pass = Pass::new(u64::MAX);
+        let _ = run_stmt_in(env, &parse(src).unwrap(), &pass);
+        pass.spent.get()
+    };
+    let mut env = Env::new();
+    run(&mut env, "v := 1..10000").unwrap();
+    run(&mut env, "neg(w) := 5 if w < 2").unwrap();
+    run(&mut env, "neg_2(w) := 5 if w < 2, 6 otherwise").unwrap();
+    // In a branch only the first element picks, the other 9,999 elements' messages are still
+    // written (the branch keeps them), and each counts as work.
+    let without = spent(&mut env, "n := neg_2(v) if v < 2, 0 otherwise");
+    let with = spent(&mut env, "n := neg(v) if v < 2, 0 otherwise");
+    assert!(with >= without + 9_990, "{with} vs {without}");
+    let tight = Pass::new(without + 5_000);
+    assert_eq!(run_stmt_in(&mut env, &parse("n := neg(v) if v < 2, 0 otherwise").unwrap(), &tight), Err(CalcError::TooMuchWork));
+    assert_eq!(run(&mut env, "n := neg(v) if v < 2, 0 otherwise"), Ok(None));
+    // A strict caller is told of the first failed element only, so only that message is written.
+    let (strict, decided) = (spent(&mut env, "n := 5 if v < 0"), spent(&mut env, "n := 5 if v < 0, 6 otherwise"));
+    assert!(strict <= decided + 5, "{strict} vs {decided}");
+    assert_eq!(err_in(&mut env, "n := 5 if v < 0"), "element 0: no case applies (v = 1)");
+    // The first failed element is reported, whatever failed it.
+    run(&mut env, "x := [0, 5, -1]").unwrap();
+    assert_eq!(err_in(&mut env, "n := 1/x if x < 1"), "element 0: result isn't a finite number");
+    assert_eq!(err_in(&mut env, "n := 1/x if x < 0"), "element 0: no case applies (x = 0)");
+}

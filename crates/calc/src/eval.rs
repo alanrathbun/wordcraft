@@ -899,6 +899,8 @@ enum Slot {
     Text(String),
     /// Its error (not naming the element).
     Failed(CalcError),
+    /// No case of a piecewise holds for it: [`CalcError::NoCase`], its message not yet written.
+    NoCase,
 }
 
 /// The piecewise `cases` ([`piecewise`]).
@@ -979,11 +981,9 @@ fn per_element(
         }
     }
     if open > 0 {
-        let vars = if otherwise.is_none() { case_vars(cx.env, fr, cases, Some((rows, cols))) } else { Vec::new() };
-        for (k, s) in slots.iter_mut().enumerate() {
-            if matches!(s, Slot::Open) {
-                *s = if otherwise.is_some() { Slot::Case(cases.len()) } else { Slot::Failed(no_case(cx, &vars, Some(k))) };
-            }
+        let other = otherwise.map(|_| cases.len());
+        for s in slots.iter_mut().filter(|s| matches!(s, Slot::Open)) {
+            *s = other.map_or(Slot::NoCase, Slot::Case);
         }
     }
     // Each value some element picks, worked out once; its elements taken in order.
@@ -997,7 +997,33 @@ fn per_element(
         same_shape((rows, cols), &v)?;
         take(cx, &v, group.iter().map(|&(_, k)| k), &mut slots)?;
     }
+    write_no_cases(cx, fr, cases, (rows, cols), &mut slots)?;
     assemble(cx, rows, cols, slots)
+}
+
+/// Write the message of each element of `slots` that no case holds for ([`no_case`]), naming the
+/// conditions' variables at that element. A strict caller is told of the first failed element
+/// only, so only that one is written when it is one of these; for a lenient caller, which keeps
+/// them all, each is written. Writing one counts as work (a step, and one per 32 bytes), since a
+/// branch that no element picks may hold thousands of them.
+fn write_no_cases(cx: &Cx<'_>, fr: &Frame<'_>, cases: &[(&Expr, &Expr)], shape: (usize, usize), slots: &mut [Slot]) -> Result<(), CalcError> {
+    let failed = |s: &Slot| matches!(s, Slot::Failed(_) | Slot::NoCase);
+    let lenient = cx.lenient();
+    let first = slots.iter().position(failed);
+    if !first.is_some_and(|k| lenient || matches!(slots.get(k), Some(Slot::NoCase))) {
+        return Ok(());
+    }
+    let vars = case_vars(cx.env, fr, cases, Some(shape));
+    for (k, s) in slots.iter_mut().enumerate().filter(|(k, _)| lenient || Some(*k) == first) {
+        if matches!(s, Slot::NoCase) {
+            let e = no_case(cx, &vars, Some(k));
+            let CalcError::NoCase(values) = &e else { continue };
+            let bytes: usize = values.iter().map(String::len).sum();
+            cx.pass.charge(u64::try_from(bytes / 32).unwrap_or(u64::MAX).saturating_add(1))?;
+            *s = Slot::Failed(e);
+        }
+    }
+    Ok(())
 }
 
 /// Mark the elements still open in `slots` that the condition `c` (1s and 0s, of their shape)
@@ -1075,10 +1101,11 @@ fn assemble(cx: &Cx<'_>, rows: usize, cols: usize, slots: Vec<Slot>) -> Result<D
     if let (Some(t), Some(n)) = (first_text, first_number) {
         return Err(array::mixed(rows, cols, t, n, o));
     }
-    // Every element is decided and taken before this; were one not, it has no value.
+    // Every element is decided and taken before this, and a no-case message written for every
+    // one that can be reported; were one not, it has no value.
     let failure = |s: Slot| match s {
         Slot::Failed(e) => e,
-        Slot::Open | Slot::Case(_) | Slot::Num(_) | Slot::Text(_) => CalcError::NoCase(Vec::new()),
+        Slot::NoCase | Slot::Open | Slot::Case(_) | Slot::Num(_) | Slot::Text(_) => CalcError::NoCase(Vec::new()),
     };
     let mut failed: Vec<(usize, CalcError)> = Vec::new();
     let data = if first_text.is_some() {

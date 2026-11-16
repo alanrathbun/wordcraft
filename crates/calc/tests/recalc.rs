@@ -1985,6 +1985,15 @@ fn piecewise_definitions_recalculate() {
     assert_eq!(region(&d, 2).0.state, CalcState::Fresh);
     assert!(region(&d, 2).1.ends_with(")┤=0.7"), "{}", region(&d, 2).1);
     assert_eq!(region(&d, 3).0.state, CalcState::Error("no case applies (T = 1000 °F)".into()));
+    // Stale, the result is read back from after the brace.
+    mark_stale(&mut d);
+    assert!(region(&d, 2).1.ends_with(")┤≈0.7"), "{}", region(&d, 2).1);
+    // A text result, with `==` in a condition and `=` inside a text, reads back too.
+    let mut d = doc_with(&["T := 1000 °F", "c := \"a = 1\" if T == 1000 °F, \"b = 2\" otherwise ="]);
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 2).1.ends_with(")┤=\"a = 1\""), "{}", region(&d, 2).1);
+    mark_stale(&mut d);
+    assert!(region(&d, 2).1.ends_with(")┤≈\"a = 1\""), "{}", region(&d, 2).1);
     // Every name in every branch is a dependency: a failure upstream fails it, picked or not.
     let mut d = doc_with(&["a := 1 in + 1 lbf", "Y := 1 if 1 > 0, a otherwise ="]);
     recalc(&mut d, &no_page);
@@ -2002,6 +2011,10 @@ fn perf_1000_element_piecewise() {
     // Branches that fail for the elements that don't pick them: a negative root, and a division by
     // zero at x = 0.5 in.
     sources.extend((0..50).map(|k| format!("y_{k} := sqrt(x/(1 in) - {k}) if x ≥ {k} in, 1/(x/(1 in) - 0.5) if x > 0.5 in, 0 otherwise")));
+    // A function with no `otherwise`, used only where it has a case: its other elements fail with
+    // a no-case message that nothing reads.
+    sources.push("neg(v) := 5 if v < 1 in".to_string());
+    sources.extend((0..20).map(|k| format!("n_{k} := neg(x) if x < 1 in, {k} otherwise")));
     let mut blocks = vec![table_block(data_table(1, &rows))];
     blocks.extend(sources.iter().enumerate().map(|(i, s)| para_block(para(vec![calc_eq(i as u64 + 1, s)]))));
     let mut d = doc_of(blocks);
@@ -2012,7 +2025,7 @@ fn perf_1000_element_piecewise() {
     let report = recalc(&mut d, &no_page);
     let took = start.elapsed();
     println!("perf_1000_element_piecewise: {took:?}");
-    assert_eq!(report.regions, 52);
+    assert_eq!(report.regions, 73);
     assert_eq!(report.errors, 0, "{:?}", regions(&d).iter().map(|r| r.0.state.clone()).collect::<Vec<_>>());
     assert!(region(&d, 2).1.ends_with("=271"), "{}", region(&d, 2).1);
     assert!(took.as_millis() < 100, "recalc took {took:?}");
