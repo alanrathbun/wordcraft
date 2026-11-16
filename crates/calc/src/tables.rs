@@ -7,6 +7,10 @@
 //! followed by a unit of the heading's dimension. Cells are not calculations: anything else is an
 //! error naming the column and row, never a guess (`1-1/2` is never 0.5, a blank is never 0).
 //!
+//! A heading `Name (text)` makes a text column instead: each cell is its text, trimmed (a number
+//! there is text, `"6"`), and may not be empty, hold a quote mark or run past 1,000 characters.
+//! Every other column stays strictly numeric.
+//!
 //! Table text and structure come from files, so both are hostile: a column holds at most
 //! [`MAX_ELEMENTS`] values, a table at most [`MAX_COLS`] columns, and nothing here panics.
 
@@ -16,7 +20,7 @@ use wordcraft_doc::props::VMerge;
 use wordcraft_doc::table::MAX_COLS;
 use wordcraft_doc::{Block, Cell, Paragraph, Table};
 
-use crate::array::MAX_ELEMENTS;
+use crate::array::{MAX_ELEMENTS, MAX_TEXT_CHARS};
 use crate::parse::is_keyword;
 use crate::{CalcError, Env, Expr, Stmt, check_name, defined_name, parse};
 
@@ -24,24 +28,40 @@ fn syntax(message: impl Into<String>) -> CalcError {
     CalcError::Syntax(message.into())
 }
 
-/// A heading read as a name and its unit: `"D_o (in)"` is `("D_o", Some("in"))` and `"t_nom"` is
-/// `("t_nom", None)`. The name must be a valid calculation name that isn't a unit, function or
-/// constant, and the unit must read. Whether `g` in the unit means gravity is the caller's check.
-pub(crate) fn heading(text: &str) -> Result<(String, Option<String>), CalcError> {
+/// What a column holds, by its heading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ColumnKind {
+    /// Plain numbers: `t_nom`.
+    Plain,
+    /// Numbers in a unit: `D_o (in)` is `Unit("in")`.
+    Unit(String),
+    /// Texts: `Material (text)`, the unit `text` in any case.
+    Text,
+}
+
+/// A heading read as a name and what its column holds: `"D_o (in)"` is `("D_o", Unit("in"))`,
+/// `"t_nom"` is `("t_nom", Plain)` and `"Material (text)"` is `("Material", Text)`. The name must
+/// be a valid calculation name that isn't a unit, function or constant, and the unit must read.
+/// Whether `g` in the unit means gravity is the caller's check.
+pub(crate) fn heading(text: &str) -> Result<(String, ColumnKind), CalcError> {
     let text = text.trim();
     let name = heading_name(text)?;
-    let unit = match text.split_once('(') {
+    let kind = match text.split_once('(') {
         Some((_, rest)) => {
             let unit = rest.strip_suffix(')').map(str::trim).filter(|u| !u.is_empty());
             let Some(unit) = unit else {
                 return Err(syntax(format!("the heading {text} needs a unit in brackets at its end, like D_o (in)")));
             };
-            parse_unit(unit)?;
-            Some(unit.to_string())
+            if unit.eq_ignore_ascii_case("text") {
+                ColumnKind::Text
+            } else {
+                parse_unit(unit)?;
+                ColumnKind::Unit(unit.to_string())
+            }
         }
-        None => None,
+        None => ColumnKind::Plain,
     };
-    Ok((name.to_string(), unit))
+    Ok((name.to_string(), kind))
 }
 
 /// The name a heading gives (the text before any `(`), when it is a valid calculation name that
@@ -63,6 +83,21 @@ fn heading_name(text: &str) -> Result<&str, CalcError> {
     }
     check_name(name)?;
     Ok(name)
+}
+
+/// What a text column's cell holds: its text, which `cell_text` has trimmed. Empty, holding a
+/// quote mark (a text can't) or too long is an error saying so, to follow the column's name and row.
+fn text_cell(text: &str) -> Result<String, &'static str> {
+    if text.is_empty() {
+        return Err("is empty");
+    }
+    if text.contains('"') {
+        return Err("has a quote mark \", which text can't hold");
+    }
+    if text.chars().nth(MAX_TEXT_CHARS).is_some() {
+        return Err("is longer than 1,000 characters");
+    }
+    Ok(text.to_string())
 }
 
 /// What a data cell's text means: a number and the unit written after it, if any. The number is a
@@ -293,7 +328,11 @@ pub(crate) fn column_stmts(t: &Table, g_is_gravity: bool) -> (Vec<(u32, Result<S
 fn column(t: &Table, c: usize, live: &[usize], env: &Env) -> Result<Stmt, CalcError> {
     let head = t.rows.first().and_then(|r| r.cells.get(c)).ok_or(CalcError::UpstreamTable)?;
     let text = cell_text(head).map_err(|e| syntax(format!("the heading of column {} {e}", c.saturating_add(1))))?;
-    let (name, unit) = heading(&text)?;
+    let (name, kind) = heading(&text)?;
+    let unit = match &kind {
+        ColumnKind::Unit(unit) => Some(unit.clone()),
+        ColumnKind::Plain | ColumnKind::Text => None,
+    };
     if let Some(unit) = &unit {
         env.check_display_unit(unit)?;
     }
@@ -302,11 +341,16 @@ fn column(t: &Table, c: usize, live: &[usize], env: &Env) -> Result<Stmt, CalcEr
     if values > MAX_ELEMENTS {
         return Err(CalcError::TooLarge);
     }
+    let text_column = kind == ColumnKind::Text;
     let mut items = Vec::with_capacity(values);
     for &k in live {
         let at = |message: &str| syntax(format!("{name} row {k} {message}"));
         let cell = t.rows.get(k).and_then(|r| r.cells.get(c)).ok_or_else(|| at("isn't a number"))?;
         let text = cell_text(cell).map_err(|e| at(&e))?;
+        if text_column {
+            items.push(Expr::Text(text_cell(&text).map_err(at)?));
+            continue;
+        }
         let (value, own) = cell_value(&text).map_err(|e| at(&e))?;
         let item = match (own, &unit) {
             (None, None) => Expr::Num(value),
@@ -352,9 +396,21 @@ mod tests {
     }
 
     #[test]
+    fn text_cells_are_checked() {
+        assert_eq!(text_cell("A106 B"), Ok("A106 B".to_string()));
+        assert_eq!(text_cell("6"), Ok("6".to_string()));
+        assert_eq!(text_cell(""), Err("is empty"));
+        assert_eq!(text_cell("1/2\" pipe"), Err("has a quote mark \", which text can't hold"));
+        assert!(text_cell(&"x".repeat(MAX_TEXT_CHARS)).is_ok());
+        assert_eq!(text_cell(&"x".repeat(MAX_TEXT_CHARS + 1)), Err("is longer than 1,000 characters"));
+    }
+
+    #[test]
     fn headings() {
-        assert_eq!(heading("D_o (in)"), Ok(("D_o".to_string(), Some("in".to_string()))));
-        assert_eq!(heading("t_nom"), Ok(("t_nom".to_string(), None)));
+        assert_eq!(heading("D_o (in)"), Ok(("D_o".to_string(), ColumnKind::Unit("in".to_string()))));
+        assert_eq!(heading("t_nom"), Ok(("t_nom".to_string(), ColumnKind::Plain)));
+        assert_eq!(heading("Material (Text)"), Ok(("Material".to_string(), ColumnKind::Text)));
+        assert_eq!(heading("Material (TEXT)"), Ok(("Material".to_string(), ColumnKind::Text)));
         for bad in ["2x (in)", "m (kg)", "D_o (furlongs)"] {
             assert!(heading(bad).is_err(), "{bad:?} reads as {:?}", heading(bad));
         }

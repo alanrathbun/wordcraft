@@ -2048,3 +2048,57 @@ fn a_sum_calculates_and_shows_in_a_document() {
     // The sum is a real ∑ in the tree.
     assert!(region(&d, 4).2.nodes.iter().any(|n| matches!(n, MNode::Nary { chr: '∑', .. })));
 }
+
+const MATERIALS: &[&[&str]] = &[&["Material (text)", "Sa (ksi)"], &["A106 B", "20"], &["A312 TP316", "20"], &["A333 6", "20"]];
+
+#[test]
+fn text_columns_feed_lookups() {
+    let mut d = doc_of(vec![
+        table_block(data_table(1, MATERIALS)),
+        para_block(para(vec![calc_eq(8, "S_allow := lookup(Material, Sa, \"A106 B\") =")])),
+        para_block(para(vec![calc_eq(9, "grade := lookup(Sa, Material, 20 ksi) =")])),
+        para_block(para(vec![calc_eq(10, "bad := lookup(Material, Sa, \"A106 C\") =")])),
+    ]);
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 8).1.ends_with("=20000 \"psi\""), "{}", region(&d, 8).1);
+    assert!(matches!(region(&d, 9).0.state, CalcState::Error(ref m) if m.contains("matches more than one value in Sa")));
+    assert_eq!(region(&d, 10).0.state, CalcState::Error("\"A106 C\" isn't in Material".into()));
+    set_cell(&mut d, 0, 2, 0, "");
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message: "Material row 2 is empty".into() }]);
+    set_cell(&mut d, 0, 2, 0, "1/2\" pipe");
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors[0].message, "Material row 2 has a quote mark \", which text can't hold");
+    // A number in a text column is text; a numeric column stays strict.
+    set_cell(&mut d, 0, 2, 0, "6");
+    set_cell(&mut d, 0, 3, 1, "twenty");
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors.iter().map(|e| e.message.as_str()).collect::<Vec<_>>(), ["Sa row 3 isn't a number"]);
+}
+
+#[test]
+fn a_fahrenheit_column_compares_as_temperatures() {
+    // Review Focus 2.
+    let mut d = doc_of(vec![
+        table_block(data_table(1, &[&["T (°F)"], &["800"], &["950"]])),
+        para_block(para(vec![calc_eq(8, "Y := 0.4 if T ≤ 900 °F, 0.7 otherwise =")])),
+    ]);
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 8).1.ends_with("=[■(0.4@0.7)]"), "{}", region(&d, 8).1);
+}
+
+#[test]
+fn text_lookups_follow_the_kinds_and_refuse_a_mismatch() {
+    let mut d = doc_of(vec![
+        table_block(data_table(1, MATERIALS)),
+        para_block(para(vec![calc_eq(8, "a := lookup(Material, Sa, [\"A333  6\", \"A106 B\"]) =")])),
+        para_block(para(vec![calc_eq(9, "b := lookup(Material, Sa, 20 ksi) =")])),
+        para_block(para(vec![calc_eq(10, "c := lookup(Sa, Material, \"A106 B\") =")])),
+        para_block(para(vec![calc_eq(11, "e := lookup(Material, Material, [\"A106 B\", \"A333 6\"]) =")])),
+    ]);
+    recalc(&mut d, &no_page);
+    assert!(region(&d, 8).1.ends_with("=[■(20000@20000)] \"psi\""), "{}", region(&d, 8).1);
+    assert_eq!(region(&d, 9).0.state, CalcState::Error("can't compare \"A106 B\" with a number".into()));
+    assert_eq!(region(&d, 10).0.state, CalcState::Error("can't compare \"A106 B\" with a number".into()));
+    assert!(region(&d, 11).1.contains("A106 B"), "{}", region(&d, 11).1);
+}

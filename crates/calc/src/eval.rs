@@ -83,7 +83,7 @@ pub(crate) fn text_use(text: &str, place: impl Into<Cow<'static, str>>) -> CalcE
 }
 
 /// `text` cut to [`SHOWN_TEXT_CHARS`] characters, with `…` when it was cut.
-fn cut_text(text: &str) -> String {
+pub(crate) fn cut_text(text: &str) -> String {
     let mut shown: String = text.chars().take(SHOWN_TEXT_CHARS).collect();
     if text.chars().nth(SHOWN_TEXT_CHARS).is_some() {
         shown.push('…');

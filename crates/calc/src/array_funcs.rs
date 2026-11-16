@@ -7,7 +7,7 @@
 //! - **Interpolation:** `linterp(xs, ys, x)` (linear) and `spline(xs, ys, x)` (natural cubic
 //!   spline), over `xs` strictly increasing.
 //!
-//! `length`, `rows`, `cols` and `transpose` also take text; every other one refuses it.
+//! `length`, `rows`, `cols`, `transpose` and `lookup` also take text; every other one refuses it.
 //!
 //! None of them guesses: a lookup that matches no `xs` and an interpolation outside `xs` are
 //! errors, never the nearest value or an extrapolation. `x` may be a grid, giving one result per
@@ -15,7 +15,7 @@
 //! by its role (`xs`). Each function charges its element work to the pass before doing it.
 
 use crate::array::{self, Data, Grid, MAX_ELEMENTS};
-use crate::eval::{Pass, Val, picked, text_use};
+use crate::eval::{Pass, Val, cut_text, picked, text_use};
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, render};
 use craft_units::{Dim, Formatted, Precision, Quantity, UnitError, UnitSystem, format};
@@ -59,8 +59,8 @@ pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>
     if let Some(e) = args.iter().find_map(|a| a.failure(cx.origin)) {
         return Some(Err(e));
     }
-    // Numbers only, but for the sizes and `transpose`.
-    if !matches!(name, "length" | "rows" | "cols" | "transpose")
+    // Numbers only, but for the sizes, `transpose` and `lookup`.
+    if !matches!(name, "length" | "rows" | "cols" | "transpose" | "lookup")
         && let Some(text) = args.iter().find_map(Data::text)
     {
         return Some(Err(text_use(text, format!("in {name}"))));
@@ -163,10 +163,35 @@ fn total(name: &str, args: &[Data], cx: &Ctx<'_>) -> Result<Data, CalcError> {
 /// The elements of `d`, which `f` needs to be a vector (a single value is one element); an error
 /// naming it as `label` for a matrix.
 fn vector<'a>(f: &str, d: &'a Data, label: &str) -> Result<&'a [Val], CalcError> {
-    match d {
-        Data::Grid(g) if g.rows != 1 && g.cols != 1 => Err(CalcError::Syntax(format!("{f} needs {label} to be a vector, not a matrix"))),
-        _ => Ok(items(d)),
+    check_vector(f, d, label)?;
+    Ok(items(d))
+}
+
+/// `d`, of numbers or of texts, must be a vector for `f` (a single value is one element).
+fn check_vector(f: &str, d: &Data, label: &str) -> Result<(), CalcError> {
+    match d.shape() {
+        Some((rows, cols)) if rows != 1 && cols != 1 => Err(CalcError::Syntax(format!("{f} needs {label} to be a vector, not a matrix"))),
+        _ => Ok(()),
     }
+}
+
+/// The texts of `d`: a single text is one. Numbers have none.
+fn texts(d: &Data) -> &[String] {
+    match d {
+        Data::Text(s) => std::slice::from_ref(s),
+        Data::TextGrid(g) => &g.items,
+        Data::One(_) | Data::Grid(_) => &[],
+    }
+}
+
+/// How many elements `d` has: a single value or text is one.
+fn count(d: &Data) -> usize {
+    d.shape().map_or(1, |(rows, cols)| rows.saturating_mul(cols))
+}
+
+/// The work of reading `d`'s texts, by their size (a number's is in its element count).
+fn text_work(d: &Data) -> u64 {
+    texts(d).iter().fold(0, |n, s| n.saturating_add(array::text_steps(s)))
 }
 
 /// `f`'s two vectors `a` and `b` must have the same length.
@@ -279,28 +304,101 @@ fn fits(x: Quantity, dim: Dim) -> Result<(), CalcError> {
     if x.dim.same_ignoring_angle(dim) { Ok(()) } else { Err(CalcError::Unit(UnitError::Mismatch { left: x.dim, right: dim })) }
 }
 
-/// `lookup(xs, ys, x)`: the `ys` value whose `xs` equals `x` (to within [`EQUAL`], after unit
-/// conversion), for each element of `x`. No match is an error, never the nearest value, and so is
-/// more than one (repeated `xs`), never the first.
+/// `lookup(xs, ys, x)`: the `ys` value whose `xs` equals `x` (numbers to within [`EQUAL`], after
+/// unit conversion; texts by [`array::text_key`]), for each element of `x`. `xs` is of numbers or
+/// of texts, and so `x` must be; `ys` is of either, and the result is of its kind. No match is an
+/// error, never the nearest value, and so is more than one (repeated `xs`), never the first.
 fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError> {
     let [xs, ys, x] = args else {
         return Err(CalcError::Arity("lookup".to_string(), 3));
     };
     let (xs_name, ys_name) = (arg_name(exprs, 0, "xs"), arg_name(exprs, 1, "ys"));
-    let (xs, ys) = (vector("lookup", xs, xs_name)?, vector("lookup", ys, ys_name)?);
-    same_length("lookup", (xs_name, xs.len()), (ys_name, ys.len()))?;
-    // Every element of `x` is compared with every element of `xs`.
-    charge(cx, items(x).len().saturating_add(1).saturating_mul(xs.len()))?;
-    let dim = one_dim(xs, xs_name, cx.origin)?;
-    array::map(x, cx.origin, false, |x| {
-        fits(x.q, dim)?;
-        let mut matches = xs.iter().enumerate().filter(|(_, xi)| nearly_equal(xi.q.value, x.q.value)).map(|(i, _)| i);
-        match (matches.next(), matches.next()) {
-            (Some(i), None) => ys.get(i).copied().ok_or_else(|| CalcError::Syntax(format!("{ys_name} has no element {i}"))),
-            (Some(_), Some(_)) => Err(CalcError::Syntax(format!("{} matches more than one value in {xs_name}", shown(x.q, cx)))),
-            (None, _) => Err(CalcError::Syntax(format!("{} isn't in {xs_name}", shown(x.q, cx)))),
+    check_vector("lookup", xs, xs_name)?;
+    check_vector("lookup", ys, ys_name)?;
+    same_length("lookup", (xs_name, count(xs)), (ys_name, count(ys)))?;
+    // Every element of `x` is compared with every element of `xs`; texts are read by their size.
+    let pairs = count(x).saturating_add(1).saturating_mul(count(xs));
+    cx.pass.charge(pairs_work(pairs, text_work(xs).saturating_add(text_work(x))))?;
+    let (xs_text, x_text) = (xs.text(), x.text());
+    let found: Vec<usize> = match (xs_text, x_text) {
+        (None, None) => {
+            let xv = items(xs);
+            let dim = one_dim(xv, xs_name, cx.origin)?;
+            let results = items(x).iter().map(|x| {
+                fits(x.q, dim)?;
+                let matches = xv.iter().enumerate().filter(|(_, xi)| nearly_equal(xi.q.value, x.q.value)).map(|(i, _)| i);
+                unique(matches, xs_name, || shown(x.q, cx))
+            });
+            positions(x, cx.origin, results)?
         }
-    })
+        (Some(_), Some(_)) => {
+            let keys: Vec<String> = texts(xs).iter().map(|s| array::text_key(s)).collect();
+            let results = texts(x).iter().map(|text| {
+                let key = array::text_key(text);
+                let matches = keys.iter().enumerate().filter(|(_, k)| **k == key).map(|(i, _)| i);
+                unique(matches, xs_name, || format!("\"{}\"", cut_text(text)))
+            });
+            positions(x, cx.origin, results)?
+        }
+        (Some(text), None) | (None, Some(text)) => return Err(CalcError::Syntax(format!("can't compare \"{}\" with a number", cut_text(text)))),
+    };
+    gather(ys, ys_name, &found, x.shape(), cx)
+}
+
+/// The work of `pairs` comparisons and `text` steps of reading texts.
+fn pairs_work(pairs: usize, text: u64) -> u64 {
+    u64::try_from(pairs).unwrap_or(u64::MAX).saturating_add(text)
+}
+
+/// The one element index of `matches`: none is "isn't in", and two or more is "matches more than
+/// one value in", naming `x` as `shown` writes it.
+fn unique(mut matches: impl Iterator<Item = usize>, xs_name: &str, shown: impl FnOnce() -> String) -> Result<usize, CalcError> {
+    match (matches.next(), matches.next()) {
+        (Some(i), None) => Ok(i),
+        (Some(_), Some(_)) => Err(CalcError::Syntax(format!("{} matches more than one value in {xs_name}", shown()))),
+        (None, _) => Err(CalcError::Syntax(format!("{} isn't in {xs_name}", shown()))),
+    }
+}
+
+/// Each element's result, in order; the first error stops it, naming its element when `x` is a
+/// grid (counted from `origin`).
+fn positions(x: &Data, origin: u8, results: impl Iterator<Item = Result<usize, CalcError>>) -> Result<Vec<usize>, CalcError> {
+    let mut found = Vec::new();
+    for (k, r) in results.enumerate() {
+        match r {
+            Ok(i) => found.push(i),
+            Err(e) => {
+                return Err(match x.shape() {
+                    Some((rows, cols)) => array::element_error(rows, cols, k, origin, e),
+                    None => e,
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The elements `found` of `ys`, in `shape` (`None` for a single value). Text is charged for
+/// before it is copied.
+fn gather(ys: &Data, ys_name: &str, found: &[usize], shape: Option<(usize, usize)>, cx: &Ctx<'_>) -> Result<Data, CalcError> {
+    let missing = |i: usize| CalcError::Syntax(format!("{ys_name} has no element {i}"));
+    let single = || CalcError::Syntax("an array needs at least one element".to_string());
+    if matches!(ys, Data::Text(_) | Data::TextGrid(_)) {
+        let all = texts(ys);
+        let picked: Vec<&String> = found.iter().map(|&i| all.get(i).ok_or_else(|| missing(i))).collect::<Result<_, _>>()?;
+        cx.pass.charge(picked.iter().fold(0, |n: u64, s| n.saturating_add(array::text_steps(s))))?;
+        let out: Vec<String> = picked.into_iter().cloned().collect();
+        return match shape {
+            Some((rows, cols)) => Grid::new(rows, cols, out).map(Data::TextGrid),
+            None => out.into_iter().next().map(Data::Text).ok_or_else(single),
+        };
+    }
+    let all = items(ys);
+    let out: Vec<Val> = found.iter().map(|&i| all.get(i).copied().ok_or_else(|| missing(i))).collect::<Result<_, _>>()?;
+    match shape {
+        Some((rows, cols)) => Grid::new(rows, cols, out).map(Data::Grid),
+        None => out.into_iter().next().map(Data::One).ok_or_else(single),
+    }
 }
 
 /// `linterp(xs, ys, x)` or `spline(xs, ys, x)`: the value at each element of `x` of the line
