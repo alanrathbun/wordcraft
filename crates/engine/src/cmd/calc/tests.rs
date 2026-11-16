@@ -350,7 +350,7 @@ fn catalog_has_calc_commands() {
         assert!(e.iter().any(|x| x.3 == id), "{id} catalogued");
         assert!(reg.get(id).is_some(), "{id} registered");
     }
-    for id in ["calc.setSource", "calc.names", "calc.checkName", "calc.resolveEdited"] {
+    for id in ["calc.setSource", "calc.names", "calc.checkName", "calc.resolveEdited", "calc.dataTable"] {
         assert!(reg.get(id).is_some(), "{id} registered");
     }
 }
@@ -1061,4 +1061,199 @@ fn g_setting_switches_between_gravity_and_gram() {
     assert!(region(&s, w).1.ends_with("=49.033 \"N\""));
     let bad = s.run("calc.settings", &json!({"g": "grams"}));
     assert!(bad.is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Data tables, the origin setting and quoted elements
+// ---------------------------------------------------------------------------------------------
+
+/// Inserts a table holding `rows` (one text per cell, typed with Tab between cells) and leaves
+/// the caret at the end of the document, after it; returns the table's body block index.
+fn typed_table(s: &mut Session, rows: &[&[&str]]) -> usize {
+    let r = run(s, "insert.table", json!({"rows": rows.len(), "cols": rows[0].len()}));
+    let block = r["table"][0].as_u64().unwrap_or_else(|| panic!("no table in {r}")) as usize;
+    for (k, text) in rows.iter().flat_map(|r| r.iter()).enumerate() {
+        if k > 0 {
+            run(s, "text.tab", json!({}));
+        }
+        run(s, "text.insert", json!({"text": text}));
+    }
+    run(s, "caret.docEnd", json!({}));
+    block
+}
+
+/// Puts the caret in cell (`row`, `col`) of the table at body block `block`, `off` bytes in.
+fn caret_in_cell(s: &mut Session, block: usize, row: u32, col: u32, off: usize) {
+    let path = wordcraft_doc::Path(vec![block as u32, row, col, 0]);
+    s.sel = crate::Selection::caret(Pos { story: wordcraft_doc::StoryRef::Body, path, off });
+}
+
+/// The calculation data mark of the table at body block `block`.
+fn table_mark(s: &Session, block: usize) -> Option<wordcraft_doc::calc::CalcTable> {
+    match &*s.doc.body[block] {
+        Block::Table(t) => t.calc.as_deref().cloned(),
+        Block::Para(_) => panic!("block {block} isn't a table"),
+    }
+}
+
+fn shows(s: &Session, id: u64, tail: &str) {
+    let (r, linear) = region(s, id);
+    assert_eq!(r.state, CalcState::Fresh, "{linear}");
+    assert!(linear.ends_with(tail), "{linear} should end with {tail}");
+}
+
+#[test]
+fn mark_table_defines_columns() {
+    let mut s = session();
+    let t = typed_table(&mut s, &[&["D (in)", "qty"], &["1/2", "3"]]);
+    caret_in_cell(&mut s, t, 0, 0, 0);
+    let r = run(&mut s, "calc.dataTable", json!({"on": true}));
+    let id = r["id"].as_u64().unwrap_or_else(|| panic!("no id in {r}"));
+    assert_eq!(table_mark(&s, t).map(|c| (c.id, c.errors)), Some((id, Vec::new())));
+    // Marking a marked table changes nothing and answers its id.
+    let undo = s.undo_depth();
+    assert_eq!(run(&mut s, "calc.dataTable", json!({"on": true})), json!({"id": id}));
+    assert_eq!(s.undo_depth(), undo, "no undo step");
+    run(&mut s, "caret.docEnd", json!({}));
+    let d = calc(&mut s, "D =");
+    let (r, linear) = region(&s, d);
+    assert_eq!(r.state, CalcState::Fresh, "{linear}");
+    assert!(linear.contains("0.5") && linear.ends_with("\"in\""), "{linear}");
+    // Another table gets an id of its own.
+    let u = typed_table(&mut s, &[&["E (in)"], &["1"]]);
+    caret_in_cell(&mut s, u, 1, 0, 0);
+    let other = run(&mut s, "calc.dataTable", json!({"on": true}))["id"].as_u64().unwrap();
+    assert_ne!(other, id);
+    // Unmarking: the column is gone.
+    caret_in_cell(&mut s, t, 1, 1, 0);
+    assert_eq!(run(&mut s, "calc.dataTable", json!({"on": false})), json!({"on": false}));
+    assert_eq!(table_mark(&s, t), None);
+    assert_eq!(region(&s, d).0.state, CalcState::Error("D isn't defined".into()));
+    // Outside a table, or with parameters that aren't a bool: refused, nothing changes.
+    run(&mut s, "caret.docEnd", json!({}));
+    let before = s.doc.clone();
+    let e = s.run("calc.dataTable", &json!({"on": true})).unwrap_err();
+    assert_eq!(e.to_string(), "Put the caret in a table in the main text");
+    caret_in_cell(&mut s, t, 0, 0, 0);
+    for bad in [json!({}), json!({"on": "yes"}), json!({"on": 1})] {
+        assert!(matches!(s.run("calc.dataTable", &bad), Err(crate::CmdError::Params(_))), "{bad}");
+    }
+    assert!(s.doc.same_content(&before));
+}
+
+#[test]
+fn data_table_in_a_header_is_refused() {
+    let mut s = session();
+    run(&mut s, "insert.editHeader", json!({}));
+    run(&mut s, "insert.table", json!({"rows": 2, "cols": 1}));
+    let e = s.run("calc.dataTable", &json!({"on": true})).unwrap_err();
+    assert_eq!(e.to_string(), "Put the caret in a table in the main text");
+}
+
+#[test]
+fn undo_unmark_restores() {
+    let mut s = session();
+    let t = typed_table(&mut s, &[&["D (in)"], &["1/2"]]);
+    let d = calc(&mut s, "D =");
+    assert_eq!(region(&s, d).0.state, CalcState::Error("D isn't defined".into()));
+    caret_in_cell(&mut s, t, 0, 0, 0);
+    run(&mut s, "calc.dataTable", json!({"on": true}));
+    shows(&s, d, "\"in\"");
+    let marked = region(&s, d);
+    run(&mut s, "calc.dataTable", json!({"on": false}));
+    assert_eq!(region(&s, d).0.state, CalcState::Error("D isn't defined".into()));
+    // Undoing the unmark brings the results back; undoing the mark leaves D undefined.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(table_mark(&s, t).is_some());
+    assert_eq!(region(&s, d), marked);
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(table_mark(&s, t), None);
+    assert_eq!(region(&s, d).0.state, CalcState::Error("D isn't defined".into()));
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(region(&s, d), marked);
+}
+
+#[test]
+fn origin_setting_reindexes() {
+    let mut s = session();
+    let t = typed_table(&mut s, &[&["D (in)"], &["1/2"], &["3/4"]]);
+    caret_in_cell(&mut s, t, 0, 0, 0);
+    run(&mut s, "calc.dataTable", json!({"on": true}));
+    run(&mut s, "caret.docEnd", json!({}));
+    let x = calc(&mut s, "x := D[1] =");
+    shows(&s, x, "=0.75 \"in\"");
+    let r = run(&mut s, "calc.settings", json!({"origin": 1}));
+    assert_eq!(r["origin"], json!(1), "{r}");
+    shows(&s, x, "=0.5 \"in\"");
+    for bad in [json!(2), json!(-1), json!("1"), json!(true), json!(0.5)] {
+        let e = s.run("calc.settings", &json!({"origin": bad})).unwrap_err();
+        assert_eq!(e, crate::CmdError::Params("`origin` is 0 or 1".into()), "{bad}");
+    }
+    assert_eq!(run(&mut s, "calc.settings", json!({}))["origin"], json!(1));
+    // In manual mode the switch marks results stale; recalculating makes them current.
+    run(&mut s, "calc.settings", json!({"manual": true}));
+    assert_eq!(region(&s, x).0.state, CalcState::Fresh);
+    run(&mut s, "calc.settings", json!({"origin": 0}));
+    assert_eq!(region(&s, x).0.state, CalcState::Stale);
+    run(&mut s, "calc.recalculate", json!({}));
+    shows(&s, x, "=0.75 \"in\"");
+}
+
+#[test]
+fn quoting_an_element() {
+    let mut s = session();
+    let t = typed_table(&mut s, &[&["D (in)"], &["1/2"], &["3/4"]]);
+    caret_in_cell(&mut s, t, 0, 0, 0);
+    let id = run(&mut s, "calc.dataTable", json!({"on": true}))["id"].clone();
+    run(&mut s, "caret.docEnd", json!({}));
+    calc(&mut s, "x := 2");
+    // Table columns are names a quoted value can show, known by their table's id.
+    let names = run(&mut s, "calc.names", json!({}));
+    let list = names["names"].as_array().unwrap();
+    let col = list.iter().find(|n| n["name"] == "D").unwrap_or_else(|| panic!("D in {names}"));
+    assert_eq!(col["table"], json!(true), "{col}");
+    assert_eq!(col["tableId"], id, "{col}");
+    assert!(col.get("id").is_none(), "a table id is no region id: {col}");
+    assert!(list.iter().any(|n| n["name"] == "x" && n.get("id").is_some()), "{names}");
+    let check = run(&mut s, "calc.checkName", json!({"name": "D"}));
+    assert_eq!(check["reason"], json!("duplicate"), "{check}");
+    assert_eq!(check["existingTable"], id, "{check}");
+    assert!(check.get("existing").is_none(), "a table id is no region id: {check}");
+    run(&mut s, "insert.calcValue", json!({"name": "D", "index": [0]}));
+    assert_eq!(field_results(&s), ["0.5 in"]);
+    let field = objects(&s.doc).into_iter().find(|o| matches!(o, InlineObject::Field { .. })).unwrap();
+    assert!(matches!(field, InlineObject::Field { ref instr, .. } if instr.contains("\\i 0")), "{field:?}");
+    run(&mut s, "insert.calcValue", json!({"name": "D"}));
+    assert_eq!(field_results(&s), ["0.5 in", "0.5, 0.75 in"]);
+    // An index on a single value, outside the vector, or not one or two whole numbers: refused,
+    // nothing inserted.
+    let before = s.doc.clone();
+    let e = s.run("insert.calcValue", &json!({"name": "x", "index": [0]})).unwrap_err();
+    assert_eq!(e.to_string(), "x isn't a vector");
+    let e = s.run("insert.calcValue", &json!({"name": "D", "index": [5]})).unwrap_err();
+    assert!(e.to_string().contains("outside D"), "{e}");
+    for bad in [json!([]), json!([1, 2, 3]), json!([-1]), json!([4_294_967_296u64]), json!("0"), json!([0.5]), json!(0)] {
+        let e = s.run("insert.calcValue", &json!({"name": "D", "index": bad})).unwrap_err();
+        assert!(matches!(e, crate::CmdError::Params(_)), "{bad}: {e}");
+    }
+    assert!(s.doc.same_content(&before));
+}
+
+#[test]
+fn has_calc_counts_data_tables() {
+    let mut s = session();
+    let t = typed_table(&mut s, &[&["D (in)"], &["1/2"]]);
+    assert!(!super::has_calc(&s.doc));
+    caret_in_cell(&mut s, t, 0, 0, 0);
+    run(&mut s, "calc.dataTable", json!({"on": true}));
+    assert!(super::has_calc(&s.doc));
+    assert_eq!(table_mark(&s, t).map(|c| c.errors), Some(Vec::new()));
+    // A cell edit recalculates: the table's errors are written.
+    caret_in_cell(&mut s, t, 1, 0, 0);
+    run(&mut s, "text.insert", json!({"text": "abc "}));
+    let errors = table_mark(&s, t).map(|c| c.errors).unwrap_or_default();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].message, "D row 1 isn't a number", "{errors:?}");
+    // Saving takes the calculations' path to Word now; it still saves.
+    assert!(crate::io::save_bytes("report.docx", &s.doc).is_ok());
 }

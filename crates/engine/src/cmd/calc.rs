@@ -1,6 +1,7 @@
-//! Inline calculations: insert a calculation region, change its source, quote a variable's value,
-//! list and check names, recalculate, set the document's calculation options, and resolve a
-//! region edited outside the calculator.
+//! Inline calculations: insert a calculation region, change its source, quote a variable's value
+//! (or one element of a vector), list and check names, mark a table as calculation data,
+//! recalculate, set the document's calculation options, and resolve a region edited outside the
+//! calculator.
 //!
 //! Results never wait for a request: after every command that changes the document,
 //! [`after_command`] recalculates (or, in manual mode, marks the results stale) inside the same
@@ -10,10 +11,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use wordcraft_calc::{
-    CalcError, RecalcReport, calc_unchanged, check_new_name, check_quote_unit, defined_name, defined_names, freeze_outside_body, is_calc_object,
-    mark_stale, parse, recalc,
+    CalcError, RecalcReport, calc_unchanged, check_new_name, check_quote_index, check_quote_unit, data_tables, defined_columns, defined_name,
+    defined_names, freeze_outside_body, is_calc_object, mark_stale, parse, recalc,
 };
-use wordcraft_doc::calc::{CalcRegion, CalcState, GMeans, QuoteSpec, UnitSystem, calc_field_instr, parse_calc_field};
+use wordcraft_doc::calc::{CalcRegion, CalcState, CalcTable, GMeans, QuoteSpec, UnitSystem, calc_field_instr, parse_calc_field};
 use wordcraft_doc::math::Math;
 use wordcraft_doc::{Block, Document, InlineObject, Paragraph, Pos, StoryRef};
 
@@ -43,13 +44,15 @@ pub fn specs() -> Vec<CommandSpec> {
             .key("F2")
             .pure()
             .when(|s| calc_at_caret(s).is_none().then_some("no calculation at the caret")),
-        CommandSpec::new("insert.calcValue", "Calculated Value", "Insert › Symbols", insert_value)
-            .params(r#"{"name": string (a variable, see calc.names), "unit"?: string, "precision"?: n (0–15)}"#),
+        CommandSpec::new("insert.calcValue", "Calculated Value", "Insert › Symbols", insert_value).params(
+            r#"{"name": string (a variable or table column, see calc.names), "unit"?: string, "precision"?: n (0–15), "index"?: [i] | [i, j] (an element of a vector or matrix)}"#,
+        ),
         CommandSpec::new("calc.names", "Calculation Names", "Calculation", names).pure(),
         CommandSpec::new("calc.checkName", "Check Calculation Name", "Calculation", check).pure().params(r#"{"name": string, "id"?: n}"#),
         CommandSpec::new("calc.recalculate", "Recalculate", "References › Calculation", recalculate),
         CommandSpec::new("calc.settings", "Calculation Options", "References › Calculation", settings)
-            .params(r#"{"system"?: "us|si", "precision"?: n (0–15), "manual"?: bool, "g"?: "gravity|gram"}"#),
+            .params(r#"{"system"?: "us|si", "precision"?: n (0–15), "manual"?: bool, "g"?: "gravity|gram", "origin"?: 0|1 (where indexes count from)}"#),
+        CommandSpec::new("calc.dataTable", "Use as Calculation Data", "Calculation", data_table).params(r#"{"on": bool}"#),
         CommandSpec::new("calc.resolveEdited", "Resolve Edited Calculation", "Calculation", resolve_edited)
             .params(r#"{"id": n, "keep": "source|word"}"#),
     ]
@@ -59,9 +62,10 @@ pub fn specs() -> Vec<CommandSpec> {
 // The automatic pass
 // ---------------------------------------------------------------------------------------------
 
-/// Whether the body holds a calculation region or a quoted value (`WCCALC` field): when it
-/// doesn't, editing pays nothing for calculations. One pass over the paragraphs' objects, tables
-/// walked with an explicit stack (a hostile file can nest them deeply).
+/// Whether the body holds a calculation region, a quoted value (`WCCALC` field) or a table marked
+/// as calculation data: when it doesn't, editing pays nothing for calculations. One pass over the
+/// paragraphs' objects, tables walked with an explicit stack (a hostile file can nest them
+/// deeply).
 pub(crate) fn has_calc(doc: &Document) -> bool {
     let mut todo: Vec<&Block> = Vec::new();
     for top in &doc.body {
@@ -73,7 +77,12 @@ pub(crate) fn has_calc(doc: &Document) -> bool {
                         return true;
                     }
                 }
-                Block::Table(t) => todo.extend(t.rows.iter().flat_map(|r| r.cells.iter()).flat_map(|c| c.blocks.iter()).map(|b| &**b)),
+                Block::Table(t) => {
+                    if t.calc.is_some() {
+                        return true;
+                    }
+                    todo.extend(t.rows.iter().flat_map(|r| r.cells.iter()).flat_map(|c| c.blocks.iter()).map(|b| &**b));
+                }
             }
         }
     }
@@ -309,6 +318,28 @@ fn fresh_id(doc: &Document) -> Result<u64, CmdError> {
     }
 }
 
+/// A newly marked data table's id: one more than any data table's id in the document (every
+/// story, tracked-deleted ones too), so it is no table's id now. Table ids are an id space of
+/// their own, apart from regions'. Tables are walked with an explicit stack (a hostile file can
+/// nest them deeply).
+fn fresh_table_id(doc: &Document) -> Result<u64, CmdError> {
+    let mut max: Option<u64> = None;
+    let stories = std::iter::once(&doc.body).chain(doc.parts.values().map(|part| &part.blocks));
+    let mut todo: Vec<&Block> = stories.flat_map(|blocks| blocks.iter().map(|b| &**b)).collect();
+    while let Some(b) = todo.pop() {
+        if let Block::Table(t) = b {
+            if let Some(c) = &t.calc {
+                max = Some(max.map_or(c.id, |m| m.max(c.id)));
+            }
+            todo.extend(t.rows.iter().flat_map(|r| r.cells.iter()).flat_map(|c| c.blocks.iter()).map(|b| &**b));
+        }
+    }
+    match max {
+        None => Ok(1),
+        Some(m) => m.checked_add(1).ok_or_else(|| CmdError::Failed("no calculation data id is left".into())),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Parameters
 // ---------------------------------------------------------------------------------------------
@@ -338,6 +369,27 @@ fn opt_bool(v: &Value, k: &str) -> Result<Option<bool>, CmdError> {
     match v.get(k) {
         None | Some(Value::Null) => Ok(None),
         Some(x) => x.as_bool().map(Some).ok_or_else(|| CmdError::Params(format!("`{k}` is true or false"))),
+    }
+}
+
+/// A required true/false parameter.
+fn req_bool(v: &Value, k: &str) -> Result<bool, CmdError> {
+    v.get(k).and_then(Value::as_bool).ok_or_else(|| CmdError::Params(format!("missing or invalid `{k}` (true or false)")))
+}
+
+/// The optional `index` of a quoted value: `[i]` or `[i, j]`, whole numbers that fit a field code
+/// (`u32`).
+fn index_param(v: &Value) -> Result<Option<(u32, Option<u32>)>, CmdError> {
+    let bad = || CmdError::Params("`index` is [i] or [i, j], whole numbers".into());
+    let at = |x: &Value| x.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(bad);
+    match v.get("index") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(a)) => match a.as_slice() {
+            [i] => Ok(Some((at(i)?, None))),
+            [r, c] => Ok(Some((at(r)?, Some(at(c)?)))),
+            _ => Err(bad()),
+        },
+        Some(_) => Err(bad()),
     }
 }
 
@@ -457,22 +509,29 @@ fn set_source(s: &mut Session, v: &Value) -> CmdResult {
     Ok(json!({"id": id}))
 }
 
-/// Inserts a locked `WCCALC` field quoting a variable's value. Stage 1 keeps quoted values up to
-/// date in the main text and its tables only, so it is refused anywhere else.
+/// Inserts a locked `WCCALC` field quoting a variable's value (a region's variable or a data
+/// table's column), or with `index` one element of a vector or matrix. Stage 1 keeps quoted
+/// values up to date in the main text and its tables only, so it is refused anywhere else.
 fn insert_value(s: &mut Session, v: &Value) -> CmdResult {
     let name = name_param(v)?.to_string();
     let unit = opt_str(v, "unit")?.map(str::trim).filter(|u| !u.is_empty()).map(str::to_string);
     let precision = precision_param(v)?;
+    let index = index_param(v)?;
     require_body(s, "insert.calcValue")?;
-    if !defined_names(&s.doc).iter().any(|(n, _)| *n == name) {
+    if !defined_names(&s.doc).iter().any(|(n, _)| *n == name) && !defined_columns(&s.doc).iter().any(|(n, ..)| *n == name) {
         return Err(CmdError::Failed(format!("{name} isn't a defined variable")));
+    }
+    // An element that isn't there would only ever show `?`; an index on a single value is no
+    // element at all.
+    if let Some(at) = index {
+        check_quote_index(&s.doc, &name, at).map_err(|e| CmdError::Failed(e.to_string()))?;
     }
     // A unit the value can't be shown in would only ever show `?`.
     if let Some(unit) = unit.as_deref() {
         check_quote_unit(&s.doc, &name, unit).map_err(|e| CmdError::Failed(format!("{name} can't be shown in {unit}: {e}")))?;
     }
     // The field code must read back as written, or the value would never be updated.
-    let spec = QuoteSpec { name: name.clone(), unit: unit.clone(), precision, index: None };
+    let spec = QuoteSpec { name: name.clone(), unit: unit.clone(), precision, index };
     let instr = calc_field_instr(&spec);
     if unit.as_deref().is_some_and(|u| u.contains('"')) || parse_calc_field(&instr) != Some(spec) {
         return Err(CmdError::Params("that unit can't be quoted".into()));
@@ -487,9 +546,17 @@ fn insert_value(s: &mut Session, v: &Value) -> CmdResult {
     Ok(json!({"name": name}))
 }
 
-/// Every variable a quoted value can show, with its region's id.
+/// Every variable a quoted value can show, sorted by name: a region's, with the region's `id`,
+/// and a data table's column, with `"table": true`, its table's `tableId` and the `column`
+/// (counted from 0). A table's id is never given as `id`: tables have an id space of their own.
 fn names(s: &mut Session, _: &Value) -> CmdResult {
-    let names: Vec<Value> = defined_names(&s.doc).into_iter().map(|(name, id)| json!({"name": name, "id": id})).collect();
+    let regions = defined_names(&s.doc).into_iter().map(|(name, id)| (name.clone(), json!({"name": name, "id": id})));
+    let columns = defined_columns(&s.doc)
+        .into_iter()
+        .map(|(name, table, column)| (name.clone(), json!({"name": name, "table": true, "tableId": table, "column": column})));
+    let mut all: Vec<(String, Value)> = regions.chain(columns).collect();
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    let names: Vec<Value> = all.into_iter().map(|(_, n)| n).collect();
     Ok(json!({"names": names}))
 }
 
@@ -511,6 +578,9 @@ fn check(s: &mut Session, v: &Value) -> CmdResult {
             let mut r = json!({"ok": false, "reason": "duplicate", "message": e.to_string()});
             if let Some((_, id)) = defined_names(&s.doc).into_iter().find(|(n, _)| *n == parsed) {
                 r["existing"] = json!(id);
+            } else if let Some((_, table, _)) = defined_columns(&s.doc).into_iter().find(|(n, ..)| *n == parsed) {
+                // A table's column owns it: its table's id, never as a region's.
+                r["existingTable"] = json!(table);
             }
             r
         }
@@ -542,9 +612,10 @@ fn system_name(sys: UnitSystem) -> &'static str {
     }
 }
 
-/// Sets the document's unit system, precision, manual mode and what `g` means. Back in automatic mode the
-/// document recalculates; in manual mode a change to how results are shown marks them stale,
-/// and switching to manual alone leaves them current.
+/// Sets the document's unit system, precision, manual mode, what `g` means and where indexes count
+/// from (`origin`, 0 or 1). Back in automatic mode the document recalculates; in manual mode a
+/// change to how results are worked out or shown marks them stale, and switching to manual alone
+/// leaves them current.
 fn settings(s: &mut Session, v: &Value) -> CmdResult {
     let old = s.doc.calc_settings.clone().unwrap_or_default();
     let mut new = old.clone();
@@ -575,17 +646,56 @@ fn settings(s: &mut Session, v: &Value) -> CmdResult {
             }
         }
     }
+    match v.get("origin") {
+        None | Some(Value::Null) => {}
+        Some(x) => {
+            new.origin =
+                x.as_u64().filter(|&o| o <= 1).and_then(|o| u8::try_from(o).ok()).ok_or_else(|| CmdError::Params("`origin` is 0 or 1".into()))?
+        }
+    }
     if new != old {
         s.doc.calc_settings = Some(new.clone());
     }
     if has_calc(&s.doc) {
         if !new.manual {
             recalc_now(s);
-        } else if new.system != old.system || new.precision != old.precision || new.g != old.g {
+        } else if new.system != old.system || new.precision != old.precision || new.g != old.g || new.origin != old.origin {
             mark_stale(&mut s.doc);
         }
     }
-    Ok(json!({"system": system_name(new.system), "precision": new.precision, "manual": new.manual, "g": g_name(new.g)}))
+    Ok(json!({"system": system_name(new.system), "precision": new.precision, "manual": new.manual, "g": g_name(new.g), "origin": new.origin}))
+}
+
+/// Marks the innermost table at the caret as calculation data (`"on": true`: each column defines
+/// the vector its heading names), answering its id, or makes it a plain table again
+/// (`"on": false`). Marking a marked table, or unmarking a plain one, changes nothing. Only a
+/// table in the main text can be calculation data. The automatic pass that follows, in the same
+/// undo step, recalculates.
+fn data_table(s: &mut Session, v: &Value) -> CmdResult {
+    let on = req_bool(v, "on")?;
+    let not_here = || CmdError::Failed("Put the caret in a table in the main text".into());
+    if s.sel.focus.story != StoryRef::Body {
+        return Err(not_here());
+    }
+    let (tp, _, _) = s.sel.focus.path.cell().ok_or_else(not_here)?;
+    let table = s.doc.table(StoryRef::Body, &tp).ok_or_else(not_here)?;
+    match (on, table.calc.as_deref()) {
+        // Its id as recalculation gives it: a pasted copy's repeated id isn't its own.
+        (true, Some(c)) => {
+            let id = data_tables(&s.doc).into_iter().find(|(path, _)| *path == tp.0).map_or(c.id, |(_, id)| id);
+            Ok(json!({"id": id}))
+        }
+        (true, None) => {
+            let id = fresh_table_id(&s.doc)?;
+            s.doc.table_mut(StoryRef::Body, &tp)?.calc = Some(Box::new(CalcTable { id, errors: Vec::new() }));
+            Ok(json!({"id": id}))
+        }
+        (false, Some(_)) => {
+            s.doc.table_mut(StoryRef::Body, &tp)?.calc = None;
+            Ok(json!({"on": false}))
+        }
+        (false, None) => Ok(json!({"on": false})),
+    }
 }
 
 /// A region edited outside the calculator: `"source"` draws it again from its source (the edited

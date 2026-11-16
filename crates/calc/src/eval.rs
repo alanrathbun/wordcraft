@@ -507,12 +507,34 @@ fn indexed_grid<'a>(cx: &'a Cx<'_>, fr: &'a Frame<'_>, name: &str, count: usize)
     let Data::Grid(g) = target else {
         return Err(not_a_vector(name));
     };
+    index_count(g, name, count)?;
+    Ok(g)
+}
+
+/// Whether `g` (named `name`) can be read with `count` indexes: one into a vector, two into any
+/// grid.
+fn index_count(g: &Grid, name: &str, count: usize) -> Result<(), CalcError> {
     match count {
-        1 if g.rows == 1 || g.cols == 1 => Ok(g),
+        1 if g.rows == 1 || g.cols == 1 => Ok(()),
         1 => Err(CalcError::IndexRange(format!("{name} is a matrix — give a row and a column, like {name}[1, 0]"))),
-        2 => Ok(g),
+        2 => Ok(()),
         _ => Err(CalcError::Syntax("an index is one number, or a row and a column, like D[2] or M[1, 0]".to_string())),
     }
+}
+
+/// Whether a quoted value's index `at` (`\i`: one index, or a row and a column) picks an element
+/// of `data`, the value of `name`, counted from `origin`; the error is the one `name[…]` would
+/// give in a calculation.
+pub(crate) fn check_element(data: &Data, name: &str, origin: u8, at: (u32, Option<u32>)) -> Result<(), CalcError> {
+    let Data::Grid(g) = data else {
+        return Err(not_a_vector(name));
+    };
+    let (idx, count) = match at {
+        (i, None) => ([f64::from(i), 0.0], 1),
+        (r, Some(c)) => ([f64::from(r), f64::from(c)], 2),
+    };
+    index_count(g, name, count)?;
+    element(g, name, origin, idx.get(..count).unwrap_or_default()).map(|_| ())
 }
 
 /// The element of `g` (named `name`) at the whole-number indexes `at`, counted from `origin`: one

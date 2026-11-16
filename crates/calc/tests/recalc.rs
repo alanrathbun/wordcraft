@@ -4,7 +4,10 @@
 use craft_units::Formatted;
 use std::sync::Arc;
 use std::time::Instant;
-use wordcraft_calc::{CalcError, calc_unchanged, check_new_name, check_quote_unit, data_tables, defined_names, mark_stale, recalc, render};
+use wordcraft_calc::{
+    CalcError, calc_unchanged, check_new_name, check_quote_index, check_quote_unit, data_tables, defined_columns, defined_names, mark_stale, recalc,
+    render,
+};
 use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, CalcTable, ColumnError, GMeans, QuoteSpec, calc_field_instr};
 use wordcraft_doc::math::{MNode, MRun, MSty, Math};
 use wordcraft_doc::props::VMerge;
@@ -1796,4 +1799,38 @@ fn perf_1000_element_vector_chain() {
     assert_eq!(report.errors, 0);
     assert_eq!(table_calc(&d, 0).errors, []);
     assert!(took.as_millis() < 100, "recalc took {took:?}");
+}
+
+#[test]
+fn columns_are_listed_by_their_table_id() {
+    let mut d = pipe_doc(PIPES);
+    // The table's id repeats a region's: the two are id spaces of their own.
+    assert_eq!(table_calc(&d, 0).id, 1);
+    let columns = defined_columns(&d);
+    assert_eq!(columns, [("D_o".to_string(), 1, 1), ("NPS".to_string(), 1, 0), ("t_nom".to_string(), 1, 2)]);
+    assert!(defined_names(&d).iter().all(|(n, _)| !columns.iter().any(|(c, ..)| c == n)), "regions only");
+    // A column in error still owns its name; a column whose name a region owns first doesn't.
+    set_cell(&mut d, 0, 2, 2, "abc");
+    let mut blocks = vec![para_block(para(vec![calc_eq(9, "NPS := 1")]))];
+    blocks.extend(d.body.iter().cloned());
+    let d = doc_of(blocks);
+    assert_eq!(defined_columns(&d), [("D_o".to_string(), 1, 1), ("t_nom".to_string(), 1, 2)]);
+}
+
+#[test]
+fn a_quoted_index_must_pick_an_element() {
+    let mut d = pipe_doc(PIPES);
+    d.body.push(para_block(para(vec![calc_eq(8, "M := [1, 2; 3, 4]"), calc_eq(9, "bad := (")])));
+    assert_eq!(check_quote_index(&d, "D_o", (2, None)), Ok(()));
+    assert_eq!(check_quote_index(&d, "M", (1, Some(0))), Ok(()));
+    assert_eq!(check_quote_index(&d, "P", (0, None)), Err(CalcError::IndexRange("P isn't a vector".into())));
+    let outside = check_quote_index(&d, "D_o", (3, None)).unwrap_err().to_string();
+    assert_eq!(outside, "index 3 is outside D_o (0 to 2)");
+    assert!(check_quote_index(&d, "M", (1, None)).unwrap_err().to_string().contains("M is a matrix"));
+    // Counted from the document's origin.
+    d.calc_settings = Some(CalcSettings { origin: 1, ..CalcSettings::default() });
+    assert_eq!(check_quote_index(&d, "D_o", (3, None)), Ok(()));
+    assert!(check_quote_index(&d, "D_o", (0, None)).is_err());
+    // No value now: checked when it has one.
+    assert_eq!(check_quote_index(&d, "bad", (0, None)), Ok(()));
 }

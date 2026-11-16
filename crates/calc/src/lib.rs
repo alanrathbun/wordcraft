@@ -27,8 +27,8 @@ pub use ast::{Expr, Op, Show, Stmt, defined_name, free_names};
 pub use eval::{Env, check_name, eval_expr, run_stmt};
 pub use parse::parse;
 pub use recalc::{
-    NOT_CALCULATED_HERE, RecalcReport, body_regions, calc_unchanged, check_new_name, check_quote_unit, data_tables, defined_names,
-    freeze_outside_body, is_calc_object, mark_stale, recalc,
+    NOT_CALCULATED_HERE, RecalcReport, body_regions, calc_unchanged, check_new_name, check_quote_index, check_quote_unit, data_tables,
+    defined_columns, defined_names, freeze_outside_body, is_calc_object, mark_stale, recalc,
 };
 
 /// What a calculation evaluates to: one value, or a grid of values (a vector or matrix).

@@ -22,7 +22,7 @@ use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph, Row, Table};
 
 use crate::array::{self, Data};
-use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, run_stmt_in};
+use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, check_element, run_stmt_in};
 use crate::render::{self, MAX_SHOWN_COLS, MAX_SHOWN_ROWS, Rendered, Shown, rendered, shown_result, shows_value};
 use crate::tables;
 use crate::{CalcError, Env, Stmt, check_name, defined_name, free_names, parse};
@@ -151,7 +151,7 @@ pub fn body_regions(doc: &Document) -> Vec<(Vec<u32>, usize, calc::CalcRegion)> 
 /// a name that isn't a unit, function or constant. User functions are left out (they have no
 /// single value); ids are the ones [`recalc`] gives, a repeated id already replaced.
 pub fn defined_names(doc: &Document) -> Vec<(String, u64)> {
-    let (ids, index) = names_of(doc);
+    let (ids, _, index) = names_of(doc);
     // A data table's columns have no region's id: they are left out here.
     let mut names: Vec<(String, u64)> = index
         .owners
@@ -163,15 +163,36 @@ pub fn defined_names(doc: &Document) -> Vec<(String, u64)> {
     names
 }
 
-/// The regions' ids as [`recalc`] gives them (a repeated id replaced) and who owns each name
-/// (data table columns included).
-fn names_of(doc: &Document) -> (Vec<u64>, Index) {
+/// Every vector owned by a data table's column, with its table's id and the column (counted from
+/// 0), sorted by name: what a quoted value can show besides [`defined_names`]. A column owns its
+/// name when it is the first definition of it in document order and its heading's name reads
+/// (also when its values don't: a quoted value of it shows `?` until they do). Table ids are the
+/// ones [`recalc`] gives ([`data_tables`]), an id space of their own: never a region's id.
+pub fn defined_columns(doc: &Document) -> Vec<(String, u64, u32)> {
+    let (_, table_ids, index) = names_of(doc);
+    let mut columns: Vec<(String, u64, u32)> = index
+        .owners
+        .iter()
+        .filter(|&(_, &i)| !index.is_region(i))
+        .filter_map(|(name, &i)| {
+            let &(t, col) = index.columns.get(i.checked_sub(index.regions)?)?;
+            Some((name.clone(), *table_ids.get(t)?, col))
+        })
+        .collect();
+    columns.sort();
+    columns
+}
+
+/// The regions' ids and the data tables' ids as [`recalc`] gives them (a repeated id replaced),
+/// and who owns each name (data table columns included).
+fn names_of(doc: &Document) -> (Vec<u64>, Vec<u64>, Index) {
     let found = collect(&doc.body);
     let (ids, _) = assign_ids(&found);
+    let table_ids = assign_table_ids(&found);
     let settings = doc.calc_settings.clone().unwrap_or_default();
     let tables = read_tables(&doc.body, &found.tables, &settings);
     let index = Index::build(&found.regions, &ids, &tables, &|_| None);
-    (ids, index)
+    (ids, table_ids, index)
 }
 
 /// Whether a quoted value of the variable `name` can show it in `unit`: the unit must read
@@ -180,12 +201,27 @@ fn names_of(doc: &Document) -> (Vec<u64>, Index) {
 /// value now (an error) is checked when it has one; until then the quoted value shows `?`.
 pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), CalcError> {
     parse_unit(unit)?;
-    let (_, index) = names_of(doc);
+    let (_, _, index) = names_of(doc);
     let settings = doc.calc_settings.clone().unwrap_or_default();
     let (env, _, _) = evaluate(&index, &settings);
     env.check_display_unit(unit)?;
     match env.data(name) {
         Some(data) => check_display(&env, unit, data),
+        None => Ok(()),
+    }
+}
+
+/// Whether a quoted value of the variable `name` can show its element `at` (one index, or a row
+/// and a column, counted from the document's origin): the variable's value now must be a vector
+/// or matrix (`x isn't a vector`) holding that element, with the message `name[…]` would give in
+/// a calculation. A variable with no value now (an error) is checked when it has one; until then
+/// the quoted value shows `?`. Evaluates a copy of the calculations: `doc` never changes.
+pub fn check_quote_index(doc: &Document, name: &str, at: (u32, Option<u32>)) -> Result<(), CalcError> {
+    let (_, _, index) = names_of(doc);
+    let settings = doc.calc_settings.clone().unwrap_or_default();
+    let (env, _, _) = evaluate(&index, &settings);
+    match env.data(name) {
+        Some(data) => check_element(data, name, env.origin(), at),
         None => Ok(()),
     }
 }
@@ -197,7 +233,7 @@ pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), Ca
 pub fn check_new_name(doc: &Document, name: &str, editing: Option<u64>) -> Result<(), CalcError> {
     check_name(name)?;
     // Ids as recalculation gives them, so a pasted copy's repeated id can't stand for its owner.
-    let (ids, index) = names_of(doc);
+    let (ids, _, index) = names_of(doc);
     let duplicate = || Err(CalcError::Duplicate { name: name.to_string(), page: None });
     match index.owners.get(name) {
         Some(&i) if !index.is_region(i) => duplicate(),
