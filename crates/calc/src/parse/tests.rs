@@ -449,6 +449,9 @@ fn quantity_variant_is_never_produced() {
             Expr::Cases { cases, otherwise } => {
                 cases.iter().any(|(v, c)| has_quantity(v) || has_quantity(c)) || otherwise.as_deref().is_some_and(has_quantity)
             }
+            Expr::Sum { first, second, last, body, .. } => {
+                has_quantity(first) || second.as_deref().is_some_and(has_quantity) || has_quantity(last) || has_quantity(body)
+            }
         }
     }
     assert!(!has_quantity(&expr_of("5 kN·m + 2 ksi")));
@@ -763,4 +766,83 @@ fn an_if_call_is_a_factor() {
     assert_eq!(cases[0].1, expr("x > 0"));
     // In an evaluation too.
     assert_eq!(expr("2 if(x > 0, 1, 2)"), expr("2·if(x > 0, 1, 2)"));
+}
+
+fn sum(index: &str, first: Expr, second: Option<Expr>, last: Expr, body: Expr) -> Expr {
+    Expr::Sum { index: index.into(), first: Box::new(first), second: second.map(Box::new), last: Box::new(last), body: Box::new(body) }
+}
+
+#[test]
+fn a_sum_parses_its_range_and_one_product_term() {
+    let term = bin(Op::Mul, index("a", vec![name("i")]), index("b", vec![name("i")]));
+    assert_eq!(expr("∑(i = 1..n) a[i]·b[i]"), sum("i", num(1.0), None, name("n"), term.clone()));
+    // The sum covers one product term: what follows a `+` is outside it.
+    assert_eq!(expr("∑(i = 1..n) a[i]·b[i] + 1"), bin(Op::Add, sum("i", num(1.0), None, name("n"), term.clone()), num(1.0)));
+    assert_eq!(expr("∑(i = 1..n) (a[i] + 1)"), sum("i", num(1.0), None, name("n"), bin(Op::Add, index("a", vec![name("i")]), num(1.0))));
+    // Powers and quotients stay inside the term; comparisons and logic do not.
+    assert_eq!(expr("∑(i = 1..3) i^2/2"), sum("i", num(1.0), None, num(3.0), bin(Op::Div, bin(Op::Pow, name("i"), num(2.0)), num(2.0))));
+    assert_eq!(
+        expr("∑(i = 1..3) i > 2"),
+        Expr::Compare { first: Box::new(sum("i", num(1.0), None, num(3.0), name("i"))), rest: vec![(Cmp::Gt, num(2.0))] }
+    );
+    // A step: the second value.
+    assert_eq!(expr("∑(k = 1, 3..7) k"), sum("k", num(1.0), Some(num(3.0)), num(7.0), name("k")));
+    // The ends are whole expressions.
+    assert_eq!(expr("∑(i = 0..length(r) - 1) i"), sum("i", num(0.0), None, bin(Op::Sub, call("length", vec![name("r")]), num(1.0)), name("i")));
+    // Nested; two sums side by side; a sum after an operator, and as a factor.
+    assert_eq!(expr("∑(i = 1..3) ∑(j = 1..i) j"), sum("i", num(1.0), None, num(3.0), sum("j", num(1.0), None, name("i"), name("j"))));
+    assert_eq!(
+        expr("∑(i = 1..2) i + ∑(i = 1..3) i"),
+        bin(Op::Add, sum("i", num(1.0), None, num(2.0), name("i")), sum("i", num(1.0), None, num(3.0), name("i")))
+    );
+    assert_eq!(expr("2 ∑(i = 1..3) i"), bin(Op::Mul, num(2.0), sum("i", num(1.0), None, num(3.0), name("i"))));
+    // A definition's right side, with and without a result.
+    assert!(matches!(body_of("I := ∑(i = 0..n) i"), Expr::Sum { .. }));
+    assert!(matches!(parse("I := ∑(i = 0..n) i = ? in^4"), Ok(Stmt::Define { show: Some(_), .. })));
+    assert_eq!(body_of("tri(n) := ∑(i = 1..n) i"), sum("i", num(1.0), None, name("n"), name("i")));
+}
+
+#[test]
+fn a_malformed_sum_is_a_syntax_error() {
+    for src in [
+        "∑ i =",
+        "∑(i) i =",
+        "∑(i = 1) i =",
+        "∑(i = 1..) i =",
+        "∑(i = 1..3 i =",
+        "∑(i = 1..3) =",
+        "∑(1 = 1..3) 1 =",
+        "∑(i = 1, 2, 3..4) i =",
+        "∑(i = 1..3..4) i =",
+        "∑(i = 1, 2) i =",
+        "∑(i == 1..3) i =",
+        "∑(and = 1..3) 1 =",
+    ] {
+        assert!(parse(src).is_err(), "{src:?} should not parse: {:?}", parse(src));
+    }
+    // A sum's `=` is not the show `=`: what follows the first is read as a range.
+    assert!(matches!(parse("∑(i = 1..3) i = ? in"), Ok(Stmt::Eval { show: Show { unit: Some(_) }, .. })));
+}
+
+#[test]
+fn the_names_of_a_sum() {
+    // The index is used (the dependency rule) but never as a name inside the body; the ends and
+    // the rest of the body count.
+    let stmt = parse("t := ∑(i = a..n) b[i]·c + i =").unwrap();
+    assert_eq!(free_names(&stmt), vec!["i", "a", "n", "b", "c"]);
+    // Without the sum, `i` outside it is the plain name.
+    assert_eq!(free_names(&parse("∑(i = 1..2) i + i =").unwrap()), vec!["i"]);
+    // An inner sum's ends see the outer index, as the body does.
+    assert_eq!(free_names(&parse("∑(i = 1..3) ∑(j = i..m) j·i·x =").unwrap()), vec!["i", "j", "m", "x"]);
+    // The index of one sum is a name in a later sum's ends.
+    assert_eq!(free_names(&parse("∑(i = 1..2) i + ∑(j = i..4) j =").unwrap()), vec!["i", "j"]);
+}
+
+#[test]
+fn nested_sums_are_bounded() {
+    let opens: String = (0..200).map(|k| format!("∑(i_{k} = 1..2) ")).collect();
+    assert_eq!(parse(&format!("{opens}1 =")), Err(CalcError::TooComplex));
+    let in_ends: String = (0..200).map(|k| format!("∑(i_{k} = 1..")).collect();
+    let closes: String = (0..200).map(|_| ") 1").collect();
+    assert_eq!(parse(&format!("{in_ends}3{closes} =")), Err(CalcError::TooComplex));
 }

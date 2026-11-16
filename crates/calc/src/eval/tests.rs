@@ -1648,3 +1648,90 @@ fn statement_boundaries_refuse_a_failed_grid() {
     run(&mut env, "i := 0..2").unwrap();
     assert_eq!(err_in(&mut env, "t[i] := f"), "t[i] is one element — its right side can't be a vector");
 }
+
+#[test]
+fn sums() {
+    let mut env = Env::new();
+    for src in ["A_b := 0.5 in^2", "r := [2, 3, 4] in", "a := [1, 2, 3]", "b := [4, 5, 6]"] {
+        run(&mut env, src).unwrap();
+    }
+    assert_eq!(run(&mut env, "∑(i = 0..2) a[i]·b[i] =").unwrap().unwrap().value, 32.0);
+    assert_eq!(run(&mut env, "∑(i = 0..2) a[i]·b[i] + 1 =").unwrap().unwrap().value, 33.0);
+    let i = run(&mut env, "I := ∑(i = 0..length(r) - 1) A_b·r[i]^2 = ? in^4").unwrap().unwrap();
+    assert!((i.value - 0.5 * (4.0 + 9.0 + 16.0) * 0.0254_f64.powi(4)).abs() < 1e-15);
+    assert_eq!(run(&mut env, "∑(i = 1..3) ∑(j = 1..i) j =").unwrap().unwrap().value, 10.0);
+    assert_eq!(run(&mut env, "∑(k = 1, 3..7) k =").unwrap().unwrap().value, 16.0);
+    // Two sums may share an index; a defined name may not be one.
+    assert_eq!(run(&mut env, "∑(i = 1..2) i + ∑(i = 1..3) i =").unwrap().unwrap().value, 9.0);
+    assert_eq!(run(&mut env, "∑(a = 1..2) a =").unwrap_err().to_string(), "the sum's index a is already defined — choose another name");
+    assert_eq!(run(&mut env, "∑(i = 1..2) ∑(i = 1..2) i =").unwrap_err().to_string(), "the sum's index i is already defined — choose another name");
+    assert!(matches!(run(&mut env, "∑(m = 1..2) m ="), Err(CalcError::ReservedName(_))));
+    assert_eq!(run(&mut env, "∑(i = 1..0) i =").unwrap_err().to_string(), "the sum's range is empty — its last value is below its first");
+    assert!(run(&mut env, "∑(i = 0..2) (a[i] + r[i]) =").is_err(), "mixed units");
+    assert!(matches!(run(&mut env, "∑(i = 1..1e9) i ="), Err(CalcError::TooLarge | CalcError::TooMuchWork)));
+    // Review Focus 5: a parameter in the range.
+    run(&mut env, "tri(n) := ∑(i = 1..n) i").unwrap();
+    assert_eq!(run(&mut env, "tri(4) =").unwrap().unwrap().value, 10.0);
+}
+
+#[test]
+fn a_sum_binds_its_index_only_in_its_body() {
+    let mut env = Env::new();
+    // An outer index is a value in the ends of an inner sum, and a parameter too.
+    assert_eq!(run(&mut env, "∑(i = 1..3) ∑(j = i..3) j =").unwrap().unwrap().value, 6.0 + 5.0 + 3.0);
+    run(&mut env, "tri(n) := ∑(i = 1..n) i").unwrap();
+    assert_eq!(run(&mut env, "∑(k = 1..3) tri(k) =").unwrap().unwrap().value, 1.0 + 3.0 + 6.0);
+    // A parameter can't be an index, and a function's body doesn't see the caller's index.
+    run(&mut env, "bad(n) := ∑(n = 1..2) n").unwrap();
+    assert_eq!(err_in(&mut env, "bad(1) ="), "the sum's index n is already defined — choose another name");
+    run(&mut env, "leak(x) := x + k").unwrap();
+    assert_eq!(err_in(&mut env, "∑(k = 1..2) leak(k) ="), "k isn't defined");
+    // The index isn't left behind.
+    assert_eq!(err_in(&mut env, "∑(k = 1..2) k + k ="), "k isn't defined");
+}
+
+#[test]
+fn a_sum_index_must_be_unused_by_functions_and_failed_names() {
+    let mut env = Env::new();
+    run(&mut env, "f(x) := x").unwrap();
+    let msg = "the sum's index f is already defined — choose another name";
+    assert_eq!(err_in(&mut env, "∑(f = 1..2) f ="), msg);
+    env.mark_failed("w");
+    assert_eq!(err_in(&mut env, "∑(w = 1..2) w ="), "the sum's index w is already defined — choose another name");
+}
+
+#[test]
+fn sum_terms_add_under_the_unit_rules() {
+    let mut env = Env::new();
+    // Whole vectors add element by element.
+    run(&mut env, "M := [1, 2; 3, 4]").unwrap();
+    match run_value(&mut env, "∑(i = 1..3) M·i =").unwrap().unwrap() {
+        Value::Grid { items, rows, cols } => {
+            assert_eq!((rows, cols), (2, 2));
+            assert_eq!(items.iter().map(|q| q.value).collect::<Vec<_>>(), vec![6.0, 12.0, 18.0, 24.0]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Shapes must match across terms.
+    run(&mut env, "u := [1, 2, 3]").unwrap();
+    run(&mut env, "w := [1, 2]").unwrap();
+    assert!(run_value(&mut env, "∑(i = 0..1) if(i == 0, u, w) =").is_err());
+    // Units must agree, and text is refused with its place.
+    assert!(run(&mut env, "∑(i = 1..2) i·1 in =").is_ok());
+    assert!(run(&mut env, "∑(i = 1..2) if(i == 1, 1 in, 1 lbf) =").is_err());
+    assert_eq!(err_in(&mut env, "∑(i = 1..2) \"a\" ="), "\"a\" is text — it can't be used in a sum");
+    // A single term is the term itself, in its own unit.
+    let one_term = run(&mut env, "∑(i = 2..2) i·3 in =").unwrap().unwrap();
+    close(one_term, 6.0 * 0.0254, Dim { exp: [1, 0, 0, 0, 0, 0, 0, 0] });
+}
+
+#[test]
+fn sums_are_bounded_work() {
+    let mut env = Env::new();
+    // 10,000 × 10,000 terms is far past the budget.
+    assert!(matches!(run(&mut env, "∑(i = 1..10000) ∑(j = 1..10000) j ="), Err(CalcError::TooComplex | CalcError::TooMuchWork)));
+    // A sum nested as deep as the parser allows still evaluates.
+    let opens: String = (0..40).map(|k| format!("∑(i_{k} = 1..1) ")).collect();
+    let src = format!("{opens}1 =");
+    assert_eq!(run(&mut env, &src).unwrap().unwrap().value, 1.0);
+}

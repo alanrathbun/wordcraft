@@ -334,7 +334,7 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
                 (Some(i), _) => indexed(env, name, i, body, pass)?,
                 (None, Expr::Range { first, second, last }) => {
                     let cx = Cx::new(env, pass);
-                    range(&cx, first, second.as_deref(), last)?
+                    range(&cx, &Frame::GLOBAL, first, second.as_deref(), last, 0)?
                 }
                 (None, _) => eval_data(env, body, pass)?,
             }
@@ -442,13 +442,19 @@ pub(crate) struct Frame<'a> {
     names: &'a [String],
     values: &'a [Data],
     calls: usize,
+    /// The scope this one is inside: a sum's index sees the parameters, and the indexes of the sums
+    /// around it. A function's body has none, and sees only its own parameters.
+    parent: Option<&'a Frame<'a>>,
 }
 
 impl Frame<'_> {
-    const GLOBAL: Frame<'static> = Frame { names: &[], values: &[], calls: 0 };
+    const GLOBAL: Frame<'static> = Frame { names: &[], values: &[], calls: 0, parent: None };
 
+    /// The value of a parameter or index in scope. The scopes nest no deeper than the sums inside
+    /// one another, which the parser bounds.
     fn param(&self, name: &str) -> Option<&Data> {
-        self.names.iter().position(|n| n == name).and_then(|i| self.values.get(i))
+        let own = self.names.iter().position(|n| n == name).and_then(|i| self.values.get(i));
+        own.or_else(|| self.parent.and_then(|p| p.param(name)))
     }
 }
 
@@ -541,6 +547,7 @@ fn eval(cx: &Cx<'_>, fr: &Frame<'_>, e: &Expr, depth: usize) -> Result<Data, Cal
         Expr::Matrix { rows, cols, items } => matrix(cx, fr, *rows, *cols, items, depth),
         Expr::Index(name, at) => index(cx, fr, name, at, depth),
         Expr::Cases { cases, otherwise } => cases_expr(cx, fr, cases, otherwise.as_deref(), depth),
+        Expr::Sum { index, first, second, last, body } => sum(cx, fr, index, (first, second.as_deref(), last), body, depth),
         // A range is evaluated only as the whole right side of a variable's definition.
         Expr::Range { .. } => Err(range_only_defines_a_variable()),
     }
@@ -1216,6 +1223,12 @@ fn case_vars<'a>(env: &'a Env, fr: &'a Frame<'_>, cases: &[(&'a Expr, &'a Expr)]
                     stack.push(value);
                 }
             }
+            Expr::Sum { first, second, last, body, .. } => {
+                stack.push(body);
+                stack.push(last);
+                stack.extend(second.as_deref());
+                stack.push(first);
+            }
         }
     }
     out
@@ -1269,9 +1282,26 @@ pub(crate) fn truth(cx: &Cx<'_>, d: &Data) -> Result<Data, CalcError> {
 /// The range `first..last` or `first, second..last`, both ends included: a column of the values
 /// from `first` stepping by `second − first` (by 1 towards `last` when there is no second value)
 /// for as long as they don't pass `last`.
-fn range(cx: &Cx<'_>, first: &Expr, second: Option<&Expr>, last: &Expr) -> Result<Data, CalcError> {
+///
+/// The ends are worked out in the scope `fr`: a definition's are global, a sum's may use the
+/// parameters and the indexes around it.
+fn range(cx: &Cx<'_>, fr: &Frame<'_>, first: &Expr, second: Option<&Expr>, last: &Expr, depth: usize) -> Result<Data, CalcError> {
+    let (a, b, z) = range_ends(cx, fr, first, second, last, depth)?;
+    range_values(cx, a, b, z).map(Data::Grid)
+}
+
+/// The values at the ends of a range, each a single value: the first, the second when it is given
+/// and the last.
+fn range_ends(
+    cx: &Cx<'_>,
+    fr: &Frame<'_>,
+    first: &Expr,
+    second: Option<&Expr>,
+    last: &Expr,
+    depth: usize,
+) -> Result<(Val, Option<Val>, Val), CalcError> {
     tick(cx)?;
-    let end = |e: &Expr| match eval(cx, &Frame::GLOBAL, e, 1)? {
+    let end = |e: &Expr| match eval(cx, fr, e, depth + 1)? {
         Data::One(v) => Ok(v),
         Data::Grid(_) => Err(CalcError::Syntax("a range's values are single values, like 0..5".to_string())),
         d @ (Data::Text(_) | Data::TextGrid(_)) => Err(text_use(d.text().unwrap_or_default(), "in a range")),
@@ -1279,6 +1309,12 @@ fn range(cx: &Cx<'_>, first: &Expr, second: Option<&Expr>, last: &Expr) -> Resul
     let a = end(first)?;
     let b = second.map(end).transpose()?;
     let z = end(last)?;
+    Ok((a, b, z))
+}
+
+/// The column of values of the range from `a` to `z`, stepping by `b − a` when there is a second
+/// value `b`.
+fn range_values(cx: &Cx<'_>, a: Val, b: Option<Val>, z: Val) -> Result<Grid, CalcError> {
     let span = z.q.sub(a.q).map_err(unit)?;
     let step = match b {
         Some(b) => b.q.sub(a.q).map_err(unit)?,
@@ -1336,7 +1372,42 @@ fn range(cx: &Cx<'_>, first: &Expr, second: Option<&Expr>, last: &Expr) -> Resul
     {
         end.q = z.q;
     }
-    Grid::new(n, 1, values).map(Data::Grid)
+    Grid::new(n, 1, values)
+}
+
+/// The sum `∑(index = first..last) body`: `body` worked out once for each value of the range, with
+/// the index bound to it, and the terms added element by element (so their units must agree and
+/// their shapes match). The index is the sum's own: it can't be a unit, function or constant, nor
+/// a name defined in the document, a parameter, or the index of a sum around this one. A range
+/// that ends below its first value with no step is empty, and an empty sum is an error, never 0.
+/// Each term costs the work of its body, and the range itself is a grid, so at most 10,000 terms.
+// Not inlined, so the recursive `eval` frame stays small (its depth is bounded by `MAX_EVAL_DEPTH`).
+#[inline(never)]
+fn sum(cx: &Cx<'_>, fr: &Frame<'_>, index: &str, ends: (&Expr, Option<&Expr>, &Expr), body: &Expr, depth: usize) -> Result<Data, CalcError> {
+    check_name(index)?;
+    if fr.param(index).is_some() || cx.env.entries.contains_key(index) {
+        return Err(CalcError::Syntax(format!("the sum's index {index} is already defined — choose another name")));
+    }
+    let empty = || CalcError::Syntax("the sum's range is empty — its last value is below its first".to_string());
+    let (first, second, last) = ends;
+    let (a, b, z) = range_ends(cx, fr, first, second, last, depth)?;
+    if b.is_none() && z.q.sub(a.q).is_ok_and(|span| span.value < 0.0) {
+        return Err(empty());
+    }
+    let values = range_values(cx, a, b, z)?;
+    let names = [index.to_string()];
+    let mut total: Option<Data> = None;
+    for v in &values.items {
+        let bound = [Data::One(*v)];
+        let frame = Frame { names: &names, values: &bound, calls: fr.calls, parent: Some(fr) };
+        let term = eval(cx, &frame, body, depth + 1)?;
+        no_text(&[&term], "in a sum")?;
+        total = Some(match total {
+            None => term,
+            Some(so_far) => pair(cx, &so_far, &term, |x, y| Ok(Val { q: apply(Op::Add, x.q, y.q)?, t: sum_temp(Op::Add, x.t, y.t) }))?,
+        });
+    }
+    total.ok_or_else(empty)
 }
 
 /// What values between two temperatures stand for: absolute when either end is, a bare `K`
@@ -1403,7 +1474,7 @@ fn indexed(env: &Env, name: &str, i: &str, body: &Expr, pass: &Pass) -> Result<D
     let mut values: Vec<Option<Data>> = vec![None; size];
     for (&k, v) in places.iter().zip(&g.items) {
         let bound = [Data::One(*v)];
-        let frame = Frame { names: &names, values: &bound, calls: 0 };
+        let frame = Frame { names: &names, values: &bound, calls: 0, parent: None };
         let value = match eval_lenient(&cx, &frame, body, 0).map_err(|e| array::element_error(size, 1, k, o, e))? {
             value @ (Data::One(_) | Data::Text(_)) => value,
             Data::Grid(_) | Data::TextGrid(_) => {
@@ -1698,7 +1769,7 @@ fn call_user(cx: &Cx<'_>, fr: &Frame<'_>, name: &str, params: &[String], body: &
         return Err(CalcError::TooComplex);
     }
     let values = eval_args(cx, fr, args, depth)?;
-    let inner = Frame { names: params, values: &values, calls: fr.calls + 1 };
+    let inner = Frame { names: params, values: &values, calls: fr.calls + 1, parent: None };
     eval(cx, &inner, body, depth + 1)
 }
 

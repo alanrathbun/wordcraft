@@ -359,3 +359,29 @@ fn cases_linear_text_and_runs() {
     let d = display_of("y := if(x > 0, 1, 2)", None);
     assert!(runs(&d.math).iter().any(|r| r.text == "if" && r.sty == Some(MSty::Plain)));
 }
+
+#[test]
+fn sums_show_as_nary() {
+    let d = display_of("I := ∑(i = 0..n) a[i]·b[i]", None);
+    let Some(MNode::Nary { chr: '∑', sub, sup, e, .. }) = find_node(&d.math, |n| matches!(n, MNode::Nary { .. })) else { panic!("{:?}", d.math) };
+    assert!(!sub.is_empty() && !sup.is_empty() && !e.is_empty());
+}
+
+#[test]
+fn a_sum_shows_its_limits_and_a_grouped_term() {
+    let d = display_of("I := ∑(i = 0..n) a[i]·b[i]", None);
+    assert_eq!(d.linear, "I≔∑_(i=0)^n▒〖a_i·b_i〗");
+    // A second value shows after the first; the term stays grouped before what follows.
+    let d = display_of("∑(k = 1, 3..7) k + 1 =", Some(&Shown::One(f("17", ""))));
+    assert_eq!(d.linear, "∑_(k=1,3)^7▒〖k〗+1=17");
+    // The limits and the term are trees of their own, with the index in the lower limit.
+    let Some(MNode::Nary { sub, e, .. }) = find_node(&d.math, |n| matches!(n, MNode::Nary { .. })) else { panic!("{:?}", d.math) };
+    let text: String = runs(sub).iter().map(|r| r.text.clone()).collect();
+    assert_eq!(text, "k=1,3");
+    assert_eq!(runs(e).iter().map(|r| r.text.clone()).collect::<String>(), "k");
+    // Nested sums nest their trees; a sum under a power keeps its parentheses.
+    let d = display_of("x := ∑(i = 1..3) ∑(j = 1..i) j", None);
+    assert_eq!(d.linear, "x≔∑_(i=1)^3▒〖∑_(j=1)^i▒〖j〗〗");
+    let d = display_of("x := (∑(i = 1..3) i)^2", None);
+    assert_eq!(d.linear, "x≔(∑_(i=1)^3▒〖i〗)^2");
+}

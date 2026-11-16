@@ -103,6 +103,21 @@ pub enum Expr {
         /// The value when no condition holds; with none, that is an error.
         otherwise: Option<Box<Expr>>,
     },
+    /// A sum with limits, `∑(i = first..last) body` or `∑(i = first, second..last) body`: `body`
+    /// added up with the index `i` taking each value of the range, both ends included. The index
+    /// belongs to the sum alone.
+    Sum {
+        /// The index, a name used only inside `body`.
+        index: String,
+        /// The first value of the range.
+        first: Box<Expr>,
+        /// The second value, when it is given (it sets the step).
+        second: Option<Box<Expr>>,
+        /// The last value of the range.
+        last: Box<Expr>,
+        /// The term added up for each index value.
+        body: Box<Expr>,
+    },
 }
 
 /// A comparison.
@@ -171,7 +186,8 @@ pub fn defined_name(s: &Stmt) -> Option<&str> {
 }
 
 /// The names a statement uses (variables, units, constants, called functions and indexed
-/// vectors), minus a function's own parameters, without duplicates, in order of first use. The
+/// vectors), minus a function's own parameters and, inside a sum, its index (which is itself listed
+/// as used, once, where the sum starts), without duplicates, in order of first use. The
 /// range variable of an indexed definition (`i` in `t[i] := …`) is used, so it comes first.
 pub fn free_names(s: &Stmt) -> Vec<String> {
     let (body, params, index): (&Expr, &[String], Option<&String>) = match s {
@@ -186,28 +202,42 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
     {
         out.push(i.clone());
     }
+    // The indexes of the sums being read, innermost last: a name that is one of them is the sum's
+    // own, not a use of anything else.
+    let mut bound: Vec<&str> = Vec::new();
     // An explicit stack keeps this safe on trees built by hand, deeper than the parser allows.
-    let mut stack: Vec<&Expr> = vec![body];
-    while let Some(e) = stack.pop() {
+    let mut stack: Vec<Visit<'_>> = vec![Visit::Expr(body)];
+    while let Some(visit) = stack.pop() {
+        let e = match visit {
+            Visit::Expr(e) => e,
+            Visit::Bind(i) => {
+                bound.push(i);
+                continue;
+            }
+            Visit::Unbind => {
+                bound.pop();
+                continue;
+            }
+        };
         let name = match e {
             Expr::Num(_) | Expr::Text(_) | Expr::Quantity(..) => continue,
             Expr::Name(n) => n,
             Expr::Unary(_, a) | Expr::Abs(a) | Expr::Not(a) => {
-                stack.push(a);
+                stack.push(Visit::Expr(a));
                 continue;
             }
             Expr::Binary(_, a, b) | Expr::Logic(_, a, b) => {
-                stack.push(b);
-                stack.push(a);
+                stack.push(Visit::Expr(b));
+                stack.push(Visit::Expr(a));
                 continue;
             }
             Expr::Compare { first, rest } => {
-                stack.extend(rest.iter().rev().map(|(_, e)| e));
-                stack.push(first);
+                stack.extend(rest.iter().rev().map(|(_, e)| Visit::Expr(e)));
+                stack.push(Visit::Expr(first));
                 continue;
             }
             Expr::Call(n, args) | Expr::Index(n, args) => {
-                stack.extend(args.iter().rev());
+                stack.extend(args.iter().rev().map(Visit::Expr));
                 // `if(c, a, b)` is a keyword, not a function anything defines.
                 if matches!(e, Expr::Call(..)) && n == "if" {
                     continue;
@@ -215,7 +245,7 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
                 n
             }
             Expr::Matrix { items, .. } => {
-                stack.extend(items.iter().rev());
+                stack.extend(items.iter().rev().map(Visit::Expr));
                 continue;
             }
             Expr::Cases { cases, otherwise } => {
@@ -223,28 +253,59 @@ pub fn free_names(s: &Stmt) -> Vec<String> {
                 continue;
             }
             Expr::Range { first, second, last } => {
-                stack.push(last);
+                stack.push(Visit::Expr(last));
                 if let Some(second) = second {
-                    stack.push(second);
+                    stack.push(Visit::Expr(second));
                 }
-                stack.push(first);
+                stack.push(Visit::Expr(first));
+                continue;
+            }
+            Expr::Sum { index, first, second, last, body } => {
+                // The index counts as used, so a definition of that name elsewhere runs first and
+                // the "already defined" error doesn't depend on the order of evaluation. The ends
+                // come first, outside the index; then the body, inside it.
+                if seen.insert(index) {
+                    out.push(index.clone());
+                }
+                stack.push(Visit::Unbind);
+                stack.push(Visit::Expr(body));
+                stack.push(Visit::Bind(index));
+                stack.push(Visit::Expr(last));
+                if let Some(second) = second {
+                    stack.push(Visit::Expr(second));
+                }
+                stack.push(Visit::Expr(first));
                 continue;
             }
         };
-        if seen.insert(name) {
+        if !bound.contains(&name.as_str()) && seen.insert(name) {
             out.push(name.clone());
         }
     }
     out
 }
 
+/// What [`free_names`] still has to do: read an expression, or enter or leave a sum's body, where
+/// its index is bound.
+enum Visit<'a> {
+    Expr(&'a Expr),
+    Bind(&'a str),
+    Unbind,
+}
+
+impl<'a> From<&'a Expr> for Visit<'a> {
+    fn from(e: &'a Expr) -> Self {
+        Visit::Expr(e)
+    }
+}
+
 /// Push the parts of a piecewise onto a stack of expressions to visit, so they come off it in
 /// source order: each value then its condition, then `otherwise`.
-fn push_cases<'a>(stack: &mut Vec<&'a Expr>, cases: &'a [(Expr, Expr)], otherwise: Option<&'a Expr>) {
-    stack.extend(otherwise);
+fn push_cases<'a, T: From<&'a Expr>>(stack: &mut Vec<T>, cases: &'a [(Expr, Expr)], otherwise: Option<&'a Expr>) {
+    stack.extend(otherwise.map(T::from));
     for (value, condition) in cases.iter().rev() {
-        stack.push(condition);
-        stack.push(value);
+        stack.push(T::from(condition));
+        stack.push(T::from(value));
     }
 }
 
@@ -303,6 +364,15 @@ pub(crate) fn keywords_used(s: &Stmt) -> Vec<&'static str> {
                 None
             }
             Expr::Range { first, second, last } => {
+                stack.push(last);
+                if let Some(second) = second {
+                    stack.push(second);
+                }
+                stack.push(first);
+                None
+            }
+            Expr::Sum { first, second, last, body, .. } => {
+                stack.push(body);
                 stack.push(last);
                 if let Some(second) = second {
                     stack.push(second);

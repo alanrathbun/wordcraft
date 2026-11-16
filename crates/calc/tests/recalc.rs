@@ -2030,3 +2030,21 @@ fn perf_1000_element_piecewise() {
     assert!(region(&d, 2).1.ends_with("=271"), "{}", region(&d, 2).1);
     assert!(took.as_millis() < 100, "recalc took {took:?}");
 }
+
+#[test]
+fn a_sum_index_defined_elsewhere_is_reported() {
+    let mut d = doc_with(&["tot := ∑(i = 1..3) i =", "i := 0..5"]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, CalcState::Error("the sum's index i is already defined — choose another name".into()));
+}
+
+#[test]
+fn a_sum_calculates_and_shows_in_a_document() {
+    let mut d = doc_with(&["a := [1, 2, 3]", "n := 2", "tot := ∑(i = 0..n) a[i] =", "∑(i = 1..4) i^2 ="]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 3).0.state, CalcState::Fresh);
+    assert_eq!(region(&d, 3).1, "tot≔∑_(i=0)^n▒〖a_i〗=6");
+    assert_eq!(region(&d, 4).1, "∑_(i=1)^4▒〖i^2〗=30");
+    // The sum is a real ∑ in the tree.
+    assert!(region(&d, 4).2.nodes.iter().any(|n| matches!(n, MNode::Nary { chr: '∑', .. })));
+}

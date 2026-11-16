@@ -745,6 +745,44 @@ impl Out {
         self.sentinel(Piece { text: k.to_string(), kind: Kind::Node(k) }, &text);
     }
 
+    /// A sum: a real ∑ with its limits (`i=first` or `i=first,second` below, `last` above) and
+    /// the summed term grouped after it (`∑_(i=1)^n▒〖a_i·b_i〗`), so what the term reaches is
+    /// visible. Like [`Out::matrix`], the tree is built part by part and stands in the parsed
+    /// text as one sentinel; a sum inside the term recurses here, and the parser bounds that
+    /// nesting.
+    fn sum(&mut self, index: &str, ends: (&Expr, Option<&Expr>, &Expr), body: &Expr) {
+        let (first, second, last) = ends;
+        let mut text = String::from("∑_(");
+        let sub = built(
+            |o| {
+                o.name(index);
+                o.text("=");
+                write_end(first, o);
+                if let Some(second) = second {
+                    o.text(",");
+                    write_end(second, o);
+                }
+            },
+            &mut text,
+        );
+        text.push_str(")^");
+        let parens = !exponent_simple(last);
+        if parens {
+            text.push('(');
+        }
+        let sup = built(|o| write_expr(last, o), &mut text);
+        if parens {
+            text.push(')');
+        }
+        text.push_str("▒〖");
+        let e = built(|o| write_expr(body, o), &mut text);
+        text.push('〗');
+        self.linear.push_str(&text);
+        let k = self.nodes.len();
+        self.nodes.push(MNode::Nary { chr: '∑', lim_loc: None, grow: false, sub_hide: false, sup_hide: false, sub, sup, e });
+        self.sentinel(Piece { text: k.to_string(), kind: Kind::Node(k) }, &text);
+    }
+
     /// A name that a subscript index follows: in invisible brackets when it has a subscript of
     /// its own (`〖D_o〗_i`), so the index lowers the whole name instead of extending its subscript.
     fn index_base(&mut self, name: &str) {
@@ -790,10 +828,27 @@ impl Out {
 /// tree. An expression inside one recurses into [`Out::matrix`] or [`Out::cases`]; the parser
 /// bounds that nesting.
 fn cell(e: &Expr, text: &mut String) -> Arg {
-    let mut cell = Out::default();
-    write_expr(e, &mut cell);
-    text.push_str(&cell.linear);
-    restore_pieces(parse_linear(&cell.parsed), &cell.pieces, &cell.nodes)
+    built(|out| write_expr(e, out), text)
+}
+
+/// What `write` puts in a fresh [`Out`], as a tree, its linear text added to `text`.
+fn built(write: impl FnOnce(&mut Out), text: &mut String) -> Arg {
+    let mut part = Out::default();
+    write(&mut part);
+    text.push_str(&part.linear);
+    restore_pieces(parse_linear(&part.parsed), &part.pieces, &part.nodes)
+}
+
+/// An end of a sum's range, written before a `,` or a `)` inside its lower limit: a quotient keeps
+/// its parentheses, so what follows it can't run on into its denominator.
+fn write_end(e: &Expr, out: &mut Out) {
+    if range_end_parens(e) {
+        out.text("(");
+        write_expr(e, out);
+        out.text(")");
+    } else {
+        write_expr(e, out);
+    }
 }
 
 /// A subscript of two or more characters is upright (`σ_max`); a one-letter one is a symbol.
@@ -868,7 +923,10 @@ fn prec(e: &Expr) -> u8 {
         Expr::Unary(..) => NEG,
         Expr::Binary(Op::Pow, ..) => POWER,
         Expr::Binary(Op::Neg, ..) => SUM,
-        Expr::Num(_) | Expr::Text(_) | Expr::Name(_) | Expr::Call(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Index(..) => ATOM,
+        // The summed term is grouped after the ∑, so a sum is a unit wherever it stands.
+        Expr::Num(_) | Expr::Text(_) | Expr::Name(_) | Expr::Call(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Index(..) | Expr::Sum { .. } => {
+            ATOM
+        }
     }
 }
 
@@ -956,7 +1014,7 @@ fn ends_in_script(e: &Expr) -> bool {
         match e {
             Expr::Num(v) => return exponential(*v),
             Expr::Name(n) => return n.contains('_') && !is_unit(n),
-            Expr::Text(_) | Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Cases { .. } => return false,
+            Expr::Text(_) | Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } | Expr::Cases { .. } | Expr::Sum { .. } => return false,
             Expr::Call(..) => return is_sqrt(e),
             Expr::Index(..) | Expr::Binary(Op::Pow | Op::Div, ..) => return true,
             Expr::Unary(_, a) | Expr::Binary(_, _, a) | Expr::Logic(_, _, a) | Expr::Not(a) => e = a,
@@ -1084,6 +1142,7 @@ fn write_expr(root: &Expr, out: &mut Out) {
             }
             Expr::Matrix { cols, items, .. } => out.matrix(*cols, items),
             Expr::Cases { cases, otherwise } => out.cases(cases, otherwise.as_deref()),
+            Expr::Sum { index, first, second, last, body } => out.sum(index, (first, second.as_deref(), last), body),
             Expr::Index(..) | Expr::Range { .. } => push_array_syntax(e, &mut todo, out),
             Expr::Binary(op, a, b) => match op {
                 Op::Add | Op::Sub | Op::Neg => {

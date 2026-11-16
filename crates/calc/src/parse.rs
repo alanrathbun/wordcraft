@@ -23,6 +23,8 @@
 //! power     := atom [ "^" unary ]                              right-associative
 //! atom      := number | text | name | name"(" args ")" | name"[" args "]" | "(" expr ")"
 //!            | "if(" expr "," expr "," expr ")"                  if(condition, then, else)
+//!            | "∑" "(" name "=" expr [ "," expr ] ".." expr ")" term
+//!                                                               a sum: first..last, or first, second..last
 //!            | "[" rows "]" | "|" expr "|" | "√" atom
 //! rows      := items { ";" items }                             every row the same length
 //! items     := expr { "," expr }
@@ -31,9 +33,15 @@
 //!
 //! `and`, `or`, `not`, `if` and `otherwise` are keywords, never names. A `==` is a comparison; a
 //! lone `=` still ends the statement. `if` touching a `(` is the function `if(c, a, b)`, which
-//! like any call can be a factor of an implied product (`2 if(c, a, b)`); anywhere else `if` and `otherwise` belong to a list of cases, which,
-//! like a range, can only be the whole right side of a definition, so its commas are never
-//! confused with list or argument commas.
+//! like any call can be a factor of an implied product (`2 if(c, a, b)`); anywhere else `if` and
+//! `otherwise` belong to a list of cases, which, like a range, can only be the whole right side of
+//! a definition, so its commas are never confused with list or argument commas.
+//!
+//! `∑` takes one product term, as `·` does: `∑(i = 1..n) a[i]·b[i] + 1` is `(∑ a[i]·b[i]) + 1`;
+//! write `∑(i = 1..n) (a[i] + 1)` to sum a sum of terms. Its ends are read like the values of a
+//! range, and the `=` after `∑(` and the index is the sum's own, not the one that shows the result.
+//! The index belongs to the sum alone. Sums nest, and the ends of a sum count as nesting like a
+//! bracket.
 //!
 //! A text is written between quotes, `"OK"` or `“OK”`, and is at most [`MAX_TEXT_CHARS`] characters.
 //! It never multiplies by adjacency (`2 "OK"` is an error).
@@ -188,6 +196,11 @@ enum Kind {
     If,
     /// `otherwise`
     Otherwise,
+    /// `∑`
+    Sum,
+    /// The `=` inside a sum's parentheses, `∑(i = 1..n)`: it separates the index from its range,
+    /// and doesn't end the statement.
+    SumEq,
 }
 
 /// Whether `name` is a keyword (`and`, `or`, `not`, `if`, `otherwise`) rather than a name.
@@ -254,6 +267,8 @@ impl Kind {
             Kind::Not => "`not`".into(),
             Kind::If => "`if`".into(),
             Kind::Otherwise => "`otherwise`".into(),
+            Kind::Sum => "`∑`".into(),
+            Kind::SumEq => "`=`".into(),
         }
     }
 }
@@ -341,6 +356,7 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
             '∧' => Kind::And,
             '∨' => Kind::Or,
             '¬' => Kind::Not,
+            '∑' => Kind::Sum,
             '<' => two_char(&mut chars, &mut end, Kind::Lt, Kind::Le),
             '>' => two_char(&mut chars, &mut end, Kind::Gt, Kind::Ge),
             '!' => match chars.next_if(|&(_, n)| n == '=') {
@@ -371,8 +387,13 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
                 Kind::Sup(decode_superscript(&run)?)
             }
             '=' => {
-                // `==` is a comparison; a lone `=` ends the expression, and what follows is the unit.
+                // `==` is a comparison; a lone `=` ends the expression, and what follows is the unit,
+                // except the one right after `∑(name`, which stays in the sum.
                 if chars.next_if(|&(_, n)| n == '=').is_none() {
+                    if opens_a_sum(&toks) {
+                        toks.push(Tok { kind: Kind::SumEq, start, end });
+                        continue;
+                    }
                     toks.push(Tok { kind: Kind::Eq, start, end });
                     return Ok(toks);
                 }
@@ -411,6 +432,14 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
         toks.push(Tok { kind, start, end });
     }
     Ok(toks)
+}
+
+/// Whether the tokens so far end in `∑(` and a name, so that a `=` after them is the sum's own.
+fn opens_a_sum(toks: &[Tok]) -> bool {
+    matches!(
+        toks.len().checked_sub(3).and_then(|k| toks.get(k..)),
+        Some([Tok { kind: Kind::Sum, .. }, Tok { kind: Kind::LParen, .. }, Tok { kind: Kind::Name(_), .. }])
+    )
 }
 
 type Chars<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
@@ -856,7 +885,7 @@ impl<'a> Parser<'a> {
     /// never does, so `2 "OK"` ends the expression and the text is reported as unexpected.
     fn starts_factor(&self) -> bool {
         match self.peek_kind() {
-            Some(Kind::Num(_) | Kind::Name(_) | Kind::LParen | Kind::LBracket | Kind::Sqrt) => true,
+            Some(Kind::Num(_) | Kind::Name(_) | Kind::LParen | Kind::LBracket | Kind::Sqrt | Kind::Sum) => true,
             Some(Kind::Bar) => !self.bar_closes,
             Some(Kind::If) => self.if_call_next(),
             _ => false,
@@ -943,8 +972,63 @@ impl<'a> Parser<'a> {
                 _ => Err(misplaced_cases()),
             },
             Kind::Otherwise => Err(misplaced_cases()),
+            Kind::Sum => self.sum(),
             other => Err(syntax(format!("expected a value but found {}", other.describe()))),
         }
+    }
+
+    /// A sum, after its `∑`: `(i = first..last)` or `(i = first, second..last)`, then the term it
+    /// adds up. The term is one product term, like `·` takes (`∑(…) a·b + 1` is `(∑ a·b) + 1`):
+    /// a `+`, `-`, comparison, `and` or `or` ends it.
+    fn sum(&mut self) -> Result<Node, CalcError> {
+        let bad = || syntax("a sum is written like ∑(i = 1..n) a[i]·b[i]");
+        if self.bump().map(|t| &t.kind) != Some(&Kind::LParen) {
+            return Err(bad());
+        }
+        let Some(Tok { kind: Kind::Name(index), .. }) = self.bump() else {
+            return Err(syntax("a sum's index must be a name, like ∑(i = 1..n) a[i]"));
+        };
+        if self.bump().map(|t| &t.kind) != Some(&Kind::SumEq) {
+            return Err(bad());
+        }
+        let (first, second, last) = self.bracketed(false, Self::sum_range)?;
+        self.expect(&Kind::RParen)?;
+        let body = self.expr(MUL_BP.0)?;
+        let height = first.height.max(last.height).max(second.as_ref().map_or(0, |s| s.height)).max(body.height);
+        let sum = Expr::Sum {
+            index: index.clone(),
+            first: Box::new(first.expr),
+            second: second.map(|s| Box::new(s.expr)),
+            last: Box::new(last.expr),
+            body: Box::new(body.expr),
+        };
+        Node::over(height, sum)
+    }
+
+    /// The range of a sum, inside its parentheses: `first..last` or `first, second..last`. The
+    /// values are whole expressions read as a range's are, and the whole counts as one level of
+    /// nesting, so sums inside the ends of sums are bounded.
+    fn sum_range(&mut self) -> Result<(Node, Option<Node>, Node), CalcError> {
+        self.depth += 1;
+        let r = if self.depth > MAX_DEPTH { Err(CalcError::TooComplex) } else { self.sum_range_inner() };
+        self.depth -= 1;
+        r
+    }
+
+    fn sum_range_inner(&mut self) -> Result<(Node, Option<Node>, Node), CalcError> {
+        let bad = || syntax("a sum's range is written like 1..n, or like 1, 3..n with a step");
+        let first = self.range_value()?;
+        let second = if self.peek_kind() == Some(&Kind::Comma) {
+            self.pos += 1;
+            Some(self.range_value()?)
+        } else {
+            None
+        };
+        if self.bump().map(|t| &t.kind) != Some(&Kind::DotDot) {
+            return Err(bad());
+        }
+        let last = self.range_value()?;
+        Ok((first, second, last))
     }
 
     /// The arguments of a call, after its `(`.
