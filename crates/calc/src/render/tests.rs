@@ -269,6 +269,14 @@ fn comparison_parentheses_follow_precedence() {
     assert!(lin("c := a or (b and d)").contains("a∨b∧d"));
     assert!(lin("c := a or (b or d)").contains("a∨(b∨d)"));
     assert!(lin("c := not (a and b)").contains("¬(a∧b)"));
+    // `not` binds looser than a comparison, but `¬a<b` would read as `(¬a)<b`: the comparison
+    // keeps its parentheses, however it was typed. A bare name needs none.
+    assert!(lin("c := not (a < b)").contains("≔¬(a<b)"), "{}", lin("c := not (a < b)"));
+    assert!(lin("c := not a < b").contains("≔¬(a<b)"));
+    assert!(lin("c := not a == 2").contains("≔¬(a==2)"));
+    assert!(lin("c := not a").contains("≔¬a"));
+    assert!(!lin("c := not a").contains('('));
+    assert!(lin("c := not (a or b)").contains("¬(a∨b)"));
     assert!(lin("c := a + (b < d)").contains("a+(b<d)"));
     assert!(lin("c := (a < b) < d").contains("(a<b)<d"));
     assert!(lin("c := x < (a or b)").contains("x<(a∨b)"));
@@ -281,6 +289,12 @@ fn a_comparison_result_reads_back() {
     let d = display_of("a == 1 =", Some(&one));
     assert!(d.linear.contains("a==1=1"), "{}", d.linear);
     assert_eq!(shown_result(&d.linear), Some(one));
+    // A display that lost its result: neither `=` of `==` is the result's marker.
+    assert_eq!(shown_result("x≔a==1"), None);
+    assert_eq!(shown_result("x≔a==1#"), None);
+    assert_eq!(shown_result("x≔(a==1)+(b==2)"), None);
+    // With its result, still read from the last `=`.
+    assert_eq!(shown_result("x≔a==1=1"), Some(Shown::One(f("1", ""))));
 }
 
 #[test]

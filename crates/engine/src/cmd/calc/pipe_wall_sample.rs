@@ -261,7 +261,7 @@ fn conditions_text_and_sums_reopen_unchanged() {
     ] {
         calc(&mut s, source);
     }
-    shows(&s, "b", "≔a>1∧a<3∨¬a==2=1");
+    shows(&s, "b", "≔a>1∧a<3∨¬(a==2)=1");
     shows(&s, "c", "≔if(a≠2,\"x y\",\"z\")=\"z\"");
     shows(&s, "d", "≔∑_(i=1)^3▒〖(i+a)〗=12");
     shows(&s, "f_2", "≔{■(1&\"if \"a<0@2&\"if \"a<1@3&\"otherwise\")┤=3");

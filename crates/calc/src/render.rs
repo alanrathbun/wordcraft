@@ -358,6 +358,8 @@ pub(crate) fn shown_result(linear: &str) -> Option<Shown> {
         }
         match c {
             '"' => quoted = !quoted,
+            // Either half of an `==` is no result marker (`x≔a==1` has lost its result).
+            '=' if linear.get(..i).is_some_and(|s| s.ends_with('=')) || linear.get(i + 1..).is_some_and(|s| s.starts_with('=')) => {}
             '=' | '≈' if !quoted => {
                 start = Some(i + c.len_utf8());
                 break;
@@ -1148,7 +1150,9 @@ fn write_expr(root: &Expr, out: &mut Out) {
                 wrap(&mut todo, a, prec(a) < level);
             }
             Expr::Not(a) => {
-                wrap(&mut todo, a, prec(a) < NOT);
+                // A comparison keeps its parentheses, though `not` binds looser: `¬a<3` would read
+                // as `(¬a)<3`. So does a looser `and` or `or`.
+                wrap(&mut todo, a, prec(a) <= COMPARE);
                 todo.push(Step::Text("¬"));
             }
             Expr::Matrix { cols, items, .. } => out.matrix(*cols, items),
