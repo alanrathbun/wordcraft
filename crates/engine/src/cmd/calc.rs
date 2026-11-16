@@ -13,7 +13,7 @@ use wordcraft_calc::{
     CalcError, RecalcReport, calc_unchanged, check_new_name, check_quote_unit, defined_name, defined_names, freeze_outside_body, is_calc_object,
     mark_stale, parse, recalc,
 };
-use wordcraft_doc::calc::{CalcRegion, CalcState, GMeans, UnitSystem, calc_field_instr, parse_calc_field};
+use wordcraft_doc::calc::{CalcRegion, CalcState, GMeans, QuoteSpec, UnitSystem, calc_field_instr, parse_calc_field};
 use wordcraft_doc::math::Math;
 use wordcraft_doc::{Block, Document, InlineObject, Paragraph, Pos, StoryRef};
 
@@ -472,8 +472,9 @@ fn insert_value(s: &mut Session, v: &Value) -> CmdResult {
         check_quote_unit(&s.doc, &name, unit).map_err(|e| CmdError::Failed(format!("{name} can't be shown in {unit}: {e}")))?;
     }
     // The field code must read back as written, or the value would never be updated.
-    let instr = calc_field_instr(&name, unit.as_deref(), precision);
-    if unit.as_deref().is_some_and(|u| u.contains('"')) || parse_calc_field(&instr) != Some((name.clone(), unit.clone(), precision)) {
+    let spec = QuoteSpec { name: name.clone(), unit: unit.clone(), precision, index: None };
+    let instr = calc_field_instr(&spec);
+    if unit.as_deref().is_some_and(|u| u.contains('"')) || parse_calc_field(&instr) != Some(spec) {
         return Err(CmdError::Params("that unit can't be quoted".into()));
     }
     s.math = None;

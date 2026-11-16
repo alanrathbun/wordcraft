@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
 use wordcraft_calc::docx::{export, import};
-use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, UnitSystem, calc_field_instr};
+use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, QuoteSpec, UnitSystem, calc_field_instr};
 use wordcraft_doc::math::Math;
 use wordcraft_doc::{Block, CharProps, Document, InlineObject, Paragraph, para_block};
 
@@ -51,7 +51,7 @@ fn report() -> Document {
     let mut p = Paragraph::with_text("The stress is ", CharProps::default());
     let off = p.text.len();
     let field = InlineObject::Field {
-        instr: calc_field_instr("σ", Some("ksi"), Some(2)),
+        instr: calc_field_instr(&QuoteSpec { name: "σ".into(), unit: Some("ksi".into()), precision: Some(2), index: None }),
         result: String::new(),
         locked: true,
         dirty: false,
@@ -677,4 +677,29 @@ fn a_broken_fit_store_under_its_own_name_is_dropped() {
     let saved = parts(&save(&back));
     assert!(!item_ids(&saved).iter().any(|id| id == FIT_ITEM_ID));
     assert!(dangling(&saved).is_empty(), "{:?}", dangling(&saved));
+}
+
+#[test]
+fn vector_results_round_trip_as_word_matrices() {
+    let sources = ["D := [0.840, 1.050] in = ? mm", "x := 0..59 =", "v := [2 in, 3 lbf] =", "M := [1, 2; 3, 4] =", "S := [1e-9, 2e9] ="];
+    let mut doc = Document::new();
+    doc.body = sources
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut p = Paragraph::with_text("", CharProps::default());
+            p.insert_object(0, calc_eq(i as u64 + 1, s, false), &CharProps::default()).unwrap();
+            para_block(p)
+        })
+        .collect();
+    wordcraft_calc::recalc(&mut doc, &|_| None);
+    let bytes = save(&doc);
+    let xml = document_xml(&bytes);
+    assert!(xml.contains("<m:m>") || xml.contains("<m:m "), "a vector result is a Word matrix");
+    assert!(xml.contains('⋮') && xml.contains("(60 rows)"), "the cut is in Word's equation too");
+    let back = open(&bytes);
+    for (i, (r, linear)) in regions(&back).iter().enumerate() {
+        assert_eq!(r.state, CalcState::Fresh, "{} came back as {:?} ({linear})", sources[i], r.state);
+        assert_eq!(linear, &region(&doc, i as u64 + 1).1);
+    }
 }

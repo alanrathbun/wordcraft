@@ -157,12 +157,25 @@ pub const MAX_INSTR_BYTES: usize = 1024;
 /// Highest precision switch [`parse_calc_field`] accepts.
 const MAX_PRECISION: u8 = 15;
 
-/// The field code quoting the value of `var`: `WCCALC σ \u ksi \p 2`, each switch left out when
-/// `None`. A unit with spaces is double-quoted (`\u "kN m"`). `var` is an identifier (no
-/// whitespace); a `"` in a unit, which no unit has, is dropped, and an empty unit counts as none.
-pub fn calc_field_instr(var: &str, unit: Option<&str>, precision: Option<u8>) -> String {
-    let mut instr = format!("{CALC_FIELD} {var}");
-    if let Some(unit) = unit {
+/// What a quoted value (`WCCALC` field) shows: the variable, the unit and precision it is shown
+/// with (`None` = the variable's own and the document's), and for a vector or matrix, the one
+/// element to show (an index, or a row and a column, counted from the document's origin; `None` =
+/// the whole list).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuoteSpec {
+    pub name: String,
+    pub unit: Option<String>,
+    pub precision: Option<u8>,
+    pub index: Option<(u32, Option<u32>)>,
+}
+
+/// The field code quoting `spec`: `WCCALC σ \u ksi \p 2`, or `WCCALC D \i 2` and `WCCALC M \i 1,2`
+/// for an element, each switch left out when `None`. A unit with spaces is double-quoted
+/// (`\u "kN m"`). The name is an identifier (no whitespace); a `"` in a unit, which no unit has, is
+/// dropped, and an empty unit counts as none.
+pub fn calc_field_instr(spec: &QuoteSpec) -> String {
+    let mut instr = format!("{CALC_FIELD} {}", spec.name);
+    if let Some(unit) = &spec.unit {
         let unit: String = unit.chars().filter(|&c| c != '"').collect();
         if !unit.trim().is_empty() {
             if unit.chars().any(char::is_whitespace) {
@@ -172,8 +185,13 @@ pub fn calc_field_instr(var: &str, unit: Option<&str>, precision: Option<u8>) ->
             }
         }
     }
-    if let Some(precision) = precision {
+    if let Some(precision) = spec.precision {
         instr.push_str(&format!(" \\p {precision}"));
+    }
+    match spec.index {
+        Some((i, None)) => instr.push_str(&format!(" \\i {i}")),
+        Some((r, Some(c))) => instr.push_str(&format!(" \\i {r},{c}")),
+        None => {}
     }
     instr
 }
@@ -208,10 +226,18 @@ fn words(instr: &str) -> Option<Vec<(String, bool)>> {
     }
 }
 
-/// Reads a [`calc_field_instr`] code back: the variable name, unit and precision. `None` if it
-/// isn't a `WCCALC` code, is over [`MAX_INSTR_BYTES`], has no name, repeats or doesn't know a
-/// switch, or gives a precision over 15.
-pub fn parse_calc_field(instr: &str) -> Option<(String, Option<String>, Option<u8>)> {
+/// A whole number written with digits only: `u32::from_str` takes a leading `+`; a field code doesn't.
+fn digits<T: std::str::FromStr>(text: &str) -> Option<T> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Reads a [`calc_field_instr`] code back. `None` if it isn't a `WCCALC` code, is over
+/// [`MAX_INSTR_BYTES`], has no name, repeats or doesn't know a switch, gives a precision over 15,
+/// or an index that isn't one whole number or two separated by a comma.
+pub fn parse_calc_field(instr: &str) -> Option<QuoteSpec> {
     if instr.len() > MAX_INSTR_BYTES {
         return None;
     }
@@ -224,25 +250,25 @@ pub fn parse_calc_field(instr: &str) -> Option<(String, Option<String>, Option<u
     if quoted || name.is_empty() || name.starts_with('\\') {
         return None;
     }
-    let (mut unit, mut precision) = (None, None);
+    let mut spec = QuoteSpec { name, unit: None, precision: None, index: None };
     while let Some((switch, quoted)) = words.next() {
         if quoted {
             return None;
         }
         let (value, _) = words.next()?;
         match switch.as_str() {
-            "\\u" if unit.is_none() && !value.trim().is_empty() && !value.starts_with('\\') => unit = Some(value),
-            "\\p" if precision.is_none() => {
-                // `u8::from_str` takes a leading `+`; a field code doesn't.
-                if !value.bytes().all(|b| b.is_ascii_digit()) {
-                    return None;
-                }
-                precision = Some(value.parse::<u8>().ok().filter(|&p| p <= MAX_PRECISION)?);
+            "\\u" if spec.unit.is_none() && !value.trim().is_empty() && !value.starts_with('\\') => spec.unit = Some(value),
+            "\\p" if spec.precision.is_none() => spec.precision = Some(digits::<u8>(&value).filter(|&p| p <= MAX_PRECISION)?),
+            "\\i" if spec.index.is_none() => {
+                spec.index = Some(match value.split_once(',') {
+                    Some((r, c)) => (digits(r)?, Some(digits(c)?)),
+                    None => (digits(&value)?, None),
+                });
             }
             _ => return None,
         }
     }
-    Some((name, unit, precision))
+    Some(spec)
 }
 
 #[cfg(test)]

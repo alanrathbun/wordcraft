@@ -6,18 +6,19 @@
 //! first and changes only the objects whose display, state or id actually changes, so plain
 //! equations and untouched paragraphs stay exactly as they were (and shared, for undo).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use craft_units::{Formatted, Precision, Quantity, UnitSystem, format, parse_unit};
-use wordcraft_doc::calc::{self, CalcSettings, CalcState, parse_calc_field};
+use craft_units::{Formatted, Precision, Quantity, Scale, UnitError, UnitSystem, format, parse_unit};
+use wordcraft_doc::calc::{self, CalcSettings, CalcState, QuoteSpec, parse_calc_field};
 use wordcraft_doc::math::Arg;
 use wordcraft_doc::para::OBJ;
 use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph};
 
-use crate::array::Data;
-use crate::eval::{MAX_PASS_STEPS, Pass, check_unit_for, run_stmt_in};
-use crate::render::{self, Rendered, rendered, shown_result, shows_value};
+use crate::array::{self, Data};
+use crate::eval::{MAX_PASS_STEPS, Pass, Val, check_display, run_stmt_in};
+use crate::render::{self, MAX_SHOWN_ROWS, Rendered, Shown, rendered, shown_result, shows_value};
 use crate::{CalcError, Env, Stmt, check_name, defined_name, free_names, parse};
 
 /// What a [`recalc`] pass did.
@@ -35,6 +36,8 @@ pub struct RecalcReport {
 
 /// Most names a circular-definition message lists.
 const MAX_CYCLE_NAMES: usize = 5;
+/// Most values a quoted vector or matrix lists; the rest are counted, never left out silently.
+const MAX_QUOTED_VALUES: usize = 50;
 
 /// Recalculate every calculation in the body of `doc`.
 ///
@@ -62,7 +65,6 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
     let index = Index::build(regions, &ids, page_of);
     let (env, outcomes, failed) = evaluate(&index, &settings);
 
-    let sys = unit_system(&settings);
     let mut errors = 0;
     let mut edited = 0;
     let mut edits: Vec<Edit> = Vec::new();
@@ -82,16 +84,7 @@ pub fn recalc(doc: &mut Document, page_of: &dyn Fn(u64) -> Option<u32>) -> Recal
         }
         let stmt = index.parsed.get(i);
         let outcome = outcomes.get(i).cloned().unwrap_or(Err(CalcError::Upstream));
-        let shown = match outcome {
-            Ok(Some(Data::One(v))) => {
-                let unit = stmt.and_then(|s| s.as_ref().ok()).and_then(show_unit);
-                format_value(v.q, unit.as_deref(), sys, precision(r.precision, &settings)).map(Some)
-            }
-            Ok(Some(Data::Grid(_))) => Err(grid_not_shown()),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
-        };
-        let (state, shown) = match shown {
+        let (state, shown) = match outcome {
             Ok(shown) => (CalcState::Fresh, shown),
             Err(e) => (CalcState::Error(e.to_string()), None),
         };
@@ -154,9 +147,9 @@ fn names_of(doc: &Document) -> (Vec<u64>, Index) {
 }
 
 /// Whether a quoted value of the variable `name` can show it in `unit`: the unit must read
-/// ([`parse_unit`]) and, when the variable has a value now, be of its dimension, and `°C`/`°F` only
-/// for an absolute temperature. A variable with no value now (an error) is checked when it has one;
-/// until then the quoted value shows `?`.
+/// ([`parse_unit`]) and, when the variable has a value now, be of its dimension (every element's,
+/// for a vector or matrix), and `°C`/`°F` only for an absolute temperature. A variable with no
+/// value now (an error) is checked when it has one; until then the quoted value shows `?`.
 pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), CalcError> {
     parse_unit(unit)?;
     let found = collect(&doc.body);
@@ -166,15 +159,9 @@ pub fn check_quote_unit(doc: &Document, name: &str, unit: &str) -> Result<(), Ca
     let (env, _, _) = evaluate(&index, &settings);
     env.check_display_unit(unit)?;
     match env.data(name) {
-        Some(Data::One(v)) => check_unit_for(*v, unit),
-        Some(Data::Grid(_)) => Err(grid_not_shown()),
+        Some(data) => check_display(&env, unit, data),
         None => Ok(()),
     }
-}
-
-/// Grid results aren't displayed or quoted yet: an error rather than a wrong number.
-fn grid_not_shown() -> CalcError {
-    CalcError::Syntax("vector results can't be shown yet".to_string())
 }
 
 /// Whether `name` may be given to a new calculation, or to the region `editing` (whose own
@@ -256,9 +243,7 @@ pub(crate) struct FoundRegion {
 
 struct FoundField {
     at: At,
-    name: String,
-    unit: Option<String>,
-    precision: Option<u8>,
+    spec: QuoteSpec,
 }
 
 #[derive(Default)]
@@ -473,8 +458,8 @@ fn visit(path: &[u32], p: &Paragraph, found: &mut Found) {
                 }
             }
             InlineObject::Field { instr, .. } if !is_deleted => {
-                if let Some((name, unit, precision)) = parse_calc_field(instr) {
-                    found.fields.push(FoundField { at: at(), name, unit, precision });
+                if let Some(spec) = parse_calc_field(instr) {
+                    found.fields.push(FoundField { at: at(), spec });
                 }
             }
             _ => {}
@@ -533,6 +518,8 @@ struct Index {
     owners: HashMap<String, usize>,
     /// Regions edited outside the calculator: they keep owning their name but define nothing.
     edited: Vec<bool>,
+    /// Each region's own precision.
+    precision: Vec<Option<u8>>,
 }
 
 impl Index {
@@ -560,7 +547,8 @@ impl Index {
             })
             .collect();
         let edited = regions.iter().map(|r| r.state == CalcState::EditedOutside).collect();
-        let mut index = Index { parsed, early, owners, edited };
+        let precision = regions.iter().map(|r| r.precision).collect();
+        let mut index = Index { parsed, early, owners, edited, precision };
         // A region's own display unit applies when its source names none.
         for (stmt, r) in index.parsed.iter_mut().zip(regions) {
             if let (Ok(stmt), Some(unit)) = (stmt, r.unit.as_deref().filter(|u| !u.trim().is_empty())) {
@@ -574,7 +562,8 @@ impl Index {
     }
 }
 
-type Outcome = Result<Option<Data>, CalcError>;
+/// A region's result as shown, when it shows one.
+type Outcome = Result<Option<Shown>, CalcError>;
 
 /// A region in the dependency graph. Indexes are positions in the region list; the graph's own
 /// lists are read with `get`, so a wrong index is a skipped edge rather than a panic.
@@ -594,6 +583,10 @@ struct Node {
 
 /// Evaluate every region in dependency order: the environment of defined names, each region's
 /// outcome, and which regions failed.
+///
+/// A result is formatted for display as part of its statement: one that can't be shown is an
+/// error like any other, so its name is defined by nothing and every use of it is an upstream
+/// error (nothing is defined unless the whole statement succeeds).
 fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<bool>) {
     let mut nodes: Vec<Node> = index.early.iter().map(|e| Node { outcome: e.clone().map(Err), ..Node::default() }).collect();
     // Edges run from the region owning a name to each region using it. Only owned names count:
@@ -642,7 +635,10 @@ fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<b
             _ if own_edit => Err(CalcError::EditedOutside),
             _ if upstream_edited => Err(CalcError::UpstreamEdited),
             _ if upstream => Err(CalcError::Upstream),
-            Some(Ok(stmt)) => run_stmt_in(&mut env, stmt, &pass),
+            Some(Ok(stmt)) => run_stmt_in(&mut env, stmt, &pass).and_then(|data| {
+                let p = precision(index.precision.get(i).copied().flatten(), settings);
+                data.map(|d| format_data(&d, show_unit(stmt).as_deref(), unit_system(settings), p, env.origin())).transpose()
+            }),
             Some(Err(e)) => Err(e.clone()),
             None => Err(CalcError::Upstream),
         };
@@ -812,26 +808,104 @@ fn format_value(q: Quantity, unit: Option<&str>, sys: UnitSystem, p: Precision) 
     Ok(format(q, scale.as_ref(), sys, p)?)
 }
 
-/// The text a quoted value shows: `"600 psi"`, or `"?"` when its name has no valid value or its
-/// unit doesn't fit.
+/// A result as it is shown: one value, or a vector or matrix of its first [`MAX_SHOWN_ROWS`] rows
+/// (each element in `unit` when given). An element that can't be formatted is named, counted from
+/// `origin`.
+fn format_data(d: &Data, unit: Option<&str>, sys: UnitSystem, p: Precision, origin: u8) -> Result<Shown, CalcError> {
+    match d {
+        Data::One(v) => format_value(v.q, unit, sys, p).map(Shown::One),
+        Data::Grid(g) => {
+            let scale = unit.map(parse_unit).transpose()?;
+            let rows = g.rows.min(MAX_SHOWN_ROWS);
+            let shown = g.items.get(..rows.saturating_mul(g.cols)).unwrap_or(&g.items);
+            let (items, unit) = format_elements(shown, &g.items, scale.as_ref(), sys, p)
+                .map_err(|(k, e)| array::element_error(g.rows, g.cols, k, origin, e.into()))?;
+            Ok(Shown::Grid { rows, cols: g.cols, items, unit, total_rows: g.rows })
+        }
+    }
+}
+
+/// The elements `shown` (the first of `all`) formatted, in `scale` when given, else each in its
+/// natural unit. When `scale` is given or every element of `all` has the same dimension, they
+/// share one unit: it is returned (unless it is empty, for plain numbers) and the items carry
+/// none. An error comes with the element it is about.
+fn format_elements(
+    shown: &[Val],
+    all: &[Val],
+    scale: Option<&Scale>,
+    sys: UnitSystem,
+    p: Precision,
+) -> Result<(Vec<Formatted>, Option<String>), (usize, UnitError)> {
+    let shared = scale.is_some() || all.windows(2).all(|w| matches!(w, [a, b] if a.q.dim == b.q.dim));
+    let mut items = shown.iter().enumerate().map(|(k, v)| format(v.q, scale, sys, p).map_err(|e| (k, e))).collect::<Result<Vec<_>, _>>()?;
+    let mut common = None;
+    if shared {
+        for f in &mut items {
+            common = Some(std::mem::take(&mut f.unit));
+        }
+    }
+    Ok((items, common.filter(|u| !u.is_empty())))
+}
+
+/// The text a quoted value shows: `"600 psi"`; a vector as a list (`"0.84, 1.05 in"`), a matrix's
+/// rows separated by `;` (`"1, 2; 3, 4"`), and past [`MAX_QUOTED_VALUES`] the count of the rest
+/// (`"0, 1, …, 49, … (60 values)"`); one element with an index. `"?"` when its name has no valid
+/// value, its unit doesn't fit, or its index is outside the value.
 fn field_result(f: &FoundField, index: &Index, env: &Env, failed: &[bool], settings: &CalcSettings) -> String {
-    let valid = index.owners.get(&f.name).is_some_and(|&i| {
+    let spec = &f.spec;
+    let valid = index.owners.get(&spec.name).is_some_and(|&i| {
         !failed.get(i).copied().unwrap_or(true) && matches!(index.parsed.get(i), Some(Ok(Stmt::Define { params, .. })) if params.is_empty())
     });
-    if !valid {
-        return "?".to_string();
-    }
-    // A grid isn't quoted yet.
-    let Some(&Data::One(v)) = env.data(&f.name) else { return "?".to_string() };
+    let data = match (env.data(&spec.name), spec.index) {
+        _ if !valid => None,
+        (Some(Data::Grid(g)), Some(at)) => array::element_at(g, env.origin(), at).map(|v| Cow::Owned(Data::One(v))),
+        (Some(d), None) => Some(Cow::Borrowed(d)),
+        _ => None,
+    };
+    let Some(data) = data else { return "?".to_string() };
+    let unit = spec.unit.as_deref();
     // A difference shown in °C or °F would be a wrong number.
-    if f.unit.as_deref().is_some_and(|u| env.check_display_unit(u).is_err() || check_unit_for(v, u).is_err()) {
+    if unit.is_some_and(|u| check_display(env, u, &data).is_err()) {
         return "?".to_string();
     }
-    match format_value(v.q, f.unit.as_deref(), unit_system(settings), precision(f.precision, settings)) {
-        Ok(shown) if shown.unit.is_empty() => render::text_number(&shown.number),
-        Ok(shown) => format!("{} {}", render::text_number(&shown.number), shown.unit),
-        Err(_) => "?".to_string(),
+    let (sys, p) = (unit_system(settings), precision(spec.precision, settings));
+    match &*data {
+        Data::One(v) => match format_value(v.q, unit, sys, p) {
+            Ok(shown) if shown.unit.is_empty() => render::text_number(&shown.number),
+            Ok(shown) => format!("{} {}", render::text_number(&shown.number), shown.unit),
+            Err(_) => "?".to_string(),
+        },
+        Data::Grid(g) => quoted_list(g, unit, sys, p).unwrap_or_else(|| "?".to_string()),
     }
+}
+
+/// A vector or matrix as a quoted list: its first [`MAX_QUOTED_VALUES`] values row by row, `, `
+/// between them (`; ` between a matrix's rows), with their shared unit once after them or each its
+/// own; then `, … (N values)` when there are more.
+fn quoted_list(g: &array::Grid, unit: Option<&str>, sys: UnitSystem, p: Precision) -> Option<String> {
+    let scale = unit.map(parse_unit).transpose().ok()?;
+    let shown = g.items.get(..MAX_QUOTED_VALUES).unwrap_or(&g.items);
+    let (items, common) = format_elements(shown, &g.items, scale.as_ref(), sys, p).ok()?;
+    let matrix = g.rows > 1 && g.cols > 1;
+    let mut text = String::new();
+    for (k, f) in items.iter().enumerate() {
+        if k > 0 {
+            text.push_str(if matrix && k.checked_rem(g.cols) == Some(0) { "; " } else { ", " });
+        }
+        text.push_str(&render::text_number(&f.number));
+        if !f.unit.is_empty() {
+            text.push(' ');
+            text.push_str(&f.unit);
+        }
+    }
+    if let Some(unit) = common {
+        text.push(' ');
+        text.push_str(&unit);
+    }
+    if g.items.len() > shown.len() {
+        text.push_str(&format!(", … ({} values)", g.items.len()));
+    }
+    Some(text)
 }
 
 // ---------------------------------------------------------------------------------------------

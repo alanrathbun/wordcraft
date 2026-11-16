@@ -43,6 +43,18 @@ pub(crate) fn check_size(rows: usize, cols: usize, len: usize) -> Result<(), Cal
     Ok(())
 }
 
+/// The element of `g` a quoted value's index (`\i`) picks, counted from `origin`: one index into a
+/// vector, or a row and a column; `None` outside the grid, and for one index into a matrix.
+pub(crate) fn element_at(g: &Grid, origin: u8, at: (u32, Option<u32>)) -> Option<Val> {
+    let place = |i: u32, len: usize| usize::try_from(i).ok()?.checked_sub(usize::from(origin)).filter(|&k| k < len);
+    let k = match at {
+        (i, None) if g.rows == 1 || g.cols == 1 => place(i, g.items.len())?,
+        (_, None) => return None,
+        (r, Some(c)) => place(r, g.rows)?.checked_mul(g.cols)?.checked_add(place(c, g.cols)?)?,
+    };
+    g.items.get(k).copied()
+}
+
 /// An evaluated value: one value, or a grid of them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Data {

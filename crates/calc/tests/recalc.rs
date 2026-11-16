@@ -4,8 +4,8 @@
 use craft_units::Formatted;
 use std::sync::Arc;
 use std::time::Instant;
-use wordcraft_calc::{CalcError, check_new_name, defined_names, mark_stale, recalc, render};
-use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, calc_field_instr};
+use wordcraft_calc::{CalcError, check_new_name, check_quote_unit, defined_names, mark_stale, recalc, render};
+use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, QuoteSpec, calc_field_instr};
 use wordcraft_doc::math::{MNode, MRun, MSty, Math};
 use wordcraft_doc::{Block, Cell, CharProps, Document, InlineObject, Paragraph, Rgb, Row, Table, para_block};
 
@@ -127,6 +127,11 @@ fn edit_region(d: &mut Document, id: u64, f: impl Fn(&mut CalcRegion, &mut Strin
     }
 }
 
+/// The code of a quoted value of `name`.
+fn quote(name: &str, unit: Option<&str>, precision: Option<u8>, index: Option<(u32, Option<u32>)>) -> String {
+    calc_field_instr(&QuoteSpec { name: name.into(), unit: unit.map(str::to_string), precision, index })
+}
+
 fn no_page(_: u64) -> Option<u32> {
     None
 }
@@ -226,7 +231,7 @@ fn quoted_value_updates() {
         para_block(para(vec![field("WCCALC σ")])),
         para_block(para(vec![calc_eq(1, "P := 1500 lbf"), calc_eq(2, "A_b := 2.5 in^2")])),
         para_block(para(vec![calc_eq(3, "σ := P/A_b")])),
-        para_block(para(vec![field("WCCALC σ"), field(&calc_field_instr("σ", Some("ksi"), Some(2)))])),
+        para_block(para(vec![field("WCCALC σ"), field(&quote("σ", Some("ksi"), Some(2), None))])),
     ]);
     recalc(&mut d, &no_page);
     assert_eq!(field_results(&d), ["600 psi", "600 psi", "0.6 ksi"]);
@@ -411,9 +416,9 @@ fn edited_outside_region_keeps_its_display_marked_and_defines_nothing() {
     });
     if let Block::Para(p) = Arc::make_mut(&mut d.body[4]) {
         let end = p.text.len();
-        p.insert_object(end, field(&calc_field_instr("x", None, None)), &CharProps::default()).unwrap();
+        p.insert_object(end, field(&quote("x", None, None, None)), &CharProps::default()).unwrap();
         let end = p.text.len();
-        p.insert_object(end, field(&calc_field_instr("y", None, None)), &CharProps::default()).unwrap();
+        p.insert_object(end, field(&quote("y", None, None, None)), &CharProps::default()).unwrap();
     }
     let report = recalc(&mut d, &no_page);
     assert_eq!(report.edited, 1);
@@ -950,7 +955,7 @@ fn unchanged_calculations_need_no_pass() {
 fn quoted_values_in_exponential_form_use_superscripts() {
     let mut d = doc_with(&["E := 29000000 psi", "α := 0.0000065", "n := -2.5e9"]);
     if let Block::Para(p) = Arc::make_mut(&mut d.body[0]) {
-        for instr in [calc_field_instr("E", None, None), calc_field_instr("α", None, None), calc_field_instr("n", None, None)] {
+        for instr in [quote("E", None, None, None), quote("α", None, None, None), quote("n", None, None, None)] {
             let end = p.text.len();
             p.insert_object(end, field(&instr), &CharProps::default()).unwrap();
         }
@@ -973,8 +978,7 @@ fn a_temperature_difference_never_shows_on_an_offset_scale() {
     // The region's own unit, as Insert › Calculation's options would set it.
     edit_region(&mut d, 4, |c, _| c.unit = Some("°F".into()));
     if let Block::Para(p) = Arc::make_mut(&mut d.body[4]) {
-        for instr in [calc_field_instr("dT", Some("°C"), None), calc_field_instr("dT", Some("Δ°C"), None), calc_field_instr("T_1", Some("°C"), None)]
-        {
+        for instr in [quote("dT", Some("°C"), None, None), quote("dT", Some("Δ°C"), None, None), quote("T_1", Some("°C"), None, None)] {
             let end = p.text.len();
             p.insert_object(end, field(&instr), &CharProps::default()).unwrap();
         }
@@ -1036,4 +1040,195 @@ fn indexes_follow_the_document_origin() {
     d.calc_settings = Some(CalcSettings { origin: 1, ..CalcSettings::default() });
     recalc(&mut d, &no_page);
     assert!(region(&d, 2).1.ends_with("=0.84 \"in\""), "{}", region(&d, 2).1);
+}
+
+/// The bracketed matrix of a result (the last one in the tree): its rows of cell texts, and the
+/// runs after it.
+fn result_matrix(nodes: &[MNode]) -> (Vec<Vec<String>>, Vec<MRun>) {
+    let at = nodes.iter().rposition(|n| matches!(n, MNode::Delim { beg: Some('['), .. })).unwrap_or_else(|| panic!("{nodes:#?}"));
+    let MNode::Delim { elems, .. } = &nodes[at] else { panic!("{nodes:#?}") };
+    let [MNode::Matrix { rows, .. }] = elems[0].as_slice() else { panic!("{elems:#?}") };
+    let cells = rows.iter().map(|row| row.iter().map(|cell| runs(cell).iter().rev().map(|r| r.text.clone()).collect()).collect()).collect();
+    let after = nodes[at + 1..].iter().map(|n| if let MNode::Run(r) = n { r.clone() } else { panic!("{n:?}") }).collect();
+    (cells, after)
+}
+
+#[test]
+fn vector_result_shows_as_a_matrix() {
+    let mut d = doc_with(&["D := [0.840, 1.050] in", "D ="]);
+    recalc(&mut d, &no_page);
+    let (r, linear, math) = region(&d, 2);
+    assert_eq!(r.state, CalcState::Fresh);
+    assert_eq!(linear, "D=[■(0.84@1.05)] \"in\"");
+    let (cells, after) = result_matrix(&math.nodes);
+    assert_eq!(cells, [["0.84"], ["1.05"]]);
+    // The shared unit is shown once, upright, set apart from the bracket.
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert!(after[0].text == "\u{2009}in" && after[0].sty == Some(MSty::Plain), "{after:?}");
+}
+
+#[test]
+fn display_unit_applies_to_every_element() {
+    let mut d = doc_with(&["D := [0.840, 1.050] in", "D = ? mm", "D = ? lbf"]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 2).1, "D=[■(21.336@26.67)] \"mm\"");
+    let (r, linear, _) = region(&d, 3);
+    let (length, force) = (craft_units::parse_unit("in").unwrap().dim, craft_units::parse_unit("lbf").unwrap().dim);
+    let mismatch = CalcError::Unit(craft_units::UnitError::Mismatch { left: length, right: force });
+    assert_eq!(r.state, err(CalcError::Element { at: "0".into(), error: Box::new(mismatch) }), "{linear}");
+    assert!(!linear.contains("=["), "{linear}");
+}
+
+#[test]
+fn mixed_dimensions_show_each_unit() {
+    let mut d = doc_with(&["[2 in, 3 lbf] ="]);
+    recalc(&mut d, &no_page);
+    let (r, linear, math) = region(&d, 1);
+    assert_eq!(r.state, CalcState::Fresh);
+    assert_eq!(linear, "[■(2 \"in\"@3 \"lbf\")]=[■(2 \"in\"@3 \"lbf\")]");
+    let (cells, after) = result_matrix(&math.nodes);
+    assert_eq!(cells, [["2\u{2009}in"], ["3\u{2009}lbf"]]);
+    assert!(after.is_empty(), "no unit after the bracket: {after:?}");
+}
+
+#[test]
+fn offset_unit_is_checked_per_element() {
+    let mut d = doc_with(&["T := [20 °C, 30 °C]", "T = ? °F", "T - [10 °C, 10 °C] = ? °C"]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 2).1, "T=[■(68@86)] \"°F\"");
+    // A difference of absolute temperatures is a difference: never shown on an offset scale.
+    let (r, linear, _) = region(&d, 3);
+    assert_eq!(r.state, err(CalcError::Element { at: "0".into(), error: Box::new(CalcError::NotAbsolute("°C".into())) }), "{linear}");
+}
+
+#[test]
+fn long_vectors_are_visibly_cut() {
+    let mut d = doc_with(&["x := 0..59 =", "len := 0 in, 1 in..59 in =", "y := 1..50 ="]);
+    recalc(&mut d, &no_page);
+    let first: Vec<String> = (0..50).map(|k| k.to_string()).collect();
+    let (r, linear, math) = region(&d, 1);
+    assert_eq!(r.state, CalcState::Fresh);
+    assert_eq!(linear, format!("x≔0..59=[■({}@⋮)] \"(60 rows)\"", first.join("@")));
+    assert!(linear.ends_with("@⋮)] \"(60 rows)\""), "{linear}");
+    // The cut shows in the equation too: a ⋮ row, then the count.
+    let (cells, after) = result_matrix(&math.nodes);
+    assert_eq!(cells.len(), 51);
+    assert_eq!(cells[49], ["49"]);
+    assert_eq!(cells[50], ["⋮"]);
+    assert_eq!(after.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["\u{2009}(60 rows)"]);
+    assert!(after.iter().all(|r| r.sty == Some(MSty::Plain)), "{after:?}");
+    // A shared unit comes before the count.
+    let (_, linear, math) = region(&d, 2);
+    assert!(linear.ends_with("@49@⋮)] \"in\" \"(60 rows)\""), "{linear}");
+    let (_, after) = result_matrix(&math.nodes);
+    assert_eq!(after.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["\u{2009}in", "\u{2009}(60 rows)"]);
+    // Fifty rows show in full.
+    let (_, linear, math) = region(&d, 3);
+    assert!(linear.ends_with("@49@50)]") && !linear.contains('⋮'), "{linear}");
+    assert_eq!(result_matrix(&math.nodes).0.len(), 50);
+}
+
+#[test]
+fn stale_vector_keeps_its_values() {
+    let sources =
+        ["D := [0.840, 1.050] in =", "x := 0..59 =", "len := 0 in, 1 in..59 in =", "[2 in, 3 lbf] =", "M := [1, 2; 3, 4] =", "S := [1e-9, 2e9] ="];
+    let mut d = doc_with(&sources);
+    recalc(&mut d, &no_page);
+    let fresh: Vec<String> = regions(&d).into_iter().map(|(_, linear, _)| linear).collect();
+    mark_stale(&mut d);
+    for (k, (r, linear, math)) in regions(&d).into_iter().enumerate() {
+        assert_eq!(r.state, CalcState::Stale);
+        let (head, tail) = fresh[k].rsplit_once('=').unwrap();
+        assert_eq!(linear, format!("{head}≈{tail}"), "{}", sources[k]);
+        // Every element is drawn grey, the cut and count included.
+        let (cells, after) = result_matrix(&math.nodes);
+        let (fresh_cells, _) = {
+            let mut f = doc_with(&[sources[k]]);
+            recalc(&mut f, &no_page);
+            result_matrix(&region(&f, 1).2.nodes)
+        };
+        assert_eq!(cells, fresh_cells, "{}", sources[k]);
+        let at = math.nodes.iter().rposition(|n| matches!(n, MNode::Delim { beg: Some('['), .. })).unwrap();
+        let shown = runs(&math.nodes[at..]);
+        assert!(shown.iter().all(|r| r.color == Some(Rgb(0x80, 0x80, 0x80))), "{}: {shown:?}", sources[k]);
+        assert!(after.iter().all(|r| r.color == Some(Rgb(0x80, 0x80, 0x80))));
+    }
+    recalc(&mut d, &no_page);
+    assert_eq!(regions(&d).into_iter().map(|(_, linear, _)| linear).collect::<Vec<_>>(), fresh);
+}
+
+#[test]
+fn quoted_vector_is_a_list() {
+    let mut d = doc_with(&["D := [0.840, 1.050] in", "M := [1, 2; 3, 4]", "x := 0..59", "v := [2 in, 3 lbf]", "len := 0 in, 1 in..59 in"]);
+    let codes = [
+        quote("D", None, None, None),
+        quote("D", None, None, Some((1, None))),
+        quote("M", None, None, None),
+        quote("x", None, None, None),
+        quote("D", None, None, Some((9, None))),
+        quote("M", None, None, Some((1, Some(0)))),
+        quote("M", None, None, Some((1, None))),
+        quote("D", Some("mm"), None, None),
+        quote("D", Some("lbf"), None, None),
+        quote("v", None, None, None),
+        quote("len", None, None, None),
+        quote("D", Some("mm"), Some(1), Some((0, None))),
+        quote("D", None, None, Some((1, Some(0)))),
+        quote("D", None, None, Some((0, Some(1)))),
+    ];
+    if let Block::Para(p) = Arc::make_mut(&mut d.body[0]) {
+        for instr in &codes {
+            let end = p.text.len();
+            p.insert_object(end, field(instr), &CharProps::default()).unwrap();
+        }
+    }
+    recalc(&mut d, &no_page);
+    let to_49: Vec<String> = (0..50).map(|k| k.to_string()).collect();
+    assert_eq!(
+        field_results(&d),
+        [
+            "0.84, 1.05 in".to_string(),
+            "1.05 in".into(),
+            "1, 2; 3, 4".into(),
+            format!("{}, … (60 values)", to_49.join(", ")),
+            "?".into(),
+            "3".into(),
+            "?".into(),
+            "21.336, 26.67 mm".into(),
+            "?".into(),
+            "2 in, 3 lbf".into(),
+            format!("{} in, … (60 values)", to_49.join(", ")),
+            "21.3 mm".into(),
+            "1.05 in".into(),
+            "?".into(),
+        ]
+    );
+    // Indexes follow the document's origin.
+    d.calc_settings = Some(CalcSettings { origin: 1, ..CalcSettings::default() });
+    recalc(&mut d, &no_page);
+    let results = field_results(&d);
+    assert_eq!((results[1].as_str(), results[5].as_str(), results[11].as_str()), ("0.84 in", "?", "?"));
+    // A unit for a quoted vector must suit every element.
+    assert_eq!(check_quote_unit(&d, "D", "mm"), Ok(()));
+    assert!(matches!(check_quote_unit(&d, "D", "lbf"), Err(CalcError::Element { .. })));
+    assert!(matches!(check_quote_unit(&d, "v", "in"), Err(CalcError::Element { at, .. }) if at == "2"));
+}
+
+#[test]
+fn a_vector_whose_display_fails_defines_nothing() {
+    let mut d = doc_with(&["D := [1, 2] in = ? lbf", "y := D[0] ="]);
+    if let Block::Para(p) = Arc::make_mut(&mut d.body[1]) {
+        let end = p.text.len();
+        p.insert_object(end, field("WCCALC D"), &CharProps::default()).unwrap();
+    }
+    recalc(&mut d, &no_page);
+    assert!(matches!(region(&d, 1).0.state, CalcState::Error(_)));
+    assert_eq!(region(&d, 2).0.state, err(CalcError::Upstream));
+    assert_eq!(field_results(&d), ["?"]);
+}
+
+#[test]
+fn defined_names_lists_vectors() {
+    let d = doc_with(&["D := [1, 2]", "i := 0..3", "t[i] := 2·i", "n := 1", "f(x) := x"]);
+    assert_eq!(defined_names(&d), [("D".to_string(), 1), ("i".to_string(), 2), ("n".to_string(), 4), ("t".to_string(), 3)]);
 }

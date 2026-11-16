@@ -17,11 +17,15 @@ fn calc_equation() -> InlineObject {
     }
 }
 
+fn spec(name: &str, unit: Option<&str>, precision: Option<u8>, index: Option<(u32, Option<u32>)>) -> QuoteSpec {
+    QuoteSpec { name: name.into(), unit: unit.map(str::to_string), precision, index }
+}
+
 #[test]
 fn instr_round_trip() {
-    let instr = calc_field_instr("σ_max", Some("ksi"), Some(2));
+    let instr = calc_field_instr(&spec("σ_max", Some("ksi"), Some(2), None));
     assert_eq!(instr, "WCCALC σ_max \\u ksi \\p 2");
-    assert_eq!(parse_calc_field(&instr), Some(("σ_max".into(), Some("ksi".into()), Some(2))));
+    assert_eq!(parse_calc_field(&instr), Some(spec("σ_max", Some("ksi"), Some(2), None)));
     assert_eq!(parse_calc_field("PAGE"), None);
     assert_eq!(parse_calc_field("WCCALCX a"), None);
     let huge = format!("WCCALC a \\u {}", "m".repeat(10_000));
@@ -30,20 +34,53 @@ fn instr_round_trip() {
 
 #[test]
 fn instr_switches_are_optional() {
-    assert_eq!(calc_field_instr("x", None, None), "WCCALC x");
-    assert_eq!(parse_calc_field("WCCALC x"), Some(("x".into(), None, None)));
-    assert_eq!(calc_field_instr("x", None, Some(0)), "WCCALC x \\p 0");
-    assert_eq!(parse_calc_field("WCCALC x \\p 0"), Some(("x".into(), None, Some(0))));
-    assert_eq!(parse_calc_field("WCCALC x \\p 15"), Some(("x".into(), None, Some(15))));
+    assert_eq!(calc_field_instr(&spec("x", None, None, None)), "WCCALC x");
+    assert_eq!(parse_calc_field("WCCALC x"), Some(spec("x", None, None, None)));
+    assert_eq!(calc_field_instr(&spec("x", None, Some(0), None)), "WCCALC x \\p 0");
+    assert_eq!(parse_calc_field("WCCALC x \\p 0"), Some(spec("x", None, Some(0), None)));
+    assert_eq!(parse_calc_field("WCCALC x \\p 15"), Some(spec("x", None, Some(15), None)));
     // Switch order doesn't matter.
-    assert_eq!(parse_calc_field("WCCALC x \\p 4 \\u m"), Some(("x".into(), Some("m".into()), Some(4))));
+    assert_eq!(parse_calc_field("WCCALC x \\p 4 \\u m"), Some(spec("x", Some("m"), Some(4), None)));
+    assert_eq!(parse_calc_field("WCCALC D \\i 1,2 \\p 4"), Some(spec("D", None, Some(4), Some((1, Some(2))))));
 }
 
 #[test]
 fn instr_unit_with_spaces_is_quoted() {
-    let instr = calc_field_instr("M", Some("kN m"), None);
+    let instr = calc_field_instr(&spec("M", Some("kN m"), None, None));
     assert_eq!(instr, "WCCALC M \\u \"kN m\"");
-    assert_eq!(parse_calc_field(&instr), Some(("M".into(), Some("kN m".into()), None)));
+    assert_eq!(parse_calc_field(&instr), Some(spec("M", Some("kN m"), None, None)));
+}
+
+#[test]
+fn quote_spec_round_trips() {
+    // Every combination of unit, precision and index reads back as written.
+    for unit in [None, Some("in"), Some("kN m"), Some("°F")] {
+        for precision in [None, Some(0), Some(3), Some(15)] {
+            for index in [None, Some((0, None)), Some((2, None)), Some((1, Some(2))), Some((0, Some(0))), Some((u32::MAX, Some(u32::MAX)))] {
+                let s = spec("D_o", unit, precision, index);
+                let instr = calc_field_instr(&s);
+                assert_eq!(parse_calc_field(&instr), Some(s), "{instr}");
+            }
+        }
+    }
+    assert_eq!(calc_field_instr(&spec("D", None, None, Some((2, None)))), "WCCALC D \\i 2");
+    assert_eq!(calc_field_instr(&spec("M", None, None, Some((1, Some(2))))), "WCCALC M \\i 1,2");
+    // An index is one whole number, or a row and a column, given once.
+    for bad in [
+        "WCCALC D \\i x",
+        "WCCALC D \\i 1,2,3",
+        "WCCALC D \\i 1 \\i 2",
+        "WCCALC D \\i",
+        "WCCALC D \\i ,2",
+        "WCCALC D \\i 1,",
+        "WCCALC D \\i -1",
+        "WCCALC D \\i +1",
+        "WCCALC D \\i 1.5",
+        "WCCALC D \\i 4294967296",
+        "WCCALC D \\i 1,4294967296",
+    ] {
+        assert_eq!(parse_calc_field(bad), None, "{bad:?}");
+    }
 }
 
 #[test]

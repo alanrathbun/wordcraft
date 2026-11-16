@@ -132,6 +132,11 @@ impl Env {
         self.origin = if origin == 1 { 1 } else { 0 };
     }
 
+    /// What an array's first element is numbered: 0 or 1.
+    pub(crate) fn origin(&self) -> u8 {
+        self.origin
+    }
+
     /// Show values in messages as the document shows results: in `system`'s units, to
     /// `precision` decimal places (US customary to 3 places until this is called).
     pub fn set_display(&mut self, system: UnitSystem, precision: Precision) {
@@ -302,9 +307,15 @@ pub(crate) fn run_stmt_in(env: &mut Env, s: &Stmt, pass: &Pass) -> Result<Option
 
 /// A `= ? unit` must be a unit of the value's dimension (of every element's, for a grid).
 fn check_show(env: &Env, show: &Show, v: &Data) -> Result<(), CalcError> {
-    let Some(text) = &show.unit else {
-        return Ok(());
-    };
+    match &show.unit {
+        Some(text) => check_display(env, text, v),
+        None => Ok(()),
+    }
+}
+
+/// Whether `v` can be shown in the unit `text` ([`check_unit_for`]); for a grid, every element,
+/// the first that can't named in the error.
+pub(crate) fn check_display(env: &Env, text: &str, v: &Data) -> Result<(), CalcError> {
     env.check_display_unit(text)?;
     match v {
         Data::One(v) => check_unit_for(*v, text),

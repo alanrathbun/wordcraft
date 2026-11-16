@@ -2692,7 +2692,7 @@ fn select_extend_from_a_table_paragraph_selects_the_document() {
 /// `.json` save (WordCraft's native format, which AutoRecover snapshots share) and reopen.
 #[test]
 fn calc_survives_native_format() {
-    use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, UnitSystem, calc_field_instr};
+    use wordcraft_doc::calc::{CalcRegion, CalcSettings, CalcState, QuoteSpec, UnitSystem, calc_field_instr};
     use wordcraft_doc::para::{InlineObject, Paragraph};
     let mut p = Paragraph::with_text("", Default::default());
     let region =
@@ -2701,7 +2701,7 @@ fn calc_survives_native_format() {
         };
     let calc = InlineObject::Equation { linear: "σ_max=12.5".into(), display: true, math: Default::default(), calc: Some(Box::new(region)) };
     let quoted = InlineObject::Field {
-        instr: calc_field_instr("σ_max", Some("ksi"), Some(2)),
+        instr: calc_field_instr(&QuoteSpec { name: "σ_max".into(), unit: Some("ksi".into()), precision: Some(2), index: None }),
         result: "12.50 ksi".into(),
         locked: true,
         dirty: false,

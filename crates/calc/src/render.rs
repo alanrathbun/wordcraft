@@ -6,6 +6,11 @@
 //! (`√x²` parses as `(√x)²` and shows as `(√x)^2`). Units are upright text, quoted in the linear
 //! form (`1500 "lbf"`). The result follows: `=600 "psi"` when current, a grey `≈600 "psi"` when
 //! stale, and a red ` ⚠` instead of any number when the calculation has an error.
+//!
+//! A vector or matrix result is a bracketed Word matrix of its formatted elements, with their one
+//! shared unit after the bracket (`=[■(0.84@1.05)] "in"`) or each element's own unit inside it
+//! (`=[■(2 "in"@3 "lbf")]`). Past [`MAX_SHOWN_ROWS`] rows it is cut, never silently: a `⋮` row and
+//! the row count follow the rows shown (`=[■(0@…@49@⋮)] "(60 rows)"`).
 
 use std::collections::HashMap;
 
@@ -15,6 +20,7 @@ use wordcraft_doc::calc::CalcState;
 use wordcraft_doc::math::{Arg, FUNCTION_NAMES, MNode, MRun, MSty, Math, parse_linear};
 use wordcraft_doc::math_linear::map_args;
 
+use crate::array::MAX_ELEMENTS;
 use crate::{CalcError, Expr, Op, Stmt, funcs, parse};
 
 /// Colour of the error marker.
@@ -40,12 +46,32 @@ const INVISIBLE_CLOSE: &str = "〗";
 const TEN: &str = "〖10〗";
 /// Separates a number from the unit after it in the math tree (spaces in linear text are dropped).
 const THIN_SPACE: char = '\u{2009}';
+/// Most rows of a vector or matrix result shown; the rest are cut, with a [`CUT`] row and the row
+/// count after the rows shown.
+pub(crate) const MAX_SHOWN_ROWS: usize = 50;
+/// Each cell of the row standing for the rows cut from a long result.
+const CUT: &str = "⋮";
+/// Longest result text [`shown_result`] reads back, bytes: well over what [`rendered`] writes for
+/// the largest grid, so anything longer came from somewhere else.
+const MAX_RESULT_BYTES: usize = 4 << 20;
+
+/// A result as shown after `=`: formatted, ready to display.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Shown {
+    /// One value.
+    One(Formatted),
+    /// A vector or matrix: its first `rows` rows (at most [`MAX_SHOWN_ROWS`]) of `cols` elements,
+    /// row by row, of `total_rows` in all. `unit` is `Some` when every element shares it (never
+    /// empty), and the items then carry an empty unit.
+    Grid { rows: usize, cols: usize, items: Vec<Formatted>, unit: Option<String>, total_rows: usize },
+}
 
 /// The linear-format text shown for the calculation `stmt_src`, with its result `shown` (when
 /// the statement shows one) in the given state. A source that doesn't parse is shown as typed,
 /// followed by the error marker.
 pub fn display(stmt_src: &str, shown: Option<&Formatted>, state: &CalcState) -> String {
-    rendered(&parse(stmt_src), stmt_src, shown, state).linear
+    let shown = shown.cloned().map(Shown::One);
+    rendered(&parse(stmt_src), stmt_src, shown.as_ref(), state).linear
 }
 
 /// A display: the linear text and the math tree to store on the equation.
@@ -64,7 +90,7 @@ pub(crate) fn shows_value(stmt: &Stmt) -> bool {
 }
 
 /// The display of an already parsed statement (`src` is used only when it didn't parse).
-pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<&Formatted>, state: &CalcState) -> Rendered {
+pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<&Shown>, state: &CalcState) -> Rendered {
     let mut out = Out::default();
     let shows = match stmt {
         Ok(stmt) => {
@@ -88,15 +114,14 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
     } else if shows {
         let stale = !matches!(state, CalcState::Fresh);
         let rel = if stale { "≈" } else { "=" };
-        let number = shown.map_or_else(|| "?".to_string(), |f| linear_number(&f.number));
-        let unit = shown.map_or("", |f| f.unit.as_str());
         let mut result: Arg = vec![MNode::Run(MRun::new(rel))];
-        result.extend(restore_pieces(parse_linear(&number), &[]));
         linear.push_str(rel);
-        linear.push_str(&number);
-        if !unit.is_empty() {
-            linear.push_str(&format!(" \"{unit}\""));
-            result.push(MNode::Run(unit_run(format!("{THIN_SPACE}{unit}"))));
+        match shown {
+            None => push_value(&Formatted { number: "?".into(), unit: String::new() }, &mut linear, &mut result),
+            Some(Shown::One(f)) => push_value(f, &mut linear, &mut result),
+            Some(Shown::Grid { rows, cols, items, unit, total_rows }) => {
+                push_grid(*rows, *cols, items, unit.as_deref(), *total_rows, &mut linear, &mut result);
+            }
         }
         if stale {
             result = paint(result, STALE_GREY);
@@ -104,6 +129,61 @@ pub(crate) fn rendered(stmt: &Result<Stmt, CalcError>, src: &str, shown: Option<
         math.extend(result);
     }
     Rendered { linear, math }
+}
+
+/// A formatted number and its unit, as linear text (`600 "psi"`) and math nodes.
+fn push_value(f: &Formatted, linear: &mut String, math: &mut Arg) {
+    let number = linear_number(&f.number);
+    math.extend(restore_pieces(parse_linear(&number), &[]));
+    linear.push_str(&number);
+    push_unit(&f.unit, linear, math);
+}
+
+/// ` "text"` after a number or a bracket: upright, set apart by a thin space. Nothing when empty.
+fn push_unit(text: &str, linear: &mut String, math: &mut Arg) {
+    if !text.is_empty() {
+        linear.push_str(&format!(" \"{text}\""));
+        math.push(MNode::Run(unit_run(format!("{THIN_SPACE}{text}"))));
+    }
+}
+
+/// A vector or matrix result ([`Shown::Grid`]): a bracketed matrix of `items`, `cols` to a row,
+/// then a [`CUT`] row when rows were cut; then the shared `unit` and, when cut, the row count.
+///
+/// The tree is built cell by cell rather than parsed from the whole linear text, so a large grid
+/// is drawn whole (the linear parser stops at a bound on its work) and each cell costs the same.
+fn push_grid(rows: usize, cols: usize, items: &[Formatted], unit: Option<&str>, total_rows: usize, linear: &mut String, math: &mut Arg) {
+    let cols = cols.max(1);
+    let cut = total_rows > rows;
+    let mut matrix: Vec<Vec<Arg>> = Vec::with_capacity(rows.saturating_add(1));
+    linear.push_str("[■(");
+    for (r, row) in items.chunks(cols).enumerate() {
+        if r > 0 {
+            linear.push('@');
+        }
+        let mut cells = Vec::with_capacity(cols);
+        for (c, item) in row.iter().enumerate() {
+            if c > 0 {
+                linear.push('&');
+            }
+            let mut cell = Vec::new();
+            push_value(item, linear, &mut cell);
+            cells.push(cell);
+        }
+        matrix.push(cells);
+    }
+    if cut {
+        linear.push('@');
+        linear.push_str(&vec![CUT; cols].join("&"));
+        matrix.push(vec![vec![MNode::Run(MRun::new(CUT))]; cols]);
+    }
+    linear.push_str(")]");
+    let matrix = MNode::Matrix { rows: matrix, col_jc: Vec::new() };
+    math.push(MNode::Delim { beg: Some('['), end: Some(']'), sep: None, grow: true, shp_match: false, elems: vec![vec![matrix]] });
+    push_unit(unit.unwrap_or_default(), linear, math);
+    if cut {
+        push_unit(&format!("({total_rows} rows)"), linear, math);
+    }
 }
 
 /// A short red note after a display, upright (`⚠ not calculated here`).
@@ -190,23 +270,121 @@ pub(crate) fn unnumbered(nodes: &[MNode]) -> Option<Arg> {
     Some(out)
 }
 
-/// The result shown in a display made by [`rendered`] (`…=600 "psi"`), read back from its
-/// linear text; `None` when the text doesn't end in a result.
-pub(crate) fn shown_result(linear: &str) -> Option<Formatted> {
+/// The result shown in a display made by [`rendered`] (`…=600 "psi"`, `…=[■(0.84@1.05)] "in"`),
+/// read back from its linear text; `None` when the text doesn't end in a result [`rendered`]
+/// could have written. The text comes from files, so the work is bounded by its length, and a
+/// result longer than any [`rendered`] writes is no result.
+pub(crate) fn shown_result(linear: &str) -> Option<Shown> {
     let linear = linear.strip_suffix('#').unwrap_or(linear);
     let (_, tail) = linear.rsplit_once('=')?;
-    let tail = tail.replace(TEN, "10");
-    let tail = tail.as_str();
-    let (number, unit) = match tail.strip_suffix('"') {
+    if tail.len() > MAX_RESULT_BYTES {
+        return None;
+    }
+    match tail.strip_prefix("[■(") {
+        Some(grid) => grid_result(grid),
+        None => value_result(tail).map(Shown::One),
+    }
+}
+
+/// A number and its unit (`600 "psi"`, `1.5×〖10〗^(-5)`) read back.
+fn value_result(text: &str) -> Option<Formatted> {
+    let text = text.replace(TEN, "10");
+    let text = text.as_str();
+    let (number, unit) = match text.strip_suffix('"') {
         Some(rest) => {
             let (number, unit) = rest.rsplit_once(" \"")?;
             (number, unit.to_string())
         }
-        None => (tail, String::new()),
+        None => (text, String::new()),
     };
     let number = number.replace("^(-", "^-").replace(')', "");
     let numeric = !number.is_empty() && number.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '×' | '^'));
-    (numeric && number.chars().any(|c| c.is_ascii_digit())).then_some(Formatted { number, unit })
+    (numeric && number.chars().any(|c| c.is_ascii_digit()) && !unit.contains('"')).then_some(Formatted { number, unit })
+}
+
+/// A vector or matrix result read back from the text after its `[■(`: the cells to the first `)]`
+/// outside a quoted unit (`@` between rows, `&` between cells), then the shared unit and the row
+/// count, each quoted. Stops as soon as there are more rows or cells than [`rendered`] writes.
+fn grid_result(text: &str) -> Option<Shown> {
+    let mut rows: Vec<Vec<&str>> = vec![Vec::new()];
+    let (mut start, mut cells, mut quoted, mut end) = (0, 0usize, false, None);
+    for (i, c) in text.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '@' | '&' | ')' => {
+                let rest = text.get(i..)?;
+                if c == ')' && !rest.starts_with(")]") {
+                    continue;
+                }
+                rows.last_mut()?.push(text.get(start..i)?);
+                cells += 1;
+                if cells > MAX_ELEMENTS {
+                    return None;
+                }
+                start = i + c.len_utf8();
+                if c == ')' {
+                    end = Some(i + ")]".len());
+                    break;
+                }
+                if c == '@' {
+                    // The rows shown and the cut row.
+                    if rows.len() > MAX_SHOWN_ROWS {
+                        return None;
+                    }
+                    rows.push(Vec::new());
+                }
+            }
+            _ => {}
+        }
+    }
+    let notes = quoted_words(text.get(end?..)?)?;
+    let rows_note = |w: &str| w.strip_prefix('(')?.strip_suffix(" rows)").filter(|n| n.bytes().all(|b| b.is_ascii_digit()))?.parse::<usize>().ok();
+    let (unit, total) = match notes.as_slice() {
+        [] => (None, None),
+        [only] => rows_note(only).map_or((Some(*only), None), |n| (None, Some(n))),
+        [unit, count] => (Some(*unit), Some(rows_note(count)?)),
+        _ => return None,
+    };
+    if unit.is_some_and(|u| u.is_empty() || rows_note(u).is_some()) {
+        return None;
+    }
+    let cols = rows.first()?.len();
+    if rows.iter().any(|r| r.len() != cols) {
+        return None;
+    }
+    let cut = rows.last().is_some_and(|r| r.iter().all(|&c| c == CUT));
+    if cut {
+        rows.pop();
+    }
+    let shown = rows.len();
+    let total_rows = match total {
+        Some(n) if cut && n > shown && n.checked_mul(cols).is_some_and(|all| all <= MAX_ELEMENTS) => n,
+        None if !cut => shown,
+        _ => return None,
+    };
+    if shown == 0 || shown > MAX_SHOWN_ROWS {
+        return None;
+    }
+    let items = rows.into_iter().flatten().map(value_result).collect::<Option<Vec<_>>>()?;
+    if unit.is_some() && items.iter().any(|f| !f.unit.is_empty()) {
+        return None;
+    }
+    Some(Shown::Grid { rows: shown, cols, items, unit: unit.map(str::to_string), total_rows })
+}
+
+/// The quoted words of ` "a" "b"`: `None` for anything else, or more than two.
+fn quoted_words(mut text: &str) -> Option<Vec<&str>> {
+    let mut words = Vec::new();
+    while !text.is_empty() {
+        let (word, rest) = text.strip_prefix(" \"")?.split_once('"')?;
+        if words.len() == 2 {
+            return None;
+        }
+        words.push(word);
+        text = rest;
+    }
+    Some(words)
 }
 
 /// A formatted number as linear text: the base `10` is in invisible brackets (`〖10〗^6`) so the
@@ -814,3 +992,6 @@ fn restore_pieces(arg: Arg, pieces: &[Piece]) -> Arg {
     }
     out
 }
+
+#[cfg(test)]
+mod tests;
