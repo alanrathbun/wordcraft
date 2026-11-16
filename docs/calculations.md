@@ -407,6 +407,8 @@ grades := ["A106 B", "A312 TP316"]
 `and`, `or` and `not` (also typed `∧`, `∨`, `¬`, or with `\wedge`, `\vee`, `\neg`) combine
 comparisons. They are always shown as `∧`, `∨` and `¬`, however they were typed, and give 1 or 0.
 They take dimensionless numbers, where any nonzero value counts as true.
+If the interface font can't draw `∧` or `∨`, the calculation box shows the words `and` and `or`
+instead; they mean the same.
 
 ```
 ok := P ≤ P_max and T ≤ T_max =

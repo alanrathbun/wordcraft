@@ -22,6 +22,12 @@ use crate::WordApp;
 /// either; what is stored is the ASCII `:=`.
 pub(crate) const DEFINE_MARK: char = '\u{2254}';
 
+/// `∧` and `∨` (U+2227, U+2228): the shortcuts and the Insert Symbol row offer them, and the box
+/// shows them while the interface can draw them ([`logic_covered`]); else it shows the words
+/// `and` and `or`, which the engine reads the same.
+pub(crate) const AND_MARK: char = '\u{2227}';
+pub(crate) const OR_MARK: char = '\u{2228}';
+
 /// How many `<name>_N` the rename suggestion tries before leaving the field to the user.
 const MAX_SUGGESTIONS: u32 = 99;
 
@@ -111,6 +117,63 @@ pub fn stored_source(shown: &str) -> String {
     shown.replace(DEFINE_MARK, ":=")
 }
 
+/// Whether the interface can draw `∧` and `∨` (`has_glyph` answers for one character).
+pub fn logic_covered(mut has_glyph: impl FnMut(char) -> bool) -> bool {
+    has_glyph(AND_MARK) && has_glyph(OR_MARK)
+}
+
+/// `∧` and `∨` written as the words `and` and `or`, outside quoted texts, with a space kept on
+/// each side; and where a cursor at char index `cursor` goes in the result. For a box whose
+/// font can't draw the symbols (a missing glyph would show as a box).
+pub fn spell_logic(text: &str, cursor: usize) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut out_len = 0;
+    let mut at = None;
+    let mut in_text = false;
+    for (i, &c) in chars.iter().enumerate() {
+        if i == cursor {
+            at = Some(out_len);
+        }
+        let word = match c {
+            '"' => {
+                in_text = !in_text;
+                None
+            }
+            '\u{201C}' => {
+                in_text = true;
+                None
+            }
+            '\u{201D}' => {
+                in_text = false;
+                None
+            }
+            AND_MARK if !in_text => Some("and"),
+            OR_MARK if !in_text => Some("or"),
+            _ => None,
+        };
+        match word {
+            Some(word) => {
+                if chars.get(i.wrapping_sub(1)).is_some_and(|p| !p.is_whitespace()) && !out.ends_with(char::is_whitespace) {
+                    out.push(' ');
+                    out_len += 1;
+                }
+                out.push_str(word);
+                out_len += word.len();
+                if !chars.get(i + 1).is_some_and(|n| n.is_whitespace()) {
+                    out.push(' ');
+                    out_len += 1;
+                }
+            }
+            None => {
+                out.push(c);
+                out_len += 1;
+            }
+        }
+    }
+    (out, at.unwrap_or(out_len))
+}
+
 /// The name a source defines (`σ` for `σ := P/A_b =`); `None` when it defines nothing or doesn't
 /// parse (its error then shows at the region).
 pub fn defined_name_of(source: &str) -> Option<String> {
@@ -152,26 +215,39 @@ fn is_ok(v: &Value) -> bool {
     v.get("ok").and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// The face the interface borrows to draw `≔` in the source box (its own fonts have none): the
-/// math font equations are drawn with, which has it, else any document font that does. Looked
-/// up once per [`wordcraft_fonts::FontDb::generation`].
-pub(crate) fn define_mark_face() -> Option<std::sync::Arc<wordcraft_fonts::FontFace>> {
-    type Memo = Option<(u64, Option<std::sync::Arc<wordcraft_fonts::FontFace>>)>;
-    static MEMO: std::sync::Mutex<Memo> = std::sync::Mutex::new(None);
+type FaceMemo = Option<(u64, Option<std::sync::Arc<wordcraft_fonts::FontFace>>)>;
+
+/// A face that covers every one of `chars`, which the interface fonts lack: the math font
+/// equations are drawn with, else any document font that does. Looked up once per
+/// [`wordcraft_fonts::FontDb::generation`] (kept in `memo`).
+fn borrowed_face(memo: &std::sync::Mutex<FaceMemo>, chars: &[char]) -> Option<std::sync::Arc<wordcraft_fonts::FontFace>> {
     let db = wordcraft_fonts::FontDb::global();
     let generation = db.generation();
-    let mut memo = MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut memo = memo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((g, face)) = memo.as_ref()
         && *g == generation
     {
         return face.clone();
     }
     // Very large faces (system CJK collections) aren't borrowed by the interface.
-    let usable = |f: &std::sync::Arc<wordcraft_fonts::FontFace>| f.covers(DEFINE_MARK) && f.data().len() <= 16 << 20;
+    let usable = |f: &std::sync::Arc<wordcraft_fonts::FontFace>| chars.iter().all(|c| f.covers(*c)) && f.data().len() <= 16 << 20;
     let (math, _) = wordcraft_fonts::math::resolve_math("Cambria Math");
-    let face = Some(db.face(&math.family, &math.style)).filter(usable).or_else(|| db.fallback_for(DEFINE_MARK, u32::MAX).filter(usable));
+    let face =
+        Some(db.face(&math.family, &math.style)).filter(usable).or_else(|| chars.first().and_then(|c| db.fallback_for(*c, u32::MAX)).filter(usable));
     *memo = Some((generation, face.clone()));
     face
+}
+
+/// The face the interface borrows to draw `≔` in the source box (its own fonts have none).
+pub(crate) fn define_mark_face() -> Option<std::sync::Arc<wordcraft_fonts::FontFace>> {
+    static MEMO: std::sync::Mutex<FaceMemo> = std::sync::Mutex::new(None);
+    borrowed_face(&MEMO, &[DEFINE_MARK])
+}
+
+/// The face the interface borrows to draw `∧` and `∨` in the box and the Insert Symbol row.
+pub(crate) fn logic_mark_face() -> Option<std::sync::Arc<wordcraft_fonts::FontFace>> {
+    static MEMO: std::sync::Mutex<FaceMemo> = std::sync::Mutex::new(None);
+    borrowed_face(&MEMO, &[AND_MARK, OR_MARK])
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -282,10 +358,21 @@ pub const SYMBOL_GROUPS: &[(&str, &[&str])] = &[
             "Φ", "Ψ", "Ω",
         ],
     ),
-    ("Operators", &["≔", "·", "×", "±", "√", "²", "³", "⁻¹", "|", "°", "≤", "≥", "≠", "∑", "∧", "∨", "¬"]),
+    ("Operators", &["≔", "·", "×", "±", "√", "²", "³", "⁻¹", "|", "°", "≤", "≥", "≠", "∑", "\u{2227}", "\u{2228}", "¬"]),
     ("Units", &["gm", "°F", "°C", "Δ°F", "Δ°C", "µm", "Ω"]),
     ("Constants", &["π", "e", "g", "g_0", "c_0", "R_u"]),
 ];
+
+/// What an Insert Symbol button says: the symbol, but `and` or `or` for `∧` and `∨` where the
+/// interface can't draw them (`logic` is false).
+pub fn symbol_label(symbol: &str, logic: bool) -> &str {
+    match symbol {
+        _ if logic => symbol,
+        "\u{2227}" => "and",
+        "\u{2228}" => "or",
+        _ => symbol,
+    }
+}
 
 /// `\name` shortcuts the box turns into symbols, as in Word's math autocorrect.
 const SHORTCUTS: &[(&str, &str)] = &[
@@ -331,8 +418,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("ge", "≥"),
     ("ne", "≠"),
     ("sum", "∑"),
-    ("wedge", "∧"),
-    ("vee", "∨"),
+    ("wedge", "\u{2227}"),
+    ("vee", "\u{2228}"),
     ("neg", "¬"),
 ];
 
@@ -404,6 +491,16 @@ impl CalcBox {
         self.cursor = Some(at + symbol.chars().count());
         self.place_cursor = true;
         self.focus = true;
+    }
+
+    /// Show `∧` and `∨` as the words `and` and `or` (see [`spell_logic`]), the cursor kept.
+    pub fn spell_logic_marks(&mut self) {
+        let cursor = self.cursor.unwrap_or_else(|| self.source.chars().count());
+        let (text, at) = spell_logic(&self.source, cursor);
+        self.source = text;
+        if self.cursor.is_some() {
+            self.cursor = Some(at);
+        }
     }
 
     /// Enter: check the defined name, then insert the calculation or change the region's source.
@@ -523,9 +620,13 @@ fn source_ui(app: &mut WordApp, ui: &mut Ui, b: &mut CalcBox) -> bool {
     let label = ui.label(tl!("Calculation"));
     let font = egui::TextStyle::Body.resolve(ui.style());
     let covered = ui.fonts_mut(|f| f.has_glyph(&font, DEFINE_MARK));
+    let logic = ui.fonts_mut(|f| logic_covered(|c| f.has_glyph(&font, c)));
     // What the font can't draw never reaches the box (a source read from a file may have `≔`).
     if !covered && b.source.contains(DEFINE_MARK) {
         b.source = stored_source(&b.source);
+    }
+    if !logic && b.source.contains([AND_MARK, OR_MARK]) {
+        b.spell_logic_marks();
     }
     let mut out = egui::TextEdit::singleline(&mut b.source)
         .font(egui::TextStyle::Body)
@@ -544,6 +645,10 @@ fn source_ui(app: &mut WordApp, ui: &mut Ui, b: &mut CalcBox) -> bool {
             b.source = text;
             b.cursor = Some(at);
             b.place_cursor = true;
+            // A `\wedge` or `\vee` the font can't draw never reaches the screen as a symbol.
+            if !logic {
+                b.spell_logic_marks();
+            }
         }
     }
     if std::mem::take(&mut b.place_cursor) {
@@ -560,8 +665,11 @@ fn source_ui(app: &mut WordApp, ui: &mut Ui, b: &mut CalcBox) -> bool {
             ui.label(egui::RichText::new(tl!(*group)).small().weak());
             ui.horizontal_wrapped(|ui| {
                 for s in *symbols {
-                    if ui.button(*s).clicked() {
+                    if ui.button(symbol_label(s, logic)).clicked() {
                         b.insert_symbol(s);
+                        if !logic {
+                            b.spell_logic_marks();
+                        }
                         ui.close();
                     }
                 }

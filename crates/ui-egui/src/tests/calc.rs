@@ -308,6 +308,68 @@ fn calc_define_mark_shows_when_the_font_has_it() {
     assert_eq!(calc_ui::stored_source(mark), "P := 1", "stored as ASCII");
 }
 
+/// `∧` and `∨` show as the words `and` and `or` where the font can't draw them (never as a box),
+/// with the cursor kept in place and quoted texts left alone.
+#[test]
+fn calc_logic_marks_spell_out_without_coverage() {
+    let (and, or) = ('\u{2227}', '\u{2228}');
+    assert_eq!(calc_ui::spell_logic(&format!("a {and} b"), 4), ("a and b".to_string(), 6), "spaces kept, cursor kept before b");
+    assert_eq!(calc_ui::spell_logic(&format!("a{or}b"), 2), ("a or b".to_string(), 5), "spaces added; the cursor follows the mark");
+    assert_eq!(calc_ui::spell_logic(&format!("x > 1 {and}"), 7), ("x > 1 and ".to_string(), 10), "inserted at the end: room to go on");
+    assert_eq!(calc_ui::spell_logic(&format!("{or}"), 0), ("or ".to_string(), 0));
+    assert_eq!(calc_ui::spell_logic(&format!("c := \"a {and} b\" == t {or} u"), 5).0, "c := \"a \u{2227} b\" == t or u", "texts are left alone");
+    assert_eq!(calc_ui::spell_logic("a and b", 3), ("a and b".to_string(), 3), "nothing to spell: unchanged");
+    // Two marks in a row get one space between them.
+    assert_eq!(calc_ui::spell_logic(&format!("{and}{or}"), 2).0, "and or ");
+    // The Insert Symbol buttons say the words where the symbols can't be drawn.
+    assert_eq!(calc_ui::symbol_label(&and.to_string(), false), "and");
+    assert_eq!(calc_ui::symbol_label(&or.to_string(), false), "or");
+    assert_eq!(calc_ui::symbol_label(&and.to_string(), true), and.to_string());
+    assert_eq!(calc_ui::symbol_label("≤", false), "≤", "other symbols are the interface's own");
+    assert!(calc_ui::logic_covered(|_| true));
+    assert!(!calc_ui::logic_covered(|c| c != or), "both symbols must be drawable");
+    // A box that can't draw them rewrites its source, keeping the cursor.
+    let mut b = calc_ui::CalcBox::new(None, "x ", None);
+    b.insert_symbol(&and.to_string());
+    b.spell_logic_marks();
+    assert_eq!(b.source, "x and ");
+    assert_eq!(b.cursor, Some(6));
+}
+
+/// What the box shows for `\wedge` and the Insert Symbol buttons follows what the interface can
+/// draw: the symbol when it can (the box borrows the math face), else the word; never a glyph
+/// that would draw as a box. Either way the calculation means the same.
+#[test]
+fn calc_box_shows_logic_marks_only_when_drawable() {
+    let (and, or) = ('\u{2227}', '\u{2228}');
+    let mut h = ready(app());
+    open_box(&mut h);
+    type_text(&mut h, "a > 1 \\wedge ");
+    h.run_steps(3);
+    let font = egui::TextStyle::Body.resolve(&h.ctx.global_style());
+    let drawable = h.ctx.fonts_mut(|f| f.has_glyph(&font, and) && f.has_glyph(&font, or));
+    let source = calc_box(h.state()).expect("open").source;
+    if drawable {
+        assert_eq!(source, format!("a > 1 {and}"), "drawn from the borrowed face");
+    } else {
+        assert_eq!(source, "a > 1 and ", "no glyph: the word");
+    }
+    type_text(&mut h, "b < 2");
+    h.get_by_label("Insert Symbol").click();
+    h.run_steps(3);
+    let label = if drawable { or.to_string() } else { "or".to_string() };
+    h.get_by_label(&label).click();
+    h.run_steps(3);
+    let source = calc_box(h.state()).expect("open").source;
+    assert_eq!(source.contains(or), drawable, "{source}");
+    assert!(drawable || source.ends_with("b < 2 or "), "{source}");
+    assert!(drawable || !source.contains(and), "{source}");
+    // Both spellings are the same calculation.
+    type_text(&mut h, "1 = 1");
+    enter(&mut h);
+    assert_eq!(regions(h.state()).len(), 1, "the calculation was inserted");
+}
+
 /// Hovering a region: an error shows its message, a stale result says how to update it.
 #[test]
 fn calc_hover_text_follows_the_state() {
@@ -544,7 +606,8 @@ fn backslash_names_become_symbols() {
 
 #[test]
 fn condition_shortcuts_expand() {
-    for (typed, symbol) in [("\\le ", "≤"), ("\\ge ", "≥"), ("\\ne ", "≠"), ("\\sum ", "∑"), ("\\wedge ", "∧"), ("\\vee ", "∨"), ("\\neg ", "¬")]
+    for (typed, symbol) in
+        [("\\le ", "≤"), ("\\ge ", "≥"), ("\\ne ", "≠"), ("\\sum ", "∑"), ("\\wedge ", "\u{2227}"), ("\\vee ", "\u{2228}"), ("\\neg ", "¬")]
     {
         let n = typed.chars().count();
         assert_eq!(calc_ui::expand_shortcut(typed, n), Some((symbol.to_string(), 1)), "{typed}");
