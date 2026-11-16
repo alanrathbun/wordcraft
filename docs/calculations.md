@@ -279,7 +279,7 @@ margin := t_nom - t_min =            → [0.088; 0.087; 0.101] in
 min(margin) =                        → 0.087 in
 ```
 
-The margin is called `margin` because `m` is the metre. Changing the 3/4" `t_nom` to `0.120`
+The margin is called `margin` because `m` is the meter. Changing the 3/4" `t_nom` to `0.120`
 makes `min(margin)` 0.088 in.
 
 A second example (the engine's `flange_torque_sample` test, in a document of its own, since `NPS`
