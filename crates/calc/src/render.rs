@@ -785,9 +785,10 @@ fn range_end_parens(e: &Expr) -> bool {
     matches!(e, Expr::Binary(Op::Div, ..) | Expr::Range { .. })
 }
 
-/// Whether `e` is written ending in a sub- or superscript, a square root, or anything else whose
-/// operand UnicodeMath could run on into a `..` after it: a numeric script takes every letter,
-/// digit and `.` that follows (`D_0..5` would lower `0..5`). Errs towards yes.
+/// Whether `e` is written ending in a sub- or superscript, a square root, a fraction, or anything
+/// else whose operand UnicodeMath could run on into a `..` after it: a numeric script takes every
+/// letter, digit and `.` that follows (`D_0..5` would lower `0..5`), and so does a denominator
+/// (`1+1/2..5` would put `2..5` under the bar). Errs towards yes.
 fn ends_in_script(e: &Expr) -> bool {
     let mut e = e;
     loop {
@@ -796,7 +797,7 @@ fn ends_in_script(e: &Expr) -> bool {
             Expr::Name(n) => return n.contains('_') && !is_unit(n),
             Expr::Quantity(..) | Expr::Abs(_) | Expr::Matrix { .. } => return false,
             Expr::Call(..) => return is_sqrt(e),
-            Expr::Index(..) | Expr::Binary(Op::Pow, ..) => return true,
+            Expr::Index(..) | Expr::Binary(Op::Pow | Op::Div, ..) => return true,
             Expr::Unary(_, a) | Expr::Binary(_, _, a) => e = a,
             Expr::Range { last, .. } => e = last,
         }
@@ -804,7 +805,7 @@ fn ends_in_script(e: &Expr) -> bool {
 }
 
 /// Push the value written just before a range's `..`: in invisible brackets when it ends in a
-/// script (`〖D_0〗..5`), so the `..` stays out of the script.
+/// script or a fraction (`〖D_0〗..5`, `〖1+1/2〗..5`), so the `..` stays out of it.
 fn push_before_dots<'a>(todo: &mut Vec<Step<'a>>, e: &'a Expr) {
     if range_end_parens(e) {
         wrap(todo, e, true);

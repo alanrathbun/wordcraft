@@ -701,6 +701,45 @@ fn a_range_keeps_its_dots_out_of_scripts_in_the_math() {
     }
 }
 
+/// Every fraction's denominator in `nodes`, at any depth.
+fn denominators(nodes: &[MNode]) -> Vec<Vec<MNode>> {
+    let mut out = Vec::new();
+    let mut todo: Vec<&MNode> = nodes.iter().collect();
+    while let Some(n) = todo.pop() {
+        match n {
+            MNode::Frac { num, den, .. } => {
+                out.push(den.clone());
+                todo.extend(num.iter().chain(den.iter()));
+            }
+            MNode::Script { base, sub, sup, .. } => todo.extend(base.iter().chain(sub.iter()).chain(sup.iter())),
+            MNode::Rad { deg, e, .. } => todo.extend(deg.iter().chain(e.iter())),
+            MNode::Delim { elems, .. } => todo.extend(elems.iter().flatten()),
+            MNode::Func { name, e } => todo.extend(name.iter().chain(e.iter())),
+            MNode::Matrix { rows, .. } => todo.extend(rows.iter().flatten().flatten()),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn a_range_keeps_its_dots_out_of_fractions_in_the_math() {
+    let sources = [("x := 1 + 1/2..5", "x≔〖1+1/2〗..5"), ("y := 1 + a/b..5", "y≔〖1+a/b〗..5"), ("w := 0, 1 + a/2..5", "w≔0,〖1+a/2〗..5")];
+    let mut d = doc_with(&["a := 1", "b := 2"].into_iter().chain(sources.map(|(src, _)| src)).collect::<Vec<_>>());
+    recalc(&mut d, &no_page);
+    for (k, (src, want)) in sources.iter().enumerate() {
+        let (_, linear, math) = region(&d, k as u64 + 3);
+        let dens = denominators(&math.nodes);
+        assert!(!dens.is_empty(), "{src}: no fraction in {:#?}", math.nodes);
+        for den in dens {
+            let text: String = runs(&den).iter().map(|r| r.text.clone()).collect();
+            assert!(!text.contains(".."), "{src} ({linear}): a denominator holds {text:?}");
+        }
+        assert!(runs(&math.nodes).iter().any(|r| r.text.contains("..")), "{src}: no `..` run in {:#?}", math.nodes);
+        assert_eq!(linear, *want, "{src}");
+    }
+}
+
 #[test]
 fn a_subscripted_function_keeps_its_arguments_out_of_the_subscript() {
     let mut d = doc_with(&["f_a(t) := t^2"]);
