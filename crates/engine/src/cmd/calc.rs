@@ -33,6 +33,39 @@ const MAX_PRECISION: u64 = 15;
 /// calculation commands that recalculate or re-mark themselves.
 const NO_AUTO_PASS: [&str; 5] = ["edit.undo", "edit.redo", "edit.undoTo", "calc.recalculate", "calc.settings"];
 
+/// The stack every evaluation of the document's calculations runs on. Evaluation recurses as
+/// deep as the source nests: bounded, but a crafted document reaches the bound through 32 levels
+/// of its own functions, deeper than the 1 MB the app's main thread has on Windows, where an
+/// overflow aborts the app and no `catch_unwind` can contain it.
+const PASS_STACK: usize = 64 << 20;
+
+/// Run `f` on a thread of its own with a [`PASS_STACK`] stack and wait for it. A panic in `f`
+/// carries on in the caller with the same payload, as if `f` had panicked there, so the callers'
+/// `catch_unwind` contain it and report it as before. When no thread can be started (a platform
+/// without threads, or none left), `f` runs here. (`T: Default` only types a case that can't
+/// happen: the thread always finds `f`.)
+fn on_pass_stack<T: Send + Default>(f: impl FnOnce() -> T + Send) -> T {
+    #[cfg(test)]
+    let inject = tests::injecting_panic();
+    let mut job = Some(f);
+    let done = std::thread::scope(|scope| {
+        let job = &mut job;
+        let thread = std::thread::Builder::new().name("calculation".into()).stack_size(PASS_STACK).spawn_scoped(scope, move || {
+            #[cfg(test)]
+            if inject {
+                std::panic::resume_unwind(Box::new("injected failure"));
+            }
+            job.take().map(|f| f()).unwrap_or_default()
+        });
+        thread.ok().map(|t| t.join())
+    });
+    match done {
+        Some(Ok(value)) => value,
+        Some(Err(panic)) => std::panic::resume_unwind(panic),
+        None => job.take().map(|f| f()).unwrap_or_default(),
+    }
+}
+
 /// Builds the calculation command table.
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -117,7 +150,7 @@ pub(crate) fn parts_have_calc(doc: &Document) -> bool {
 /// The pass reads file content, so it runs inside its own `catch_unwind` (the command's has
 /// already returned): a panic puts the document back as the command left it, greys every result
 /// (if even that works, so no result looks current) and says so in the status line. The edit
-/// itself stands.
+/// itself stands. The evaluation runs on a stack of its own ([`on_pass_stack`]).
 pub(crate) fn after_command(s: &mut Session, id: &str, before: &Document) {
     if NO_AUTO_PASS.contains(&id) || s.doc.same_content(before) || calc_unchanged(before, &s.doc) {
         return;
@@ -129,8 +162,6 @@ pub(crate) fn after_command(s: &mut Session, id: &str, before: &Document) {
     let manual = s.doc.calc_settings.as_ref().is_some_and(|c| c.manual);
     let saved = s.doc.clone();
     let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        #[cfg(test)]
-        tests::maybe_inject_panic();
         if outside {
             freeze_outside_body(&mut s.doc);
         }
@@ -166,9 +197,9 @@ pub(crate) fn take_open_notice() -> Option<String> {
 /// show, and data tables edited outside it are used as they are (both are told in the status line:
 /// [`take_open_notice`]). A document with no calculations is left as it was read.
 ///
-/// The pass reads file content, so it runs inside `catch_unwind` like [`after_command`]: a panic
-/// puts the document back as read, greys every result so none looks current, and leaves a
-/// message for the status line ([`take_open_notice`]).
+/// The pass reads file content, so it runs inside `catch_unwind` like [`after_command`], and on a
+/// stack of its own ([`on_pass_stack`]): a panic puts the document back as read, greys every
+/// result so none looks current, and leaves a message for the status line ([`take_open_notice`]).
 pub(crate) fn after_open(doc: &mut Document) {
     let store = doc.calc_store.take();
     if store.is_none() && !has_calc(doc) && !wordcraft_calc::docx::has_calc_controls(doc) && !parts_have_calc(doc) {
@@ -177,10 +208,10 @@ pub(crate) fn after_open(doc: &mut Document) {
     let had_store = store.is_some();
     let saved = doc.clone();
     let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        #[cfg(test)]
-        tests::maybe_inject_panic();
-        freeze_outside_body(doc);
-        wordcraft_calc::docx::import(doc, store)
+        on_pass_stack(|| {
+            freeze_outside_body(doc);
+            wordcraft_calc::docx::import(doc, store)
+        })
     }));
     let panic = match pass {
         Ok(report) => {
@@ -229,13 +260,16 @@ fn edited_notice(edited: usize, tables_edited: usize) -> Option<String> {
 /// Recalculate the document. A duplicate-name message names the page of the first definition,
 /// so in Print Layout, when two regions define the same name, the document's pages are looked up
 /// (once per revision: see [`RegionPages`]). In the other views, which have no pages, and when no
-/// name repeats, no layout is made and the message says "elsewhere in the document".
+/// name repeats, no layout is made and the message says "elsewhere in the document". The pages
+/// are found here; the evaluation runs on a stack of its own ([`on_pass_stack`]).
 pub(crate) fn recalc_now(s: &mut Session) -> RecalcReport {
     if s.view.read_mode || s.view.mode != wordcraft_layout::ViewMode::Print || !repeats_a_name(&s.doc) {
-        return recalc(&mut s.doc, &|_| None);
+        let doc = &mut s.doc;
+        return on_pass_stack(|| recalc(doc, &|_| None));
     }
     let pages = region_pages(s);
-    recalc(&mut s.doc, &|id| pages.get(&id).copied())
+    let doc = &mut s.doc;
+    on_pass_stack(|| recalc(doc, &|id| pages.get(&id).copied()))
 }
 
 /// The page of each region (see [`region_pages`]), with what it was found for: the document,
@@ -535,12 +569,17 @@ fn insert_value(s: &mut Session, v: &Value) -> CmdResult {
     }
     // An element that isn't there would only ever show `?`; an index on a single value is no
     // element at all.
-    if let Some(at) = index {
-        check_quote_index(&s.doc, &name, at).map_err(|e| CmdError::Failed(e.to_string()))?;
+    // Both checks evaluate the document, so on a stack of their own ([`on_pass_stack`]).
+    if let Some(at) = index
+        && let Some(e) = on_pass_stack(|| check_quote_index(&s.doc, &name, at).err())
+    {
+        return Err(CmdError::Failed(e.to_string()));
     }
     // A unit the value can't be shown in would only ever show `?`.
-    if let Some(unit) = unit.as_deref() {
-        check_quote_unit(&s.doc, &name, unit).map_err(|e| CmdError::Failed(format!("{name} can't be shown in {unit}: {e}")))?;
+    if let Some(unit) = unit.as_deref()
+        && let Some(e) = on_pass_stack(|| check_quote_unit(&s.doc, &name, unit).err())
+    {
+        return Err(CmdError::Failed(format!("{name} can't be shown in {unit}: {e}")));
     }
     // The field code must read back as written, or the value would never be updated.
     let spec = QuoteSpec { name: name.clone(), unit: unit.clone(), precision, index };

@@ -6,15 +6,14 @@ use wordcraft_doc::{Block, Document, InlineObject, Pos};
 use crate::{Session, catalog};
 
 thread_local! {
-    /// Makes the automatic pass panic, to test that the panic is contained.
+    /// Makes the pass panic on its own stack (see `on_pass_stack`), to test that the panic is
+    /// contained.
     static INJECT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Called at the start of the automatic pass in test builds.
-pub(super) fn maybe_inject_panic() {
-    if INJECT_PANIC.with(std::cell::Cell::get) {
-        std::panic::resume_unwind(Box::new("injected failure"));
-    }
+/// Whether the pass should panic (read on the caller's thread: the pass panics on its own).
+pub(super) fn injecting_panic() -> bool {
+    INJECT_PANIC.with(std::cell::Cell::get)
 }
 
 fn session() -> Session {
@@ -1303,4 +1302,40 @@ fn edited_table_notice() {
         "1 calculation was edited in Word: it is marked ⚠, and calculations that use it show an error until you resolve it. \
          Calculation data was edited in Word in 1 table; results were recalculated"
     );
+}
+
+/// Calculations nested as deep as the evaluator allows (32 calls of your own functions, each
+/// through 60 `abs`) recalculate on a 1 MB stack, the size of the Windows main thread's, however
+/// the pass is reached: an edit, Recalculate, quoting a value, changing the options, or opening
+/// a document. A stack overflow aborts the app, and no `catch_unwind` can contain it.
+#[test]
+fn deep_calculations_recalculate_on_a_small_stack() {
+    let small = std::thread::Builder::new().stack_size(1 << 20).spawn(|| {
+        let mut s = session();
+        let nest = |inner: String| (0..60).fold(inner, |e, _| format!("abs({e})"));
+        calc(&mut s, &format!("h0(x) := {}", nest("x".to_string())));
+        for k in 1..32 {
+            calc(&mut s, &format!("h{k}(x) := {}", nest(format!("h{}(x)", k - 1))));
+        }
+        let y = calc(&mut s, "y := h31(-2) =");
+        // Evaluated all the way down, not stopped at a limit.
+        assert!(region(&s, y).1.ends_with("=2"), "{}", region(&s, y).1);
+        run(&mut s, "calc.recalculate", json!({}));
+        // Quoting an element in a unit checks both against the evaluated document.
+        calc(&mut s, "len := [h31(-2), 3] m");
+        run(&mut s, "insert.calcValue", json!({"name": "len", "index": [0], "unit": "mm"}));
+        assert!(field_results(&s).iter().any(|r| r == "2000 mm"), "{:?}", field_results(&s));
+        run(&mut s, "calc.settings", json!({"precision": 4}));
+        assert!(region(&s, y).1.ends_with("=2"), "{}", region(&s, y).1);
+        // Opening: the pass every opened document gets. (Called on the document itself: neither
+        // saved format reads back an equation nested this deep, but a crafted .docx can carry
+        // these sources with shallow equations.)
+        let mut opened = s.doc.clone();
+        wordcraft_calc::mark_stale(&mut opened);
+        super::after_open(&mut opened);
+        let back = Session::new(opened);
+        assert!(region(&back, y).1.ends_with("=2"), "{}", region(&back, y).1);
+        assert_eq!(super::take_open_notice(), None);
+    });
+    small.expect("a thread to run on").join().expect("recalculated without failing");
 }
