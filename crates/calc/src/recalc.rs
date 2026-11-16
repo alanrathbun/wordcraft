@@ -365,25 +365,7 @@ fn visit_table(path: &[u32], t: &Table, found: &mut Found) {
 /// tracked-deleted (the model has no tracked table deletion; deleting a table with tracking on
 /// marks its text deleted).
 fn inside_deletion(t: &Table) -> bool {
-    let (mut live, mut deleted) = (false, false);
-    for cell in t.rows.iter().flat_map(|r| &r.cells) {
-        walk_paras(&cell.blocks, &mut |_, p| {
-            for (range, props) in p.run_ranges() {
-                if range.is_empty() {
-                    continue;
-                }
-                if props.del.is_some() {
-                    deleted = true;
-                } else {
-                    live = true;
-                }
-            }
-        });
-        if live {
-            return false;
-        }
-    }
-    deleted
+    tables::deleted_only(t.rows.iter().flat_map(|r| &r.cells))
 }
 
 /// Whether `o` is a calculation region or a quoted value (`WCCALC` field; the field type is the

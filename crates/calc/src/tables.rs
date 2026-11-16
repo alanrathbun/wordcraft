@@ -28,16 +28,25 @@ fn syntax(message: impl Into<String>) -> CalcError {
 /// constant, and the unit must read. Whether `g` in the unit means gravity is the caller's check.
 pub(crate) fn heading(text: &str) -> Result<(String, Option<String>), CalcError> {
     let text = text.trim();
-    let (name, unit) = match text.split_once('(') {
-        Some((name, rest)) => {
+    let name = heading_name(text)?;
+    let unit = match text.split_once('(') {
+        Some((_, rest)) => {
             let unit = rest.strip_suffix(')').map(str::trim).filter(|u| !u.is_empty());
             let Some(unit) = unit else {
                 return Err(syntax(format!("the heading {text} needs a unit in brackets at its end, like D_o (in)")));
             };
-            (name.trim(), Some(unit))
+            parse_unit(unit)?;
+            Some(unit.to_string())
         }
-        None => (text, None),
+        None => None,
     };
+    Ok((name.to_string(), unit))
+}
+
+/// The name a heading gives (the text before any `(`), when it is a valid calculation name that
+/// isn't a unit, function or constant; whatever the unit after it says.
+fn heading_name(text: &str) -> Result<&str, CalcError> {
+    let name = text.split_once('(').map_or(text, |(name, _)| name).trim();
     if name.is_empty() {
         return Err(syntax("a calculation data column needs a heading: a name, and a unit in brackets, like D_o (in)"));
     }
@@ -48,10 +57,7 @@ pub(crate) fn heading(text: &str) -> Result<(String, Option<String>), CalcError>
         return Err(syntax(format!("{name} isn't a valid name for a calculation data column")));
     }
     check_name(name)?;
-    if let Some(unit) = unit {
-        parse_unit(unit)?;
-    }
-    Ok((name.to_string(), unit.map(str::to_string)))
+    Ok(name)
 }
 
 /// What a data cell's text means: a number and the unit written after it, if any. The number is a
@@ -183,19 +189,56 @@ fn has_live_object(p: &Paragraph) -> bool {
     p.text.char_indices().any(|(i, c)| c == OBJ && !deleted.iter().any(|r| r.contains(&i)))
 }
 
-/// The name column `col`'s heading gives, when it reads: what a column whose values don't read
-/// still owns, so the calculations using it say the table has an error.
+/// The name column `col`'s heading gives, whenever its name part reads — whatever its unit says
+/// and whatever else the cell holds: what a column in error still owns, so the calculations using
+/// it say the table has an error (and a later definition of the name is a duplicate).
 pub(crate) fn column_name(t: &Table, col: u32) -> Option<String> {
     let cell = t.rows.first()?.cells.get(usize::try_from(col).ok()?)?;
-    heading(&cell_text(cell).ok()?).ok().map(|(name, _)| name)
+    // The first paragraph with text, its objects and tracked deletions left out.
+    let text = cell.blocks.iter().find_map(|b| match &**b {
+        Block::Para(p) => {
+            let deleted = p.deleted_ranges();
+            let text: String = p.text.char_indices().filter(|&(i, c)| c != OBJ && !deleted.iter().any(|r| r.contains(&i))).map(|(_, c)| c).collect();
+            Some(text).filter(|t| !t.trim().is_empty())
+        }
+        Block::Table(_) => None,
+    })?;
+    heading_name(text.trim()).ok().map(str::to_string)
 }
 
+/// Whether `cells` hold text and all of it, at any depth, is tracked-deleted: a row (or table)
+/// deleted with tracking on, which the model keeps as text marked deleted.
+pub(crate) fn deleted_only<'a>(cells: impl IntoIterator<Item = &'a Cell>) -> bool {
+    let mut deleted = false;
+    let mut todo: Vec<&Block> = cells.into_iter().flat_map(|c| c.blocks.iter().map(|b| &**b)).collect();
+    while let Some(b) = todo.pop() {
+        match b {
+            Block::Para(p) => {
+                for (range, props) in p.run_ranges() {
+                    if range.is_empty() {
+                        continue;
+                    }
+                    if props.del.is_none() {
+                        return false;
+                    }
+                    deleted = true;
+                }
+            }
+            Block::Table(t) => todo.extend(t.rows.iter().flat_map(|r| &r.cells).flat_map(|c| c.blocks.iter().map(|b| &**b))),
+        }
+    }
+    deleted
+}
+
+const NO_VALUES: &str = "a calculation data table needs a row of headings and at least one row of values";
+
 /// What is wrong with `t`'s shape as calculation data, if anything: fewer than two rows, a merged
-/// cell, more than [`MAX_COLS`] columns, or a row without exactly one cell per heading.
+/// cell, more than [`MAX_COLS`] columns, a heading row (repeated on each page) after the first
+/// row, or a row without exactly one cell per heading.
 fn shape_error(t: &Table) -> Option<CalcError> {
     let head = t.rows.first().map_or(0, |r| r.cells.len());
     if t.rows.len() < 2 || head == 0 {
-        return Some(syntax("a calculation data table needs a row of headings and at least one row of values"));
+        return Some(syntax(NO_VALUES));
     }
     let cells = || t.rows.iter().flat_map(|r| &r.cells);
     if cells().any(|c| c.span() > 1 || c.props.vmerge != VMerge::None) {
@@ -203,6 +246,9 @@ fn shape_error(t: &Table) -> Option<CalcError> {
     }
     if head > MAX_COLS {
         return Some(syntax(format!("a calculation data table can have at most {MAX_COLS} columns")));
+    }
+    if t.rows.iter().skip(1).any(|r| r.props.header) {
+        return Some(syntax("only the first row of a calculation data table can be a heading row"));
     }
     if t.rows.iter().any(|r| r.cells.len() != head || r.props.grid_before > 0 || r.props.grid_after > 0) {
         return Some(syntax("every row of a calculation data table needs one cell in each column"));
@@ -216,25 +262,30 @@ fn shape_error(t: &Table) -> Option<CalcError> {
 /// unit keeps it (`21.3 mm` under `D_o (in)`); one of another dimension is an error. When `g` is
 /// gravity, a unit spelled with `g` is refused, naming `gm`.
 ///
+/// A row deleted with tracking on (all its text tracked-deleted) is skipped: it adds no value.
+/// Rows are still named by their place in the table, so a message points at the row as shown.
+///
 /// When the whole table is in error (merged cells, a ragged row, no values), every column is
 /// [`CalcError::UpstreamTable`], so what it defines is in error rather than undefined.
 pub(crate) fn column_stmts(t: &Table, g_is_gravity: bool) -> (Vec<(u32, Result<Stmt, CalcError>)>, Option<CalcError>) {
-    let error = shape_error(t);
+    // The data rows that aren't tracked-deleted, by their place in the table.
+    let live: Vec<usize> = t.rows.iter().enumerate().skip(1).filter(|(_, r)| !deleted_only(&r.cells)).map(|(k, _)| k).collect();
+    let error = shape_error(t).or_else(|| live.is_empty().then(|| syntax(NO_VALUES)));
     let mut env = Env::new();
     env.set_g_is_gravity(g_is_gravity);
     let count = t.rows.first().map_or(0, |r| r.cells.len()).min(MAX_COLS);
     let stmts = (0..count)
         .map(|c| {
             let col = u32::try_from(c).unwrap_or(u32::MAX);
-            let stmt = if error.is_some() { Err(CalcError::UpstreamTable) } else { column(t, c, &env) };
+            let stmt = if error.is_some() { Err(CalcError::UpstreamTable) } else { column(t, c, &live, &env) };
             (col, stmt)
         })
         .collect();
     (stmts, error)
 }
 
-/// The definition column `c` of `t` makes. `t`'s shape has been checked.
-fn column(t: &Table, c: usize, env: &Env) -> Result<Stmt, CalcError> {
+/// The definition column `c` of `t` makes from the data rows `live`. `t`'s shape has been checked.
+fn column(t: &Table, c: usize, live: &[usize], env: &Env) -> Result<Stmt, CalcError> {
     let head = t.rows.first().and_then(|r| r.cells.get(c)).ok_or(CalcError::UpstreamTable)?;
     let text = cell_text(head).map_err(|e| syntax(format!("the heading of column {} {e}", c.saturating_add(1))))?;
     let (name, unit) = heading(&text)?;
@@ -242,14 +293,14 @@ fn column(t: &Table, c: usize, env: &Env) -> Result<Stmt, CalcError> {
         env.check_display_unit(unit)?;
     }
     let dim = unit.as_deref().map(parse_unit).transpose()?.map(|s| s.dim);
-    let values = t.rows.len().saturating_sub(1);
+    let values = live.len();
     if values > MAX_ELEMENTS {
         return Err(CalcError::TooLarge);
     }
     let mut items = Vec::with_capacity(values);
-    for (k, row) in t.rows.iter().enumerate().skip(1) {
+    for &k in live {
         let at = |message: &str| syntax(format!("{name} row {k} {message}"));
-        let cell = row.cells.get(c).ok_or_else(|| at("isn't a number"))?;
+        let cell = t.rows.get(k).and_then(|r| r.cells.get(c)).ok_or_else(|| at("isn't a number"))?;
         let text = cell_text(cell).map_err(|e| at(&e))?;
         let (value, own) = cell_value(&text).map_err(|e| at(&e))?;
         let item = match (own, &unit) {

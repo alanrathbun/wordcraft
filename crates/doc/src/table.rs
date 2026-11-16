@@ -277,8 +277,10 @@ impl Table {
             grid: self.grid.clone(),
             rows: self.rows.split_off(at),
             controls: ControlWrap { open: Vec::new(), close: std::mem::take(&mut self.controls.close) },
-            // One table's data split in two would define every column twice: the tail is plain.
-            calc: None,
+            // Calculation data split in two stays data in both parts: recalculation gives the tail an
+            // id of its own and reads its first row as headings, so the split shows as errors rather
+            // than as silently shorter vectors.
+            calc: self.calc.clone(),
         };
         if let Some(last) = self.rows.last_mut() {
             last.controls.close = last.controls.close.saturating_add(u32::try_from(open.len()).unwrap_or(u32::MAX));
@@ -717,7 +719,8 @@ mod tests {
         assert!(t.slice((0, 2), (9, 9)).rows.is_empty());
     }
 
-    /// A calculation data table copied whole stays data; part of one is a plain table.
+    /// A calculation data table copied whole stays data, and so do both parts of a split; part of
+    /// one copied is a plain table.
     #[test]
     fn slice_keeps_the_calculation_data_mark_only_whole() {
         let mut t = Table::new(3, 3, 300.0);
@@ -725,7 +728,7 @@ mod tests {
         assert_eq!(t.slice((0, 2), (0, 2)).calc, t.calc);
         assert_eq!(t.slice((0, 1), (0, 2)).calc, None);
         assert_eq!(t.slice((0, 2), (1, 2)).calc, None);
-        assert_eq!(t.split_off(1).calc, None);
+        assert_eq!(t.split_off(1).calc, t.calc, "both parts of a split stay data");
         assert!(t.calc.is_some());
     }
 

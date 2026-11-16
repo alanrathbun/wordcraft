@@ -1667,6 +1667,89 @@ fn typing_outside_tables_skips_the_pass() {
 }
 
 #[test]
+fn heading_with_a_bad_unit_still_owns_its_name() {
+    let rows: &[&[&str]] = &[&["D_o (furlongs)", "t (in)"], &["1", "2"]];
+    let mut d = doc_of(vec![
+        table_block(data_table(1, rows)),
+        para_block(para(vec![calc_eq(1, "x := D_o =")])),
+        para_block(para(vec![calc_eq(2, "D_o := 1 in")])),
+    ]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, CalcState::Error("depends on table data with an error".into()));
+    assert_eq!(region(&d, 2).0.state, err(CalcError::Duplicate { name: "D_o".into(), page: None }));
+    let errors = table_calc(&d, 0).errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].col, Some(0));
+    assert!(errors[0].message.contains("furlongs"), "{errors:?}");
+    // A heading holding an object, or text in two paragraphs, still names its column.
+    let mut t = data_table(1, &[&["E_h", "F_h (in)"], &["1", "2"]]);
+    let mut head = Paragraph::with_text("E_h ", CharProps::default());
+    head.insert_object(head.text.len(), field("PAGE"), &CharProps::default()).unwrap();
+    t.rows[0].cells[0].blocks = vec![para_block(head)];
+    t.rows[0].cells[1].blocks =
+        vec![para_block(Paragraph::with_text("F_h", CharProps::default())), para_block(Paragraph::with_text("(in)", CharProps::default()))];
+    let mut d = doc_of(vec![table_block(t), para_block(para(vec![calc_eq(1, "E_h + F_h =")])), para_block(para(vec![calc_eq(2, "F_h := 1")]))]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 1).0.state, err(CalcError::UpstreamTable));
+    assert_eq!(region(&d, 2).0.state, err(CalcError::Duplicate { name: "F_h".into(), page: None }));
+    let cols: Vec<Option<u32>> = table_calc(&d, 0).errors.iter().map(|e| e.col).collect();
+    assert_eq!(cols, [Some(0), Some(1)]);
+}
+
+#[test]
+fn a_second_heading_row_is_an_error() {
+    let mut d = pipe_doc(PIPES);
+    table_mut(&mut d, 0).rows[0].props.header = true;
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, [], "the first row may repeat as a heading row");
+    table_mut(&mut d, 0).rows[2].props.header = true;
+    recalc(&mut d, &no_page);
+    let error = ColumnError { col: None, message: "only the first row of a calculation data table can be a heading row".into() };
+    assert_eq!(table_calc(&d, 0).errors, [error]);
+    assert_eq!(region(&d, 5).0.state, err(CalcError::UpstreamTable));
+}
+
+#[test]
+fn a_split_data_table_stays_data_in_both_parts() {
+    let mut head = data_table(1, PIPES);
+    let tail = head.split_off(2);
+    assert_eq!(tail.calc, head.calc);
+    let mut d = doc_of(vec![table_block(head), table_block(tail), para_block(para(vec![calc_eq(1, "x := D_o =")]))]);
+    assert_eq!(data_tables(&d), [(vec![0], 1), (vec![1], 2)]);
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0), CalcTable { id: 1, errors: Vec::new() });
+    // The tail's first row is read as headings: every column is in error, never silently short.
+    let tail = table_calc(&d, 1);
+    assert_eq!(tail.id, 2);
+    let cols: Vec<Option<u32>> = tail.errors.iter().map(|e| e.col).collect();
+    assert_eq!(cols, [Some(0), Some(1), Some(2)], "{:?}", tail.errors);
+}
+
+#[test]
+fn tracked_deleted_rows_are_skipped() {
+    let mut d = pipe_doc(PIPES);
+    d.revisions.push(wordcraft_doc::Revision::new(wordcraft_doc::RevisionKind::Delete, "me", "2026-11-15T00:00:00Z"));
+    let deleted = CharProps { del: Some(0), ..Default::default() };
+    // Row 2 deleted with tracking on: all of its text is marked deleted.
+    for (c, text) in PIPES[2].iter().enumerate() {
+        table_mut(&mut d, 0).rows[2].cells[c].blocks = vec![para_block(Paragraph::with_text(text, deleted.clone()))];
+    }
+    // Row 3 has only some text deleted: it reads what is left.
+    let mut p = Paragraph::with_text("1.315", CharProps::default());
+    p.insert_text(p.text.len(), "9", &deleted).unwrap();
+    table_mut(&mut d, 0).rows[3].cells[1].blocks = vec![para_block(p)];
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, []);
+    assert!(region(&d, 5).1.ends_with("=[■(0.021@0.032)] \"in\""), "{}", region(&d, 5).1);
+    assert!(region(&d, 6).1.ends_with("=[■(0.088@0.101)] \"in\""), "{}", region(&d, 6).1);
+    // A row with one cell's text all deleted but the rest live isn't deleted: the cell is blank.
+    let mut d = pipe_doc(PIPES);
+    table_mut(&mut d, 0).rows[2].cells[1].blocks = vec![para_block(Paragraph::with_text("1.050", deleted))];
+    recalc(&mut d, &no_page);
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(1), message: "D_o row 2 isn't a number".into() }]);
+}
+
+#[test]
 fn data_cells_hold_numbers_only() {
     // A calculation in a data cell: an error for its column, though the calculation still works.
     let mut t = data_table(1, &[&["a", "b"], &["1", "2"]]);

@@ -84,7 +84,7 @@ pub(super) fn to_text(s: &mut Session, v: &Value) -> CmdResult {
     t.controls.close = std::mem::take(&mut tail.controls.close);
     let mut blocks = Vec::new();
     if !t.rows.is_empty() {
-        // The part above keeps a calculation-data mark, as `split_off` leaves it on the first part.
+        // The part above keeps a calculation-data mark, as `split_off` leaves it on both parts.
         let mut head = Table {
             props: t.props.clone(),
             grid: t.grid.clone(),
