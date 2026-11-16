@@ -1304,6 +1304,38 @@ fn edited_table_notice() {
     );
 }
 
+/// A text cell changed in Word: the table's fingerprint sees it, the status line says so, and a
+/// lookup of the old text fails while one of an untouched row still works.
+#[test]
+fn edited_text_column_notice() {
+    let mut s = session();
+    let t = typed_table(&mut s, &[&["Material (text)", "S (ksi)"], &["A106 B", "20"], &["A312 TP316", "17"]]);
+    caret_in_cell(&mut s, t, 0, 0, 0);
+    run(&mut s, "calc.dataTable", json!({"on": true}));
+    run(&mut s, "caret.docEnd", json!({}));
+    let old = calc(&mut s, "lookup(Material, S, \"A106 B\") = ? ksi");
+    let kept = calc(&mut s, "lookup(Material, S, \"A312 TP316\") = ? ksi");
+    shows(&s, old, "=20 \"ksi\"");
+    shows(&s, kept, "=17 \"ksi\"");
+    let bytes = crate::io::save_bytes("materials.docx", &s.doc).unwrap();
+    let open = |edited: &[u8]| {
+        let mut back = Session::new(Document::new());
+        run(&mut back, "file.open", json!({"path": "materials.docx", "data": crate::cmd::insert::base64_encode(edited)}));
+        back
+    };
+    let back = open(&bytes);
+    assert!(!back.status.contains("edited in Word"), "{}", back.status);
+    shows(&back, old, "=20 \"ksi\"");
+    let back = open(&edit_in_word(&bytes, |xml| {
+        assert!(xml.contains(">A106 B<"));
+        xml.replace(">A106 B<", ">A106 C<")
+    }));
+    assert_eq!(back.status, "Calculation data was edited in Word in 1 table; results were recalculated");
+    assert_eq!(table_mark(&back, t).map(|c| c.errors), Some(Vec::new()));
+    assert_eq!(region(&back, old).0.state, CalcState::Error("\"A106 B\" isn't in Material".into()));
+    shows(&back, kept, "=17 \"ksi\"");
+}
+
 /// Calculations nested as deep as the evaluator allows (32 calls of your own functions, each
 /// through 60 `abs`) recalculate on a 1 MB stack, the size of the Windows main thread's, however
 /// the pass is reached: an edit, Recalculate, quoting a value, changing the options, or opening

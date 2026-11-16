@@ -2,6 +2,8 @@
 //!
 //! - An ASME B31.3 minimum wall thickness check over a table of pipe sizes, edited, saved to
 //!   `.docx`, reopened and edited again.
+//! - A materials table with a text column, read with a text `lookup`, a piecewise and a sum,
+//!   saved, reopened and edited again.
 //! - A flange torque table read with `lookup` and `linterp`.
 
 use serde_json::{Value, json};
@@ -121,9 +123,17 @@ const PIPES: &[&[&str]] =
 fn pipe_wall() -> Session {
     let mut s = session();
     data_table(&mut s, PIPES);
-    for source in
-        ["P := 1000 psi", "S := 20000 psi", "E := 1", "Y := 0.4", "t_min := P·D_o/(2·(S·E + P·Y)) =", "margin := t_nom - t_min =", "min(margin) ="]
-    {
+    for source in [
+        "P := 1000 psi",
+        "S := 20000 psi",
+        "E := 1",
+        "Y := 0.4",
+        "t_min := P·D_o/(2·(S·E + P·Y)) =",
+        "margin := t_nom - t_min =",
+        "min(margin) =",
+        "check := \"OK\" if margin ≥ 0 in, \"NG\" otherwise =",
+        "n_NG := sum(check == \"NG\") =",
+    ] {
         calc(&mut s, source);
     }
     run(&mut s, "text.insert", json!({"text": "Wall thickness at each size: "}));
@@ -160,7 +170,7 @@ fn assert_pipe_wall_results(s: &Session) {
 #[test]
 fn pipe_wall_sample() {
     let s = pipe_wall();
-    assert_eq!(regions(&s).len(), 7);
+    assert_eq!(regions(&s).len(), 9);
     assert_pipe_wall_results(&s);
 }
 
@@ -190,7 +200,7 @@ fn pipe_wall_sample_reopens_live() {
     let mut back = session();
     run(&mut back, "file.open", json!({"path": "pipes.docx", "data": crate::cmd::insert::base64_encode(&bytes)}));
     assert!(!back.status.contains("edited in Word"), "{}", back.status);
-    assert_eq!(regions(&back).len(), 7);
+    assert_eq!(regions(&back).len(), 9);
     assert_pipe_wall_results(&back);
     for (r, linear) in regions(&s) {
         assert_eq!(region(&back, &r.source).1, linear, "{}", r.source);
@@ -198,6 +208,73 @@ fn pipe_wall_sample_reopens_live() {
     // Live: a cell edit after reopening still flows through.
     retype_cell(&mut back, 2, 2, "0.120");
     shows(&back, "min(margin)", "=0.088 \"in\"");
+}
+
+#[test]
+fn pipe_wall_check_flips_per_size() {
+    let mut s = pipe_wall();
+    shows(&s, "check", "=[■(\"OK\"@\"OK\"@\"OK\")]");
+    shows(&s, "n_NG", "=0");
+    retype_cell(&mut s, 2, 2, "0.020");
+    shows(&s, "check", "=[■(\"OK\"@\"NG\"@\"OK\")]");
+    shows(&s, "n_NG", "=1");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Materials: text lookup, a piecewise and a sum
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn materials_sample_reopens_live_with_a_word_edit() {
+    let mut s = session();
+    data_table(&mut s, &[&["Material (text)", "S (ksi)"], &["A106 B", "20"], &["A312 TP316", "20"]]);
+    calc(&mut s, "S_allow := lookup(Material, S, \"A312 TP316\") = ? ksi");
+    calc(&mut s, "Y := 0.4 if S_allow ≤ 20 ksi, 0.7 otherwise =");
+    calc(&mut s, "Σ_S := ∑(i = 0..length(S) - 1) S[i] = ? ksi");
+    shows(&s, "S_allow", "=20 \"ksi\"");
+    shows(&s, "Y", "≔{■(0.4&\"if \"S_allow≤20 \"ksi\"@0.7&\"otherwise\")┤=0.4");
+    shows(&s, "Σ_S", "≔∑_(i=0)^(length(S)-1)▒〖S_i〗=40 \"ksi\"");
+    let bytes = crate::io::save_bytes("materials.docx", &s.doc).unwrap();
+    let mut back = session();
+    run(&mut back, "file.open", json!({"path": "materials.docx", "data": crate::cmd::insert::base64_encode(&bytes)}));
+    assert!(!back.status.contains("edited in Word"), "{}", back.status);
+    for (r, linear) in regions(&s) {
+        assert_eq!(region(&back, &r.source).1, linear, "{}", r.source);
+    }
+    retype_cell(&mut back, 2, 1, "16.7");
+    shows(&back, "S_allow", "=16.7 \"ksi\"");
+    shows(&back, "Y", "=0.4");
+    shows(&back, "Σ_S", "=36.7 \"ksi\"");
+}
+
+/// Every new display, saved to `.docx` and reopened: and/or/not, `==`, `≠`, quoted text with a
+/// space, `if(…)`, a three-case brace and a parenthesised sum body read back unchanged and live.
+#[test]
+fn conditions_text_and_sums_reopen_unchanged() {
+    let mut s = session();
+    for source in [
+        "a := 2",
+        "b := (a > 1 and a < 3) or not (a == 2) =",
+        "c := if(a ≠ 2, \"x y\", \"z\") =",
+        "d := ∑(i = 1..3) (i + a) =",
+        "f_2 := 1 if a < 0, 2 if a < 1, 3 otherwise =",
+    ] {
+        calc(&mut s, source);
+    }
+    shows(&s, "b", "≔a>1∧a<3∨¬a==2=1");
+    shows(&s, "c", "≔if(a≠2,\"x y\",\"z\")=\"z\"");
+    shows(&s, "d", "≔∑_(i=1)^3▒〖(i+a)〗=12");
+    shows(&s, "f_2", "≔{■(1&\"if \"a<0@2&\"if \"a<1@3&\"otherwise\")┤=3");
+    let bytes = crate::io::save_bytes("conditions.docx", &s.doc).unwrap();
+    let mut back = session();
+    run(&mut back, "file.open", json!({"path": "conditions.docx", "data": crate::cmd::insert::base64_encode(&bytes)}));
+    assert!(!back.status.contains("edited in Word"), "{}", back.status);
+    assert_eq!(regions(&back).len(), 5);
+    for (r, linear) in regions(&s) {
+        let (b, back_linear) = region(&back, &r.source);
+        assert_eq!(b.state, CalcState::Fresh, "{}", r.source);
+        assert_eq!(back_linear, linear, "{}", r.source);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

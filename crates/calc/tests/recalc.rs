@@ -2031,6 +2031,33 @@ fn perf_1000_element_piecewise() {
     assert!(took.as_millis() < 100, "recalc took {took:?}");
 }
 
+/// The plan's sample shape: a pass/fail check and its count over a 1,000-row column, and 50
+/// element-wise piecewise regions. (The column is `w`: `m` is the metre.)
+#[test]
+#[ignore = "timing: run with --release -- --ignored perf_1000_element_piecewise_regions"]
+fn perf_1000_element_piecewise_regions() {
+    let values: Vec<String> = (0..1000).map(|i| format!("{}.5", i % 37)).collect();
+    let mut rows: Vec<Vec<&str>> = vec![vec!["w (in)"]];
+    rows.extend(values.iter().map(|v| vec![v.as_str()]));
+    let rows: Vec<&[&str]> = rows.iter().map(Vec::as_slice).collect();
+    let mut sources = vec!["check := \"OK\" if w ≥ 10 in, \"NG\" otherwise".to_string(), "n := sum(check == \"NG\") =".to_string()];
+    sources.extend((0..50).map(|k| format!("y_{k} := w·1.001 if w > {k} in, w otherwise")));
+    let mut blocks = vec![table_block(data_table(1, &rows))];
+    blocks.extend(sources.iter().enumerate().map(|(i, s)| para_block(para(vec![calc_eq(i as u64 + 1, s)]))));
+    let mut d = doc_of(blocks);
+    recalc(&mut d, &no_page);
+    let _snapshot = d.clone();
+    set_cell(&mut d, 0, 1, 0, "2 in");
+    let start = Instant::now();
+    let report = recalc(&mut d, &no_page);
+    let took = start.elapsed();
+    println!("perf_1000_element_piecewise_regions: {took:?}");
+    assert_eq!(report.regions, 52);
+    assert_eq!(report.errors, 0, "{:?}", regions(&d).iter().map(|r| r.0.state.clone()).collect::<Vec<_>>());
+    assert!(region(&d, 2).1.ends_with("=271"), "{}", region(&d, 2).1);
+    assert!(took.as_millis() < 100, "recalc took {took:?}");
+}
+
 #[test]
 fn a_sum_index_defined_elsewhere_is_reported() {
     let mut d = doc_with(&["tot := ∑(i = 1..3) i =", "i := 0..5"]);
