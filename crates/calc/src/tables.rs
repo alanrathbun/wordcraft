@@ -86,16 +86,17 @@ fn heading_name(text: &str) -> Result<&str, CalcError> {
 }
 
 /// What a text column's cell holds: its text, which `cell_text` has trimmed. Empty, holding a
-/// quote mark (a text can't) or too long is an error saying so, to follow the column's name and row.
-fn text_cell(text: &str) -> Result<String, &'static str> {
+/// quote mark (`"`, `“` or `”`: a text can't) or too long is an error saying so, to follow the column's name and row.
+fn text_cell(text: &str) -> Result<String, String> {
     if text.is_empty() {
-        return Err("is empty");
+        return Err("is empty".to_string());
     }
-    if text.contains('"') {
-        return Err("has a quote mark \", which text can't hold");
+    // Any of the three: a typed `"` becomes `”` under smart quotes, and no literal could match it.
+    if let Some(mark) = text.chars().find(|c| matches!(c, '"' | '“' | '”')) {
+        return Err(format!("has a quote mark {mark}, which text can't hold"));
     }
     if text.chars().nth(MAX_TEXT_CHARS).is_some() {
-        return Err("is longer than 1,000 characters");
+        return Err("is longer than 1,000 characters".to_string());
     }
     Ok(text.to_string())
 }
@@ -348,7 +349,7 @@ fn column(t: &Table, c: usize, live: &[usize], env: &Env) -> Result<Stmt, CalcEr
         let cell = t.rows.get(k).and_then(|r| r.cells.get(c)).ok_or_else(|| at("isn't a number"))?;
         let text = cell_text(cell).map_err(|e| at(&e))?;
         if text_column {
-            items.push(Expr::Text(text_cell(&text).map_err(at)?));
+            items.push(Expr::Text(text_cell(&text).map_err(|e| at(&e))?));
             continue;
         }
         let (value, own) = cell_value(&text).map_err(|e| at(&e))?;
@@ -399,10 +400,12 @@ mod tests {
     fn text_cells_are_checked() {
         assert_eq!(text_cell("A106 B"), Ok("A106 B".to_string()));
         assert_eq!(text_cell("6"), Ok("6".to_string()));
-        assert_eq!(text_cell(""), Err("is empty"));
-        assert_eq!(text_cell("1/2\" pipe"), Err("has a quote mark \", which text can't hold"));
+        assert_eq!(text_cell(""), Err("is empty".to_string()));
+        for mark in ['"', '“', '”'] {
+            assert_eq!(text_cell(&format!("1/2{mark} pipe")), Err(format!("has a quote mark {mark}, which text can't hold")));
+        }
         assert!(text_cell(&"x".repeat(MAX_TEXT_CHARS)).is_ok());
-        assert_eq!(text_cell(&"x".repeat(MAX_TEXT_CHARS + 1)), Err("is longer than 1,000 characters"));
+        assert_eq!(text_cell(&"x".repeat(MAX_TEXT_CHARS + 1)), Err("is longer than 1,000 characters".to_string()));
     }
 
     #[test]

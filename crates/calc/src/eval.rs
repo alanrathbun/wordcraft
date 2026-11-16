@@ -271,6 +271,12 @@ impl Pass {
         Pass { spent: Cell::new(0), limit }
     }
 
+    /// The steps counted so far.
+    #[cfg(test)]
+    pub(crate) fn spent(&self) -> u64 {
+        self.spent.get()
+    }
+
     /// Count `n` steps of work: [`CalcError::TooMuchWork`], with nothing counted, once that would
     /// pass the limit.
     pub(crate) fn charge(&self, n: u64) -> Result<(), CalcError> {

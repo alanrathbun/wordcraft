@@ -2094,11 +2094,41 @@ fn text_lookups_follow_the_kinds_and_refuse_a_mismatch() {
         para_block(para(vec![calc_eq(8, "a := lookup(Material, Sa, [\"A333  6\", \"A106 B\"]) =")])),
         para_block(para(vec![calc_eq(9, "b := lookup(Material, Sa, 20 ksi) =")])),
         para_block(para(vec![calc_eq(10, "c := lookup(Sa, Material, \"A106 B\") =")])),
-        para_block(para(vec![calc_eq(11, "e := lookup(Material, Material, [\"A106 B\", \"A333 6\"]) =")])),
+        para_block(para(vec![calc_eq(11, "pair := lookup(Material, Material, [\"A106 B\", \"A333 6\"]) =")])),
     ]);
     recalc(&mut d, &no_page);
     assert!(region(&d, 8).1.ends_with("=[■(20000@20000)] \"psi\""), "{}", region(&d, 8).1);
     assert_eq!(region(&d, 9).0.state, CalcState::Error("can't compare \"A106 B\" with a number".into()));
     assert_eq!(region(&d, 10).0.state, CalcState::Error("can't compare \"A106 B\" with a number".into()));
-    assert!(region(&d, 11).1.contains("A106 B"), "{}", region(&d, 11).1);
+    assert_eq!(region(&d, 11).0.state, CalcState::Fresh);
+    assert!(region(&d, 11).1.ends_with("=[■(\"A106 B\"@\"A333 6\")]"), "{}", region(&d, 11).1);
+}
+
+#[test]
+fn numbers_look_up_texts_and_equal_text_keys_are_duplicates() {
+    const GRADES: &[&[&str]] = &[&["Grade (text)", "P (psi)"], &["A106 B", "100"], &["A106  B", "200"], &["A333 6", "300"]];
+    let mut d = doc_of(vec![
+        table_block(data_table(1, GRADES)),
+        para_block(para(vec![calc_eq(8, "grade_a := lookup(P, Grade, 300 psi) =")])),
+        para_block(para(vec![calc_eq(9, "p_dup := lookup(Grade, P, \"A106 B\") =")])),
+        para_block(para(vec![calc_eq(10, "p_ok := lookup(Grade, P, \"A333  6\") =")])),
+    ]);
+    recalc(&mut d, &no_page);
+    assert_eq!(region(&d, 8).0.state, CalcState::Fresh);
+    assert!(region(&d, 8).1.ends_with("=\"A333 6\""), "{}", region(&d, 8).1);
+    // `A106 B` and `A106  B` are the same text, so which row is meant is a question.
+    assert_eq!(region(&d, 9).0.state, CalcState::Error("\"A106 B\" matches more than one value in Grade".into()));
+    assert_eq!(region(&d, 10).0.state, CalcState::Fresh);
+    assert!(region(&d, 10).1.ends_with("=300 \"psi\""), "{}", region(&d, 10).1);
+}
+
+#[test]
+fn a_quote_mark_of_any_kind_is_refused_in_a_text_cell() {
+    let mut d = doc_of(vec![table_block(data_table(1, MATERIALS))]);
+    for mark in ["\"", "“", "”"] {
+        set_cell(&mut d, 0, 2, 0, &format!("1/2{mark} pipe"));
+        recalc(&mut d, &no_page);
+        let message = format!("Material row 2 has a quote mark {mark}, which text can't hold");
+        assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
+    }
 }

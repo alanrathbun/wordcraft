@@ -316,12 +316,13 @@ fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError
     check_vector("lookup", xs, xs_name)?;
     check_vector("lookup", ys, ys_name)?;
     same_length("lookup", (xs_name, count(xs)), (ys_name, count(ys)))?;
-    // Every element of `x` is compared with every element of `xs`; texts are read by their size.
-    let pairs = count(x).saturating_add(1).saturating_mul(count(xs));
-    cx.pass.charge(pairs_work(pairs, text_work(xs).saturating_add(text_work(x))))?;
+    // Texts are read (and keyed) by their size.
+    cx.pass.charge(text_work(xs).saturating_add(text_work(x)))?;
     let (xs_text, x_text) = (xs.text(), x.text());
     let found: Vec<usize> = match (xs_text, x_text) {
         (None, None) => {
+            // Every element of `x` is compared with every element of `xs`.
+            charge(cx, count(x).saturating_add(1).saturating_mul(count(xs)))?;
             let xv = items(xs);
             let dim = one_dim(xv, xs_name, cx.origin)?;
             let results = items(x).iter().map(|x| {
@@ -332,9 +333,15 @@ fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError
             positions(x, cx.origin, results)?
         }
         (Some(_), Some(_)) => {
+            charge(cx, count(xs))?;
             let keys: Vec<String> = texts(xs).iter().map(|s| array::text_key(s)).collect();
+            let steps: Vec<u64> = keys.iter().map(|k| array::text_steps(k)).collect();
             let results = texts(x).iter().map(|text| {
                 let key = array::text_key(text);
+                // Comparing two texts costs one step and the size of the shorter, as `==` does
+                // (a mismatch ends at the shorter). Charged before this element is searched.
+                let own = array::text_steps(&key);
+                cx.pass.charge(steps.iter().fold(0u64, |n, &k| n.saturating_add(own.min(k)).saturating_add(1)))?;
                 let matches = keys.iter().enumerate().filter(|(_, k)| **k == key).map(|(i, _)| i);
                 unique(matches, xs_name, || format!("\"{}\"", cut_text(text)))
             });
@@ -343,11 +350,6 @@ fn lookup(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data, CalcError
         (Some(text), None) | (None, Some(text)) => return Err(CalcError::Syntax(format!("can't compare \"{}\" with a number", cut_text(text)))),
     };
     gather(ys, ys_name, &found, x.shape(), cx)
-}
-
-/// The work of `pairs` comparisons and `text` steps of reading texts.
-fn pairs_work(pairs: usize, text: u64) -> u64 {
-    u64::try_from(pairs).unwrap_or(u64::MAX).saturating_add(text)
 }
 
 /// The one element index of `matches`: none is "isn't in", and two or more is "matches more than
@@ -496,4 +498,34 @@ fn second_derivatives(x: &[f64], y: &[f64]) -> Vec<f64> {
         }
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The steps `lookup(keys, 1.., x)` costs.
+    fn lookup_cost(keys: &[String], x: &str) -> u64 {
+        let n = keys.len();
+        let xs = Data::TextGrid(Grid::new(n, 1, keys.to_vec()).expect("grid"));
+        let ys = Data::Grid(Grid::new(n, 1, (0..n).map(|k| Val::plain(Quantity::dimensionless(k as f64))).collect()).expect("grid"));
+        let pass = Pass::new(u64::MAX);
+        let cx = Ctx { origin: 1, pass: &pass, system: UnitSystem::Si, precision: Precision::new(4) };
+        // A sought text that isn't there is an error, after the same work.
+        let _ = call_array("lookup", &[xs, ys, Data::Text(x.to_string())], &[], &cx);
+        pass.spent()
+    }
+
+    #[test]
+    fn long_texts_cost_more_to_look_up() {
+        let (short, long) = (vec!["a".to_string(); 10], vec!["a".repeat(1000); 10]);
+        let (cheap, dear) = (lookup_cost(&short, "a"), lookup_cost(&long, &"a".repeat(1000)));
+        // Short texts: 10 keys read, then 10 comparisons of 1 step each.
+        assert_eq!(cheap, 10 + 10);
+        // 1000 characters are 31 steps of 32 bytes. The 10 keys and the sought text are read (11 · 31),
+        // then each of the 10 comparisons costs 1 + 31, as `==` on texts does.
+        assert_eq!(dear, 11 * 31 + 10 + 10 * (1 + 31));
+        // A short sought text against long keys costs the shorter side's size per comparison.
+        assert_eq!(lookup_cost(&long, "a"), 10 * 31 + 10 + 10);
+    }
 }
