@@ -32,7 +32,10 @@ A name can't be a unit, a built-in function or a constant. That rules out `m`, `
 `R_u` and the rest (`h`, `lb` and `R` are not units, so they are free). Use a subscript instead:
 `A_b`, `L_1`. A subscript can't be empty (`a__b` and `x_` are refused). The array
 functions (`sum`, `length`, `lookup` and the rest; see
-[Vectors, matrices and data tables](#vectors-matrices-and-data-tables)) are reserved too.
+[Vectors, matrices and data tables](#vectors-matrices-and-data-tables)) are reserved too. A
+definition that uses one of these names shows the reserved-name error, and every calculation that
+uses the name shows "depends on a calculation with an error" until the definition is renamed: the
+name never quietly means the unit, function or constant instead.
 
 ## Constants
 

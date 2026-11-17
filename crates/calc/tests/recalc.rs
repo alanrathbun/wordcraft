@@ -246,6 +246,7 @@ fn a_name_refused_as_a_unit_function_or_constant_fails_its_uses() {
         ("g_0 := 32", "y := 2·g_0 =", "g_0"),
         // A function's name, the same way: the use points at the failed definition.
         ("slope := 0.02", "y := slope·100 ft =", "slope"),
+        ("max := 10", "y := max(1, 2) =", "max"),
     ];
     for &(define, using, name) in cases {
         for sources in [[define, using], [using, define]] {
