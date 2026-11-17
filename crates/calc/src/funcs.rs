@@ -210,6 +210,10 @@ fn modulo(args: &[Quantity]) -> Result<Quantity, CalcError> {
     number(r, merge(a.dim, b.dim))
 }
 
+/// How close, relative to the ratio, `x / y` snaps to an exact case: 4 ulps. A conversion and a
+/// division leave the ratio 1 ulp off in the cases found; relative only, so a tiny ratio never snaps.
+const SNAP: f64 = 4.0 * f64::EPSILON;
+
 /// Mathcad's `Ceil(x, y)`, `Floor(x, y)` and `Round(x, y)`: `x` to a multiple of the step `y`
 /// (`Round` takes halves away from zero). `x` and `y` agree in dimension, the step is above 0, and
 /// the result has `x`'s dimension.
@@ -228,6 +232,6 @@ fn to_multiple(name: &str, args: &[Quantity], pick: fn(f64) -> f64, grid: f64) -
     }
     let ratio = x.value / y.value;
     let exact = (ratio / grid).round() * grid;
-    let ratio = if (ratio - exact).abs() <= 1e-12 * ratio.abs().max(1.0) { exact } else { ratio };
+    let ratio = if (ratio - exact).abs() <= SNAP * ratio.abs() { exact } else { ratio };
     number(pick(ratio) * y.value, x.dim)
 }

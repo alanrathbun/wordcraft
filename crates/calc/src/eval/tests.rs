@@ -376,6 +376,16 @@ fn ceil_to_multiple() {
     same_quantity(val("Ceil(0.75 in, 0.125 in) ="), val("0.75 in ="));
     same_quantity(val("Ceil(50.8 mm, 2 in) ="), val("50.8 mm ="));
     same_quantity(val("Round(2.0625 in, 0.125 in) ="), val("2.125 in ="));
+    same_quantity(val("Floor(-0.375 in, 0.125 in) ="), val("-0.375 in ="));
+    same_quantity(val("Ceil(-0.375 in, 0.125 in) ="), val("-0.375 in ="));
+    // The snap only absorbs rounding noise: a ratio just outside it still moves, and a tiny
+    // ratio is not an exact multiple of anything.
+    close(val("Ceil(2.0000001, 1) ="), 3.0, Dim::ONE);
+    close(val("Ceil(1000000.0000001, 1) ="), 1_000_001.0, Dim::ONE);
+    close(val("Floor(0.9999999, 1) ="), 0.0, Dim::ONE);
+    close(val("Ceil(1/10^13, 1) ="), 1.0, Dim::ONE);
+    close(val("Floor(-1/10^13, 1) ="), -1.0, Dim::ONE);
+    close(val("Round(1/10^13, 1) ="), 0.0, Dim::ONE);
     // Element-wise over a grid, like the other scalar built-ins.
     let mut env = Env::new();
     run(&mut env, "v := [1.2, 2.5, 3.9]").expect("defines v");
