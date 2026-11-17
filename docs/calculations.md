@@ -120,7 +120,9 @@ Each factor is Mathcad's.
 | Unit | Meaning |
 | --- | --- |
 | `atm` | standard atmosphere, 101 325 Pa |
-| `bar` | 10⁵ Pa; takes prefixes (`mbar`) |
+| `bar` | 10⁵ Pa; takes no prefixes, so names such as `ubar` stay free |
+| `mbar` | millibar, 100 Pa |
+| `kbar` | kilobar, 10⁸ Pa |
 | `torr` | 101 325/760 Pa |
 | `gpm` | `gal/min` |
 | `cfm` | `ft³/min` |

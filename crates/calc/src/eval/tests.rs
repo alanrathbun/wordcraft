@@ -2437,8 +2437,12 @@ fn sec_called_hints_secant() {
 
 #[test]
 fn newly_reserved_names() {
-    for name in ["bar", "day", "ton", "cal"] {
+    for name in ["bar", "day", "ton", "cal", "mbar", "kbar", "kcal"] {
         let e = err(&format!("{name} := 3"));
         assert_eq!(e, CalcError::ReservedName(name.into()), "{name}");
+    }
+    // bar takes no prefix: these stay free as names.
+    for name in ["ubar", "cbar", "nbar", "Mbar", "µbar"] {
+        assert_eq!(check_name(name), Ok(()), "{name}");
     }
 }
