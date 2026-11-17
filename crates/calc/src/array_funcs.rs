@@ -56,8 +56,9 @@ pub(crate) struct Ctx<'a> {
 /// isn't one, and for `min`/`max` of single values only (those are scalar built-ins).
 ///
 /// They take their arguments whole, so an argument with a failed element ([`Data::strict`]) is that
-/// element's error; but for a lenient caller ([`Ctx::lenient`]), the `x` of `lookup`, `linterp` and
-/// `spline` is per element, and its failed elements fail only their own results.
+/// element's error; but for a lenient caller ([`Ctx::lenient`]), the `x` of `lookup`, `linterp`,
+/// `spline` and `interp` (its fourth argument) is per element, and its failed elements fail only
+/// their own results.
 pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Option<Result<Data, CalcError>> {
     type Run = fn(&str, &[Data], &[Expr], &Ctx<'_>) -> Result<Data, CalcError>;
     let run: Run = match name {
