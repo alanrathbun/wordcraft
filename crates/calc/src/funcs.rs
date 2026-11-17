@@ -11,7 +11,26 @@ const BUILTINS: &[&str] = &[
 ];
 
 /// The array functions' names: built-ins that take whole grids ([`crate::array_funcs`]).
-const ARRAY_BUILTINS: &[&str] = &["length", "rows", "cols", "sum", "mean", "dot", "mmul", "transpose", "lookup", "linterp", "spline"];
+const ARRAY_BUILTINS: &[&str] = &[
+    "length",
+    "rows",
+    "cols",
+    "sum",
+    "mean",
+    "dot",
+    "mmul",
+    "transpose",
+    "lookup",
+    "linterp",
+    "spline",
+    "cspline",
+    "lspline",
+    "pspline",
+    "regress",
+    "interp",
+    "slope",
+    "intercept",
+];
 
 /// Whether `name` is a built-in function, scalar or array.
 pub(crate) fn is_builtin(name: &str) -> bool {

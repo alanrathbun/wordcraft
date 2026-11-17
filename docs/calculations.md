@@ -218,6 +218,10 @@ Usually the element-by-element form is simpler: `t := 2·D` gives the same vecto
 | `lookup(xs, ys, x)` | the `ys` element whose `xs` element equals `x` |
 | `linterp(xs, ys, x)` | the straight-line interpolation of `ys` at `x` |
 | `spline(xs, ys, x)` | the interpolation along a natural cubic spline through every point |
+| `cspline(vx, vy)`, `lspline(vx, vy)`, `pspline(vx, vy)` | the coefficient vector of the cubic spline through every point, with cubic, linear (natural) or parabolic ends |
+| `regress(vx, vy, k)` | the coefficient vector of the least-squares polynomial of degree `k`, a whole number from 1 to one less than the points |
+| `interp(vs, vx, vy, x)` | the value at `x` of the curve `vs` (from `cspline`, `lspline`, `pspline` or `regress`) over the data `vx` and `vy` |
+| `slope(vx, vy)`, `intercept(vx, vy)` | the slope and the intercept of the least-squares line |
 
 - `lookup` never guesses. `x` must equal one `xs` element to within rounding, after converting
   units (so `38.1 mm` finds `1.5 in`); no match, or more than one, is an error.
@@ -225,9 +229,16 @@ Usually the element-by-element form is simpler: `t := 2·D` gives the same vecto
   extrapolates: an `x` outside `xs` is an error, such as "1.6 in is outside NPS (0.5 in to
   1.5 in)".
 - In all three, `x` can be a vector, giving one result for each element.
+- A coefficient vector has the kind (1 `lspline`, 2 `pspline`, 3 `cspline`, 4 `regress`), 3 and the
+  degree (0 for a spline) as its first three elements. A spline's other elements are its second
+  derivatives at each of `vx`; a `regress`'s are its coefficients `a_0 … a_k`, `a_0` first.
+  `interp` refuses a vector that isn't one of these, or that was made over data of another size or
+  units. A spline `interp` doesn't extrapolate either, but a `regress` is a formula and evaluates
+  anywhere.
 
 These names are reserved, like the units and the other functions: `sum`, `length`, `rows`, `cols`,
-`mean`, `dot`, `mmul`, `transpose`, `lookup`, `linterp` and `spline` can't be variable names.
+`mean`, `dot`, `mmul`, `transpose`, `lookup`, `linterp`, `spline`, `cspline`, `lspline`, `pspline`,
+`regress`, `interp`, `slope` and `intercept` can't be variable names.
 
 ### Data tables
 

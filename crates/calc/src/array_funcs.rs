@@ -7,6 +7,9 @@
 //! - **Interpolation:** `linterp(xs, ys, x)` (linear) and `spline(xs, ys, x)` (natural cubic
 //!   spline), over `xs` strictly increasing.
 //!
+//! - **Curve fitting** ([`fit`]): `cspline`, `lspline`, `pspline` and `regress` make a coefficient
+//!   vector that `interp(vs, vx, vy, x)` evaluates; `slope` and `intercept` give the best line.
+//!
 //! `length`, `rows`, `cols`, `transpose` and `lookup` also take text; every other one refuses it.
 //!
 //! None of them guesses: a lookup that matches no `xs` and an interpolation outside `xs` are
@@ -16,8 +19,10 @@
 //! written when it is a bare name (`NPS`), else by its role (`xs`). Each function charges its
 //! element work to the pass before doing it.
 
+mod fit;
+
 use crate::array::{self, Data, Failures, Grid, MAX_ELEMENTS};
-use crate::eval::{Pass, Val, cut_text, picked, text_use};
+use crate::eval::{Pass, Temp, Val, cut_text, picked, text_use};
 use crate::funcs::{self, unit};
 use crate::{CalcError, Expr, render};
 use craft_units::{Dim, Formatted, Precision, Quantity, UnitError, UnitSystem, format};
@@ -38,7 +43,7 @@ pub(crate) struct Ctx<'a> {
     /// The decimal places values in messages are shown with.
     pub(crate) precision: Precision,
     /// Whether the call is in a branch worked out over whole arrays: then the per-element `x` of
-    /// `lookup`, `linterp` and `spline` keeps each element's error in the result's `failed` list
+    /// `lookup`, `linterp`, `spline` and `interp` keeps each element's error in the result's `failed` list
     /// (and passes its own failed elements through), as element-wise arithmetic does. Their tables
     /// and every other function's arguments are taken whole, so they stay strict.
     pub(crate) lenient: bool,
@@ -62,11 +67,20 @@ pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>
         "transpose" => |_, args, _, cx| transpose(args, cx),
         "lookup" => |_, args, exprs, cx| lookup(args, exprs, cx),
         "linterp" | "spline" => interpolate,
+        "cspline" | "lspline" | "pspline" => |name, args, exprs, cx| fit::spline(name, args, exprs, cx),
+        "regress" => |_, args, exprs, cx| fit::regress(args, exprs, cx),
+        "interp" => |_, args, exprs, cx| fit::interp(args, exprs, cx),
+        "slope" | "intercept" => |name, args, exprs, cx| fit::line(name, args, exprs, cx),
         _ => return None,
     };
-    // The per-element `x` (the third argument) of a lookup or an interpolation.
-    let per_x = cx.lenient && args.len() == 3 && matches!(name, "lookup" | "linterp" | "spline");
-    if let Some(e) = args.iter().enumerate().filter(|(i, _)| !(per_x && *i == 2)).find_map(|(_, a)| a.failure(cx.origin)) {
+    // The per-element `x` of a lookup or an interpolation: the third argument, the fourth for `interp`.
+    let per_x = match name {
+        "lookup" | "linterp" | "spline" => Some(2),
+        "interp" => Some(3),
+        _ => None,
+    }
+    .filter(|&i| cx.lenient && args.len() == i + 1);
+    if let Some(e) = args.iter().enumerate().filter(|(i, _)| per_x != Some(*i)).find_map(|(_, a)| a.failure(cx.origin)) {
         return Some(Err(e));
     }
     // Numbers only, but for the sizes, `transpose` and `lookup`.
@@ -457,47 +471,78 @@ fn interpolate(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Resul
     let [xs, ys, x] = args else {
         return Err(CalcError::Arity(name.to_string(), 3));
     };
-    let (xs_name, ys_name) = (arg_name(exprs, 0, "xs"), arg_name(exprs, 1, "ys"));
-    let (xs, ys) = (vector(name, xs, xs_name)?, vector(name, ys, ys_name)?);
-    same_length(name, (xs_name, xs.len()), (ys_name, ys.len()))?;
-    let (Some(lo), Some(hi)) = (xs.first().map(|v| v.q), xs.last().map(|v| v.q)) else {
-        return Err(CalcError::Syntax("an array needs at least one element".to_string()));
-    };
-    if xs.len() < 2 {
-        return Err(CalcError::Syntax(format!("{name} needs at least 2 points in {xs_name}")));
-    }
-    // Checking the points (and solving for the spline) is linear in them; each `x` is a search.
-    charge(cx, xs.len().saturating_add(items(x).len()))?;
-    let x_dim = one_dim(xs, xs_name, cx.origin)?;
-    let y_dim = one_dim(ys, ys_name, cx.origin)?;
-    let o = usize::from(cx.origin);
-    if let Some(k) = xs.windows(2).position(|w| matches!(w, [a, b] if b.q.value <= a.q.value)) {
-        return Err(CalcError::Syntax(format!(
-            "{name} needs {xs_name} strictly increasing — element {} isn't more than element {}",
-            k.saturating_add(o).saturating_add(1),
-            k.saturating_add(o)
-        )));
-    }
-    let xv: Vec<f64> = xs.iter().map(|v| v.q.value).collect();
-    let yv: Vec<f64> = ys.iter().map(|v| v.q.value).collect();
-    let curve = if name == "spline" { second_derivatives(&xv, &yv) } else { Vec::new() };
-    let t = picked(ys);
-    array::map(x, cx.origin, cx.lenient, |x| {
-        fits(x.q, x_dim)?;
-        let v = x.q.value;
-        // The first point at or past `v`: `v` is between it and the one before.
-        let p = xv.partition_point(|&xi| xi < v);
-        let knot = [p.checked_sub(1), Some(p)].into_iter().flatten().find(|&k| xv.get(k).is_some_and(|&xk| nearly_equal(xk, v)));
-        let value = match knot {
-            Some(k) => yv.get(k).copied(),
-            None if p == 0 || p >= xv.len() => None,
-            None => between(&xv, &yv, &curve, p - 1, v),
+    let names = (arg_name(exprs, 0, "xs"), arg_name(exprs, 1, "ys"));
+    let points = Points::new(name, (xs, ys), names, items(x).len(), cx)?;
+    let curve = if name == "spline" { second_derivatives(&points.xv, &points.yv) } else { Vec::new() };
+    points.at(x, &curve, cx)
+}
+
+/// The points an interpolation passes through, checked: `xs` strictly increasing and of one
+/// dimension, `ys` of one, as many of each.
+struct Points<'a> {
+    xv: Vec<f64>,
+    yv: Vec<f64>,
+    x_dim: Dim,
+    y_dim: Dim,
+    /// The first and last of `xs`, for the "outside" message.
+    ends: (Quantity, Quantity),
+    t: Temp,
+    xs_name: &'a str,
+}
+
+impl<'a> Points<'a> {
+    /// The points of `f`'s `xs` and `ys` (named `names` in messages). Checking them (and whatever
+    /// the caller solves for) is linear in them, as is making `extra` more results: all charged
+    /// together before any work.
+    fn new(f: &str, (xs, ys): (&Data, &Data), names: (&'a str, &str), extra: usize, cx: &Ctx<'_>) -> Result<Points<'a>, CalcError> {
+        let (xs_name, ys_name) = names;
+        let (xs, ys) = (vector(f, xs, xs_name)?, vector(f, ys, ys_name)?);
+        same_length(f, (xs_name, xs.len()), (ys_name, ys.len()))?;
+        let (Some(lo), Some(hi)) = (xs.first().map(|v| v.q), xs.last().map(|v| v.q)) else {
+            return Err(CalcError::Syntax("an array needs at least one element".to_string()));
         };
-        let Some(value) = value else {
-            return Err(CalcError::Syntax(format!("{} is outside {xs_name} ({} to {})", shown(x.q, cx), shown(lo, cx), shown(hi, cx))));
-        };
-        Ok(Val { q: finite(Quantity::new(value, y_dim))?, t })
-    })
+        if xs.len() < 2 {
+            return Err(CalcError::Syntax(format!("{f} needs at least 2 points in {xs_name}")));
+        }
+        charge(cx, xs.len().saturating_add(extra))?;
+        let x_dim = one_dim(xs, xs_name, cx.origin)?;
+        let y_dim = one_dim(ys, ys_name, cx.origin)?;
+        let o = usize::from(cx.origin);
+        if let Some(k) = xs.windows(2).position(|w| matches!(w, [a, b] if b.q.value <= a.q.value)) {
+            return Err(CalcError::Syntax(format!(
+                "{f} needs {xs_name} strictly increasing — element {} isn't more than element {}",
+                k.saturating_add(o).saturating_add(1),
+                k.saturating_add(o)
+            )));
+        }
+        let xv: Vec<f64> = xs.iter().map(|v| v.q.value).collect();
+        let yv: Vec<f64> = ys.iter().map(|v| v.q.value).collect();
+        Ok(Points { xv, yv, x_dim, y_dim, ends: (lo, hi), t: picked(ys), xs_name })
+    }
+
+    /// The value at each element of `x`: on the lines between the points, or, with `curve` (the
+    /// spline's second derivatives at every point), on the spline. An `x` outside the points is an
+    /// error, never an extrapolation.
+    fn at(&self, x: &Data, curve: &[f64], cx: &Ctx<'_>) -> Result<Data, CalcError> {
+        let xv = &self.xv;
+        array::map(x, cx.origin, cx.lenient, |x| {
+            fits(x.q, self.x_dim)?;
+            let v = x.q.value;
+            // The first point at or past `v`: `v` is between it and the one before.
+            let p = xv.partition_point(|&xi| xi < v);
+            let knot = [p.checked_sub(1), Some(p)].into_iter().flatten().find(|&k| xv.get(k).is_some_and(|&xk| nearly_equal(xk, v)));
+            let value = match knot {
+                Some(k) => self.yv.get(k).copied(),
+                None if p == 0 || p >= xv.len() => None,
+                None => between(xv, &self.yv, curve, p - 1, v),
+            };
+            let Some(value) = value else {
+                let (lo, hi) = self.ends;
+                return Err(CalcError::Syntax(format!("{} is outside {} ({} to {})", shown(x.q, cx), self.xs_name, shown(lo, cx), shown(hi, cx))));
+            };
+            Ok(Val { q: finite(Quantity::new(value, self.y_dim))?, t: self.t })
+        })
+    }
 }
 
 /// The value at `v` between points `i` and `i + 1`: on the line through them, or with `curve`

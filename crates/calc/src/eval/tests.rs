@@ -1158,9 +1158,331 @@ fn interp_needs_increasing_xs() {
     assert_eq!(syntax_msg(e), "linterp needs xs strictly increasing — element 2 isn't more than element 1");
 }
 
+/// The pump curve of `Mathcad Verification Simple Pump Model.xmcd`.
+fn pump() -> Env {
+    let mut env = Env::new();
+    run(&mut env, "flowrate := [0, 1000, 2000, 3000, 3500, 4000] gpm").expect("defines flowrate");
+    run(&mut env, "head := [230, 228.5, 221, 200.5, 183.5, 157] ft").expect("defines head");
+    run(&mut env, "H(Q) := interp(cspline(flowrate, head), flowrate, head, Q)").expect("defines H");
+    env
+}
+
+#[test]
+fn cspline_matches_mathcad_pump_curve() {
+    let mut env = pump();
+    // Mathcad's saved values, to a relative 1e-12.
+    for (q, want) in [(100.0, 229.892), (200.0, 229.796), (500.0, 229.5), (1000.0, 228.5)] {
+        let got = shown(&mut env, &format!("H({q} gpm) ="));
+        assert_eq!(got.dim, Dim::LENGTH, "H({q})");
+        let want = quantity(want, "ft").value;
+        assert!((got.value - want).abs() <= 1e-12 * want, "H({q} gpm) = {} vs {want}", got.value);
+    }
+    run(&mut env, "Qv := [0, 100, 200] gpm").expect("defines Qv");
+    let (shape, items) = grid(&mut env, "H(Qv) =");
+    assert_eq!(shape, (3, 1));
+    for (got, want) in items.iter().zip([230.0, 229.892, 229.796]) {
+        let want = quantity(want, "ft").value;
+        assert_eq!(got.dim, Dim::LENGTH);
+        assert!((got.value - want).abs() <= 1e-12 * want, "{} vs {want}", got.value);
+    }
+}
+
+#[test]
+fn spline_coefficient_vectors_have_the_documented_layout() {
+    let mut env = pump();
+    for (f, kind) in [("lspline", 1.0), ("pspline", 2.0), ("cspline", 3.0)] {
+        run(&mut env, &format!("c := {f}(flowrate, head)")).expect("defines c");
+        let (shape, items) = grid(&mut env, "c =");
+        // n + 3 elements: the kind, 3 and 0, then a second derivative at each of the 6 points.
+        assert_eq!(shape, (9, 1), "{f}");
+        close_all(&items[..3], &[kind, 3.0, 0.0], Dim::ONE);
+        // The second derivatives are in vy/vx².
+        let per_flow_squared = Dim::LENGTH.div(quantity(1.0, "gpm").dim.powi(2).expect("squared")).expect("quotient");
+        assert!(items[3..].iter().all(|q| q.dim == per_flow_squared), "{f}: {items:?}");
+    }
+    // The same positions in a document numbered from 1.
+    env.set_origin(1);
+    close(shown(&mut env, "c[1] ="), 3.0, Dim::ONE);
+}
+
+#[test]
+fn lspline_is_natural() {
+    let mut env = flanges();
+    column(&mut env, "xs", &[0.0, 1.0, 3.0, 4.0, 7.0], "1");
+    column(&mut env, "ys", &[2.0, -1.0, 4.0, 4.5, 0.0], "1");
+    for x in ["0", "0.5", "2", "3.5", "5.25", "7"] {
+        let natural = shown(&mut env, &format!("spline(xs, ys, {x}) =")).value;
+        let fitted = shown(&mut env, &format!("interp(lspline(xs, ys), xs, ys, {x}) =")).value;
+        assert!((natural - fitted).abs() <= 1e-12 * natural.abs().max(1.0), "x = {x}: {natural} vs {fitted}");
+    }
+}
+
+#[test]
+fn pspline_parabolic_ends() {
+    let mut env = pump();
+    run(&mut env, "c := pspline(flowrate, head)").expect("defines c");
+    // M_0 = M_1 and M_5 = M_4; the other second derivatives differ.
+    assert_eq!(shown(&mut env, "c[3] =").value, shown(&mut env, "c[4] =").value);
+    assert_eq!(shown(&mut env, "c[8] =").value, shown(&mut env, "c[7] =").value);
+    assert_ne!(shown(&mut env, "c[4] =").value, shown(&mut env, "c[5] =").value);
+    // It passes through every point, and a parabola is reproduced exactly.
+    close_to(shown(&mut env, "interp(c, flowrate, head, 2000 gpm) ="), quantity(221.0, "ft"));
+    column(&mut env, "X", &[0.0, 1.0, 3.0, 4.0, 7.0], "1");
+    column(&mut env, "S", &[0.0, 1.0, 9.0, 16.0, 49.0], "1");
+    for x in ["0.5", "2", "3.5", "5.5"] {
+        let want: f64 = x.parse::<f64>().expect("a number").powi(2);
+        let got = shown(&mut env, &format!("interp(pspline(X, S), X, S, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-12 * want, "x = {x}: {got} vs {want}");
+        let got = shown(&mut env, &format!("interp(cspline(X, S), X, S, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-12 * want, "cspline, x = {x}: {got} vs {want}");
+    }
+}
+
+#[test]
+fn cspline_reproduces_a_cubic_and_small_data() {
+    let mut env = Env::new();
+    // Not-a-knot-like ends: a cubic is reproduced exactly by a spline whose M runs in a straight
+    // line across each end's two intervals.
+    column(&mut env, "X", &[0.0, 1.0, 2.5, 3.0, 5.0, 6.0], "1");
+    let cubic = |x: f64| 1.0 - 2.0 * x + 0.5 * x * x + 0.25 * x * x * x;
+    column(&mut env, "C", &[0.0, 1.0, 2.5, 3.0, 5.0, 6.0].map(cubic), "1");
+    for x in ["0.5", "1.75", "2.75", "4", "5.5"] {
+        let want = cubic(x.parse().expect("a number"));
+        let got = shown(&mut env, &format!("interp(cspline(X, C), X, C, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-11 * want.abs().max(1.0), "x = {x}: {got} vs {want}");
+    }
+    // Three points: the one parabola through them. Two points suit only lspline.
+    column(&mut env, "X3", &[1.0, 2.0, 4.0], "1");
+    column(&mut env, "Y3", &[1.0, 4.0, 16.0], "1");
+    for f in ["cspline", "pspline", "lspline"] {
+        assert!(run_value(&mut env, &format!("{f}(X3, Y3) =")).is_ok(), "{f}");
+    }
+    close(shown(&mut env, "interp(cspline(X3, Y3), X3, Y3, 3) ="), 9.0, Dim::ONE);
+    column(&mut env, "X2", &[1.0, 2.0], "1");
+    column(&mut env, "Y2", &[1.0, 4.0], "1");
+    assert!(run_value(&mut env, "lspline(X2, Y2) =").is_ok());
+    for f in ["cspline", "pspline"] {
+        assert_eq!(syntax_msg(run_value(&mut env, &format!("{f}(X2, Y2) =")).expect_err("too few")), format!("{f} needs at least 3 points in X2"));
+    }
+    let e = run_value(&mut env, "cspline([1, 3, 2], [1, 2, 3]) =").expect_err("not increasing");
+    assert_eq!(syntax_msg(e), "cspline needs vx strictly increasing — element 2 isn't more than element 1");
+    let e = run_value(&mut env, "regress([1, 2, 3], [1, 2], 1) =").expect_err("lengths differ");
+    assert_eq!(syntax_msg(e), "regress needs vx and vy of the same length (3 and 2)");
+}
+
+#[test]
+fn regress_matches_mathcad() {
+    let mut env = Env::new();
+    run(&mut env, "T := [100, 200, 300, 400, 500]").expect("defines T");
+    run(&mut env, "k := [0.25, 0.31, 0.40, 0.51, 0.64]").expect("defines k");
+    run(&mut env, "c := regress(T, k, 2)").expect("defines c");
+    let (shape, items) = grid(&mut env, "c =");
+    // k + 4 elements: the kind (4), 3 and k, then a_0 … a_k.
+    assert_eq!(shape, (6, 1));
+    close_all(&items[..3], &[4.0, 3.0, 2.0], Dim::ONE);
+    // ASTM C547 PolyRegress w Header.xmcd, to a relative 1e-9.
+    for (at, want) in [(3, 0.20799999999999994), (4, 0.0002942857142857147), (5, 1.1428571428571426E-06)] {
+        let got = shown(&mut env, &format!("c[{at}] =")).value;
+        assert!((got - want).abs() <= 1e-9 * want, "c[{at}] = {got} vs {want}");
+    }
+    // A fit evaluates anywhere, beyond the data too.
+    let want = 0.208 + 2.942857e-4 * 600.0 + 1.142857e-6 * 600.0 * 600.0;
+    let got = shown(&mut env, "interp(c, T, k, 600) =").value;
+    assert!((got - want).abs() <= 1e-6 * want, "{got} vs {want}");
+}
+
+#[test]
+fn regress_scales_and_keeps_units() {
+    let mut env = Env::new();
+    // x around 2000: a plain normal-equations solve loses its digits here.
+    run(&mut env, "Yrs := [2000, 2001, 2002, 2003, 2004, 2005]").expect("defines Yrs");
+    let poly = |t: f64| 3.0 + 0.5 * (t - 2002.0) + 0.25 * (t - 2002.0).powi(2);
+    column(&mut env, "v", &[2000.0, 2001.0, 2002.0, 2003.0, 2004.0, 2005.0].map(poly), "1");
+    run(&mut env, "c := regress(Yrs, v, 2)").expect("defines c");
+    for (x, want) in [2000.0_f64, 2002.0, 2004.0, 2010.0].map(|x| (x, poly(x))) {
+        let got = shown(&mut env, &format!("interp(c, Yrs, v, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-6, "x = {x}: {got} vs {want}");
+    }
+    // The units of a_j are those of vy/vx^j.
+    column(&mut env, "Dd", &[1.0, 2.0, 3.0, 4.0], "in");
+    column(&mut env, "Fo", &[10.0, 20.0, 40.0, 70.0], "lbf");
+    let (_, items) = grid(&mut env, "regress(Dd, Fo, 2) =");
+    let inch = quantity(1.0, "in").dim;
+    let lbf = quantity(1.0, "lbf").dim;
+    assert_eq!(items.len(), 6);
+    assert_eq!(items[3].dim, lbf);
+    assert_eq!(items[4].dim, lbf.div(inch).expect("per length"));
+    assert_eq!(items[5].dim, lbf.div(inch.powi(2).expect("squared")).expect("per area"));
+    // k = 1 is the straight line of `slope` and `intercept`.
+    let (_, line) = grid(&mut env, "regress(Dd, Fo, 1) =");
+    close_to(Quantity::new(line[3].value, line[3].dim), shown(&mut env, "intercept(Dd, Fo) ="));
+    close_to(Quantity::new(line[4].value, line[4].dim), shown(&mut env, "slope(Dd, Fo) ="));
+    // At the data's own points a fit through as many points as it has coefficients gives the data.
+    close_to(shown(&mut env, "interp(regress(Dd, Fo, 3), Dd, Fo, 3 in) ="), quantity(40.0, "lbf"));
+}
+
+#[test]
+fn slope_intercept() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 2, 3] in").expect("defines x");
+    run(&mut env, "y := [2, 4, 6] lbf").expect("defines y");
+    close_to(shown(&mut env, "slope(x, y) ="), quantity(2.0, "lbf").div(quantity(1.0, "in")).expect("a quotient"));
+    close_to(shown(&mut env, "intercept(x, y) ="), quantity(0.0, "lbf"));
+    // A line that doesn't pass through the origin, and noisy data: least squares.
+    run(&mut env, "u := [0, 1, 2, 3]").expect("defines u");
+    run(&mut env, "w := [1, 3, 4, 7]").expect("defines w");
+    close(shown(&mut env, "slope(u, w) ="), 1.9, Dim::ONE);
+    close(shown(&mut env, "intercept(u, w) ="), 0.9, Dim::ONE);
+    // No line through x values that are all the same, or through one point.
+    assert!(run(&mut env, "slope([2, 2, 2], [1, 2, 3]) =").is_err());
+    assert!(run(&mut env, "intercept([2], [1]) =").is_err());
+    let e = run(&mut env, "slope([1, 2, 3], [1, 2]) =").expect_err("lengths differ");
+    assert_eq!(syntax_msg(e), "slope needs vx and vy of the same length (3 and 2)");
+}
+
+#[test]
+fn interp_refuses_outside_spline_data() {
+    let mut env = pump();
+    let spline_error = run(&mut env, "spline(flowrate, head, 4100 gpm) =").expect_err("outside");
+    assert!(syntax_msg(spline_error.clone()).contains("is outside flowrate"), "{spline_error:?}");
+    for f in ["cspline", "lspline", "pspline"] {
+        let e = run(&mut env, &format!("interp({f}(flowrate, head), flowrate, head, 4100 gpm) =")).expect_err("outside");
+        assert_eq!(e, spline_error, "{f}");
+        let e = run(&mut env, &format!("interp({f}(flowrate, head), flowrate, head, -1 gpm) =")).expect_err("outside");
+        let msg = syntax_msg(e);
+        assert!(msg.starts_with("-3.85 in³/sec is outside flowrate"), "{f}: {msg}");
+    }
+    // The ends themselves are in the data.
+    close_to(shown(&mut env, "H(4000 gpm) ="), quantity(157.0, "ft"));
+}
+
+#[test]
+fn interp_rejects_foreign_vectors() {
+    let mut env = Env::new();
+    for src in ["xs := [1, 2, 3, 4]", "ys := [2, 3, 5, 9]", "xs2 := [1, 2, 3, 4, 5]", "ys2 := [2, 3, 5, 9, 1]"] {
+        run(&mut env, src).expect("defines");
+    }
+    let phrase = "cspline, lspline, pspline or regress";
+    let attempts = [
+        // Not from any of them.
+        "interp([1, 2, 3], xs, ys, 2) =",
+        "interp([1, 2, 3, 4, 5, 6, 7], xs, ys, 2) =",
+        "interp(5, xs, ys, 2) =",
+        // From a spline over data of another length.
+        "interp(cspline(xs, ys), xs2, ys2, 2) =",
+        "interp(lspline(xs2, ys2), xs, ys, 2) =",
+        // A regress vector whose length isn't its degree + 4, or a header that isn't ours.
+        "interp([4, 3, 2, 1, 1], xs, ys, 2) =",
+        "interp([9, 3, 0, 1, 1, 1, 1], xs, ys, 2) =",
+        "interp([3, 4, 0, 1, 1, 1, 1], xs, ys, 2) =",
+        "interp([3, 3, 1, 1, 1, 1, 1], xs, ys, 2) =",
+    ];
+    for src in attempts {
+        let e = run(&mut env, src).expect_err(src);
+        assert!(syntax_msg(e).contains(phrase), "{src}");
+    }
+    // A vector from the data's other units doesn't fit either.
+    column(&mut env, "Dd", &[1.0, 2.0, 3.0, 4.0], "in");
+    let e = run(&mut env, "interp(cspline(xs, ys), Dd, ys, 2 in) =").expect_err("units differ");
+    assert!(syntax_msg(e).contains(phrase));
+    // A matrix isn't a vector.
+    assert!(run(&mut env, "interp([1, 2; 3, 4], xs, ys, 2) =").is_err());
+    // Four arguments.
+    assert_eq!(run(&mut env, "interp(cspline(xs, ys), xs, ys) =").expect_err("arity"), CalcError::Arity("interp".into(), 4));
+}
+
+#[test]
+fn interp_per_element_in_cases() {
+    let mut env = Env::new();
+    for src in ["xs := [0, 10, 20, 30]", "ys := [0, 100, 400, 900]", "x := [5, 15, 40]"] {
+        run(&mut env, src).unwrap();
+    }
+    run(&mut env, "c := cspline(xs, ys)").unwrap();
+    // Only the elements that pick the branch can fail in it.
+    let v = vector_in(&mut env, "y := interp(c, xs, ys, x) if x ≤ 30, 0 otherwise =");
+    assert_eq!(v.len(), 3);
+    assert_eq!(v[2], 0.0);
+    assert!(v[0] > 0.0 && v[1] > 100.0, "{v:?}");
+    assert_eq!(vector_in(&mut env, "y_2 := if(x ≤ 30, interp(c, xs, ys, x), 0) =")[2], 0.0);
+    assert_eq!(err_in(&mut env, "b := interp(c, xs, ys, x) if x ≥ 0, 0 otherwise ="), "element 2: 40 is outside xs (0 to 30)");
+    // Strict callers keep their errors.
+    assert_eq!(err_in(&mut env, "interp(c, xs, ys, x) ="), "element 2: 40 is outside xs (0 to 30)");
+    // The coefficient vector is taken whole: a failed element of it fails every element.
+    run(&mut env, "z := [4, 0, 9, 1]").unwrap();
+    assert_eq!(err_in(&mut env, "b := interp(1/z, xs, ys, x) if x ≤ 30, 0 otherwise ="), "element 1: result isn't a finite number");
+    // A regress vector evaluates anywhere, per element too.
+    run(&mut env, "r := regress(xs, ys, 2)").unwrap();
+    let v = vector_in(&mut env, "q := interp(r, xs, ys, x) if x ≤ 100, 0 otherwise =");
+    assert!((v[2] - 1600.0).abs() <= 1e-9, "{v:?}");
+}
+
+#[test]
+fn regress_degree_checks() {
+    let mut env = Env::new();
+    run(&mut env, "T := [100, 200, 300, 400, 500]").unwrap();
+    run(&mut env, "k := [0.25, 0.31, 0.40, 0.51, 0.64]").unwrap();
+    for bad in ["0", "5", "6", "1.5", "-1", "2.000001", "[1, 2]"] {
+        let e = run_value(&mut env, &format!("regress(T, k, {bad}) =")).expect_err(bad);
+        assert!(syntax_msg(e).contains("whole number from 1 to 4"), "{bad}");
+    }
+    let e = run_value(&mut env, "regress(T, k, 2 in) =").expect_err("not a plain number");
+    assert!(syntax_msg(e).contains("whole number from 1 to 4"));
+    for ok in ["1", "2", "4"] {
+        assert!(run_value(&mut env, &format!("regress(T, k, {ok}) =")).is_ok(), "{ok}");
+    }
+    // All x the same: no curve to fit.
+    assert!(run_value(&mut env, "regress([3, 3, 3], [1, 2, 4], 1) =").is_err());
+    // Two different values can't fix a parabola.
+    let e = run_value(&mut env, "regress([1, 2, 2, 2], [1, 2, 3, 4], 2) =").expect_err("too few different values");
+    assert_eq!(syntax_msg(e), "regress can't fit degree 2 to vx: it has too few different values");
+}
+
+#[test]
+fn curve_fitting_charges_the_pass() {
+    let mut env = Env::new();
+    column(&mut env, "X", &(0..50).map(f64::from).collect::<Vec<_>>(), "1");
+    column(&mut env, "Y", &(0..50).map(|k| f64::from(k * k)).collect::<Vec<_>>(), "1");
+    // A spline costs its points (and its vector); a fit costs its points times its degree squared.
+    fn spent(env: &mut Env, src: &str, limit: u64) -> (Result<Option<Data>, CalcError>, u64) {
+        let pass = Pass::new(limit);
+        let r = run_stmt_in(env, &parse(src).expect("parses"), &pass);
+        (r, pass.spent.get())
+    }
+    let (r, small) = spent(&mut env, "c := cspline(X, Y)", u64::MAX);
+    assert!(r.is_ok());
+    assert!(small >= 50, "{small}");
+    let (r, fit) = spent(&mut env, "r := regress(X, Y, 10)", u64::MAX);
+    assert!(r.is_ok());
+    assert!(fit >= 50 * 11 * 11, "{fit}");
+    assert_eq!(spent(&mut env, "r := regress(X, Y, 10)", 50 * 11 * 11 - 1).0, Err(CalcError::TooMuchWork));
+    assert_eq!(spent(&mut env, "c := cspline(X, Y)", 10).0, Err(CalcError::TooMuchWork));
+    // A fit of every point of a long table is refused before a matrix that size is built.
+    column(&mut env, "BigX", &(0..2000).map(f64::from).collect::<Vec<_>>(), "1");
+    assert_eq!(spent(&mut env, "r := regress(BigX, BigX, 1999)", u64::MAX).0, Err(CalcError::TooLarge));
+}
+
 #[test]
 fn new_function_names_are_reserved() {
-    for name in ["sum", "length", "rows", "cols", "mean", "dot", "mmul", "transpose", "lookup", "linterp", "spline"] {
+    for name in [
+        "sum",
+        "length",
+        "rows",
+        "cols",
+        "mean",
+        "dot",
+        "mmul",
+        "transpose",
+        "lookup",
+        "linterp",
+        "spline",
+        "cspline",
+        "lspline",
+        "pspline",
+        "regress",
+        "interp",
+        "slope",
+        "intercept",
+    ] {
         assert_eq!(check_name(name), Err(CalcError::ReservedName(name.into())), "{name}");
     }
 }
