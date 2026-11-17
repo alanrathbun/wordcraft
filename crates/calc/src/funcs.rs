@@ -7,11 +7,33 @@ use craft_units::{Dim, Quantity, UnitError};
 /// [`crate::array_funcs`]).
 const BUILTINS: &[&str] = &[
     "sqrt", "abs", "exp", "ln", "log", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "min", "max", "round", "floor",
-    "ceil", "mod",
+    "ceil", "mod", "Ceil", "Floor", "Round", "erf", "csc", "cot", "secant", "atanh", "J0", "J1",
 ];
 
 /// The array functions' names: built-ins that take whole grids ([`crate::array_funcs`]).
-const ARRAY_BUILTINS: &[&str] = &["length", "rows", "cols", "sum", "mean", "dot", "mmul", "transpose", "lookup", "linterp", "spline"];
+const ARRAY_BUILTINS: &[&str] = &[
+    "length",
+    "rows",
+    "cols",
+    "sum",
+    "mean",
+    "dot",
+    "mmul",
+    "transpose",
+    "lookup",
+    "linterp",
+    "spline",
+    "cspline",
+    "lspline",
+    "pspline",
+    "regress",
+    "interp",
+    "slope",
+    "intercept",
+    "submatrix",
+    "augment",
+    "stack",
+];
 
 /// Whether `name` is a built-in function, scalar or array.
 pub(crate) fn is_builtin(name: &str) -> bool {
@@ -45,6 +67,13 @@ fn dispatch(name: &str, args: &[Quantity]) -> Result<Quantity, CalcError> {
         "sin" => plain1(name, args, f64::sin),
         "cos" => plain1(name, args, f64::cos),
         "tan" => plain1(name, args, f64::tan),
+        "csc" => plain1(name, args, |x| 1.0 / x.sin()),
+        "secant" => plain1(name, args, |x| 1.0 / x.cos()),
+        "cot" => plain1(name, args, |x| 1.0 / x.tan()),
+        "atanh" => plain1(name, args, f64::atanh),
+        "erf" => plain1(name, args, libm::erf),
+        "J0" => plain1(name, args, libm::j0),
+        "J1" => plain1(name, args, libm::j1),
         "asin" => angle1(name, args, f64::asin),
         "acos" => angle1(name, args, f64::acos),
         "atan" => angle1(name, args, f64::atan),
@@ -56,6 +85,9 @@ fn dispatch(name: &str, args: &[Quantity]) -> Result<Quantity, CalcError> {
         "max" => extreme(name, args, f64::max),
         "round" => round(args),
         "mod" => modulo(args),
+        "Ceil" => to_multiple(name, args, f64::ceil, 1.0),
+        "Floor" => to_multiple(name, args, f64::floor, 1.0),
+        "Round" => to_multiple(name, args, f64::round, 0.5),
         // `call` only dispatches built-in names, and the evaluator sends the array functions to
         // `array_funcs` instead.
         _ => Err(CalcError::Undefined(name.to_string())),
@@ -198,4 +230,30 @@ fn modulo(args: &[Quantity]) -> Result<Quantity, CalcError> {
         r = if shifted == b.value { 0.0 } else { shifted };
     }
     number(r, merge(a.dim, b.dim))
+}
+
+/// How close, relative to the ratio, `x / y` snaps to an exact case: 4 ulps. A conversion and a
+/// division leave the ratio 1 ulp off in the cases found; relative only, so a tiny ratio never snaps.
+const SNAP: f64 = 4.0 * f64::EPSILON;
+
+/// Mathcad's `Ceil(x, y)`, `Floor(x, y)` and `Round(x, y)`: `x` to a multiple of the step `y`
+/// (`Round` takes halves away from zero). `x` and `y` agree in dimension, the step is above 0, and
+/// the result has `x`'s dimension.
+///
+/// `grid` is the spacing of the ratio's exact cases: whole numbers for `Ceil` and `Floor`, halves
+/// for `Round`. Unit conversion can leave `x / y` a few ulps off one (`2.125 in / 0.125 in` is
+/// 17.000000000000004), which `ceil` would send to the next multiple, so a ratio that close to
+/// an exact case is taken as that case.
+fn to_multiple(name: &str, args: &[Quantity], pick: fn(f64) -> f64, grid: f64) -> Result<Quantity, CalcError> {
+    let [x, y] = args else {
+        return Err(CalcError::Arity(name.to_string(), 2));
+    };
+    same(*x, *y)?;
+    if y.value <= 0.0 {
+        return Err(CalcError::Syntax(format!("{name}'s step must be greater than 0")));
+    }
+    let ratio = x.value / y.value;
+    let exact = (ratio / grid).round() * grid;
+    let ratio = if (ratio - exact).abs() <= SNAP * ratio.abs() { exact } else { ratio };
+    number(pick(ratio) * y.value, x.dim)
 }

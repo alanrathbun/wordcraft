@@ -225,9 +225,56 @@ fn pasted_unit_name_definition_is_error() {
     let mut d = doc_with(&["A := 2 in^2", "2 A ="]);
     recalc(&mut d, &no_page);
     assert_eq!(region(&d, 1).0.state, err(CalcError::ReservedName("A".into())));
+    // The document meant its own A, so the ampere would be a wrong number: the use fails too.
     let (r, linear, _) = region(&d, 2);
-    assert_eq!(r.state, CalcState::Fresh);
-    assert!(linear.ends_with("=2 \"A\""), "{linear}");
+    assert_eq!(r.state, err(CalcError::Upstream));
+    assert_eq!(linear, "2 \"A\" ⚠");
+}
+
+/// A definition refused because its name is a unit, function or constant (a document from before
+/// the name was reserved) fails every calculation using the name, wherever it is, rather than
+/// letting them quietly compute with the unit.
+#[test]
+fn a_name_refused_as_a_unit_function_or_constant_fails_its_uses() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("day := 7", "x := 2·day =", "day"),
+        ("ton := 2000", "W_t := 3·ton =", "ton"),
+        ("hr := 0.5", "y := hr·2 =", "hr"),
+        ("m := 5", "y := m·2 =", "m"),
+        ("m := 5", "y := 3 m =", "m"),
+        ("pi := 3", "y := 2·pi =", "pi"),
+        ("g_0 := 32", "y := 2·g_0 =", "g_0"),
+        // A function's name, the same way: the use points at the failed definition.
+        ("slope := 0.02", "y := slope·100 ft =", "slope"),
+        ("max := 10", "y := max(1, 2) =", "max"),
+    ];
+    for &(define, using, name) in cases {
+        for sources in [[define, using], [using, define]] {
+            let mut d = doc_with(&sources);
+            let report = recalc(&mut d, &no_page);
+            let (at_define, at_use) = if sources[0] == define { (1, 2) } else { (2, 1) };
+            assert_eq!(region(&d, at_define).0.state, err(CalcError::ReservedName(name.into())), "{sources:?}");
+            let (r, linear, _) = region(&d, at_use);
+            assert_eq!(r.state, err(CalcError::Upstream), "{sources:?}: {linear}");
+            // The error mark, and no result.
+            assert!(linear.ends_with(" ⚠") && !linear.contains('='), "{sources:?}: {linear}");
+            assert_eq!(report.errors, 2, "{sources:?}");
+        }
+    }
+    // The name stays refused, and is no variable to quote.
+    let d = doc_with(&["day := 7", "x := 2·day"]);
+    assert_eq!(check_new_name(&d, "day", None), Err(CalcError::ReservedName("day".into())));
+    assert!(defined_names(&d).iter().all(|(n, _)| n != "day"), "{:?}", defined_names(&d));
+}
+
+#[test]
+fn a_column_heading_refused_as_a_unit_fails_its_uses() {
+    let mut d = doc_of(vec![table_block(data_table(1, &[&["day (hr)"], &["1"], &["2"]])), para_block(para(vec![calc_eq(8, "x := 2·day =")]))]);
+    recalc(&mut d, &no_page);
+    let message = CalcError::ReservedName("day".into()).to_string();
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
+    let (r, linear, _) = region(&d, 8);
+    assert_eq!(r.state, err(CalcError::UpstreamTable), "{linear}");
 }
 
 #[test]
@@ -2181,6 +2228,19 @@ fn numbers_look_up_texts_and_equal_text_keys_are_duplicates() {
 }
 
 #[test]
+fn an_h_heading_hints_hr() {
+    let mut d = doc_of(vec![table_block(data_table(1, &[&["Time (h)", "Flow (gpm)"], &["1", "2"]]))]);
+    recalc(&mut d, &no_page);
+    let message = "unknown unit `h` — for hours, use hr".to_string();
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
+    // A cell's own unit, the same way.
+    let mut d = doc_of(vec![table_block(data_table(1, &[&["Time (hr)"], &["1 h"]]))]);
+    recalc(&mut d, &no_page);
+    let message = "Time row 1: unknown unit `h` — for hours, use hr".to_string();
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
+}
+
+#[test]
 fn a_quote_mark_of_any_kind_is_refused_in_a_text_cell() {
     let mut d = doc_of(vec![table_block(data_table(1, MATERIALS))]);
     for mark in ["\"", "“", "”"] {
@@ -2189,4 +2249,53 @@ fn a_quote_mark_of_any_kind_is_refused_in_a_text_cell() {
         let message = format!("Material row 2 has a quote mark {mark}, which text can't hold");
         assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
     }
+}
+
+/// The shown result of each calculation in `sources` (its text after the last `=`), in a document
+/// with `system` units.
+fn shown_in(system: wordcraft_doc::calc::UnitSystem, sources: &[&str]) -> Vec<String> {
+    let mut d = doc_with(sources);
+    d.calc_settings = Some(CalcSettings { system, ..CalcSettings::default() });
+    recalc(&mut d, &no_page);
+    (1..=sources.len() as u64).map(|id| region(&d, id).1).collect()
+}
+
+#[test]
+fn percent_shows_as_a_unit() {
+    let shown = shown_in(wordcraft_doc::calc::UnitSystem::UsCustomary, &["x := 0.25", "x = ? %", "y := 5 % * 200 ="]);
+    assert_eq!(shown[1], "x=25 \"%\"");
+    assert_eq!(shown[2], "y≔5 \"%\"·200=10");
+}
+
+#[test]
+fn hour_is_hr() {
+    let shown = shown_in(wordcraft_doc::calc::UnitSystem::UsCustomary, &["q := 3412.14 Btu/hr", "q = ? watt"]);
+    assert_eq!(shown[1], "q=1000 \"watt\"");
+}
+
+#[test]
+fn typed_units_show_as_typed() {
+    let shown = shown_in(
+        wordcraft_doc::calc::UnitSystem::UsCustomary,
+        &["q := 1 kW", "q = ? BTU/hr", "q = ? Btu/hr", "t := 90 s", "t = ? s", "t = ? sec", "t = ? min"],
+    );
+    assert_eq!(shown[1], "q=3412.142 \"BTU/hr\"");
+    assert_eq!(shown[2], "q=3412.142 \"Btu/hr\"");
+    assert_eq!(shown[4], "t=90 \"s\"");
+    assert_eq!(shown[5], "t=90 \"sec\"");
+    assert_eq!(shown[6], "t=1.5 \"min\"");
+}
+
+#[test]
+fn si_results_spell_units() {
+    let shown = shown_in(wordcraft_doc::calc::UnitSystem::Si, &["1 kJ/sec =", "9.8 m/sec^2 =", "5 s ="]);
+    let result = |text: &str| text.rsplit('=').next().unwrap_or_default().to_string();
+    assert_eq!(result(&shown[0]), "1000 \"watt\"");
+    assert_eq!(result(&shown[1]), "9.8 \"m/sec²\"");
+    assert_eq!(result(&shown[2]), "5 \"sec\"");
+}
+
+#[test]
+fn percent_displays_upright_as_a_unit() {
+    assert_eq!(render::display("x := 5 %", None, &CalcState::Fresh), "x≔5 \"%\"");
 }

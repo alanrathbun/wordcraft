@@ -27,11 +27,15 @@ Names are global. A name is defined once, anywhere in the document, and can be u
 below its definition. Defining a name twice is an error ("already defined on page N — choose a
 unique name"), and so is a circular definition (`a := b`, `b := a`).
 
-A name can't be a unit, a built-in function or a constant. That rules out `m`, `A`, `L`, `h`, `g`,
-`s`, `N`, `W`, `J`, `kN`, `min`, `sin`, `π`, `e`, `g_0`, `c_0`, `R_u` and the rest. Use a subscript
-instead: `A_b`, `L_1`. A subscript can't be empty (`a__b` and `x_` are refused). The array
+A name can't be a unit, a built-in function or a constant. That rules out `m`, `A`, `L`, `g`,
+`s`, `N`, `W`, `J`, `kN`, `min`, `bar`, `day`, `ton`, `cal`, `sin`, `erf`, `π`, `e`, `g_0`, `c_0`,
+`R_u` and the rest (`h`, `lb` and `R` are not units, so they are free). Use a subscript instead:
+`A_b`, `L_1`. A subscript can't be empty (`a__b` and `x_` are refused). The array
 functions (`sum`, `length`, `lookup` and the rest; see
-[Vectors, matrices and data tables](#vectors-matrices-and-data-tables)) are reserved too.
+[Vectors, matrices and data tables](#vectors-matrices-and-data-tables)) are reserved too. A
+definition that uses one of these names shows the reserved-name error, and every calculation that
+uses the name shows "depends on a calculation with an error" until the definition is renamed: the
+name never quietly means the unit, function or constant instead.
 
 ## Constants
 
@@ -60,8 +64,8 @@ refused; write `gm`.
 ## Symbols
 
 In the calculation box, **Insert Symbol** lists Greek letters, operators (`≔ · × ± √ ² ³ ≤ ≥ ≠ ∑
-∧ ∨ ¬`), the temperature units and the constants; picking one puts it at the cursor. You can also
-type a backslash name followed by a space, as in Word: `\sigma` → σ, `\theta` → θ, `\Delta` → Δ,
+∧ ∨ ¬`), the temperature units, `Å` and `%`, and the constants; picking one puts it at the cursor.
+You can also type a backslash name followed by a space, as in Word: `\sigma` → σ, `\theta` → θ, `\Delta` → Δ,
 `\mu` → μ, `\omega` → ω, `\sqrt` → √, `\cdot` → ·, `\times` → ×, `\pm` → ±, `\deg` → °. Any
 Greek letter's name works, with a capital for the capital letter. For conditions and sums: `\le` →
 ≤, `\ge` → ≥, `\ne` → ≠, `\sum` → ∑, `\wedge` → ∧, `\vee` → ∨, `\neg` → ¬.
@@ -69,7 +73,7 @@ Greek letter's name works, with a capital for the capital letter. For conditions
 ## Units
 
 SI units with prefixes and US customary units both work: `in`, `ft`, `lbf`, `kip`, `psi`, `ksi`,
-`lbm`, `slug`, `BTU`, `hp`, `gal` and so on. Results are checked for dimensions, so adding a length
+`lbm`, `slug`, `Btu`, `hp`, `gal` and so on. Results are checked for dimensions, so adding a length
 to a force is an error rather than a number.
 
 - `°C` and `°F` can only be the unit of a whole value. Temperatures on an offset scale can't be
@@ -82,6 +86,72 @@ to a force is an error rather than a number.
 - `J/mol K` is refused as ambiguous. Write `J/(mol·K)`.
 - Thousands separators written as spaces (`1 500`) are refused, because a space is multiplication.
   Write `1500`.
+
+### Spellings
+
+Some units have two accepted spellings. Type whichever you like; they mean the same.
+
+| Shown in results | Also accepted |
+| --- | --- |
+| `hr` | none (see below) |
+| `sec` | `s` |
+| `Btu` | `BTU` |
+| `liter` | `L` |
+| `watt` | `W` |
+| `joule` | `J` |
+| `mol` | `mole` |
+| `Å` | `Angstrom` |
+
+When WordCraft picks the unit text itself (a result in its natural units, or one built from base
+units such as `m/sec²`), it uses the left column, in SI and US documents alike. Prefixed units keep
+their symbols: `ms`, `kW`, `kJ`, `mL`. A unit you wrote yourself shows as you wrote it: `= ? BTU/hr`
+shows `BTU/hr`, and `= ? s` shows `s`.
+
+- **The hour is `hr`.** `h` is not a unit, so it is free to use as a name. A document that still
+  uses `h` for hours shows "h isn't defined — for hours, use hr" on each calculation that uses it,
+  and "unknown unit `h` — for hours, use hr" where `h` is a unit to show a result in
+  (`= ? kW·h`) or in a data table's heading (`Time (h)`).
+  A time such as `3 hr` shows in `sec` unless you ask for another unit: `= ? hr`.
+- **`lb` and `R` are not units.** `lb` reads as force to many engineers, and `R` is a common name.
+  Write `lbm` for pound-mass (or `lbf` for pound-force) and `°R` for degrees Rankine. Both words
+  are free to use as names.
+
+### Units added for Mathcad
+
+Each factor is Mathcad's.
+
+| Unit | Meaning |
+| --- | --- |
+| `atm` | standard atmosphere, 101 325 Pa |
+| `bar` | 10⁵ Pa; takes no prefixes, so names such as `ubar` stay free |
+| `mbar` | millibar, 100 Pa |
+| `kbar` | kilobar, 10⁸ Pa |
+| `torr` | 101 325/760 Pa |
+| `gpm` | `gal/min` |
+| `cfm` | `ft³/min` |
+| `mph` | `mi/hr` |
+| `poise` | 0.1 Pa·sec |
+| `cP` | centipoise, 0.01 `poise` |
+| `%` | 0.01; written after the number: `5 %` |
+| `kgf` | kilogram-force, 9.80665 N |
+| `ton` | short ton, 2000 `lbm` |
+| `tonne` | metric ton, 1000 kg |
+| `cal` | 4.1868 `joule`; takes prefixes (`kcal`) |
+| `day` | 86 400 `sec` |
+| `yr` | Mathcad's year, 365.2422 `day` |
+| `Å` | angstrom, 10⁻¹⁰ m |
+| `plf` | pounds per linear foot, `lbf/ft` |
+| `pcf` | pounds per cubic foot, `lbf/ft³`: a force per volume, not a mass |
+| `ksf` | kips per square foot, `kip/ft²` |
+
+`%` is an ordinary unit: `5 % · 200 =` gives 10, and `x = ? %` shows 0.25 as `25 %`. `Å` is in
+the Insert Symbol list; `Angstrom` types the same unit.
+
+Every one of these names is now a unit, so it can't be a variable name. A document that already
+defined `bar`, `day`, `ton` or `cal` shows the reserved-name error ("bar is a unit, function or
+constant name — choose another name") until the variable is renamed, for instance `bar_1`. Every
+calculation that uses the name shows "depends on a calculation with an error" until then, rather
+than quietly using the unit.
 
 ## How results are shown
 
@@ -215,6 +285,9 @@ Usually the element-by-element form is simpler: `t := 2·D` gives the same vecto
 | `dot(a, b)` | the dot product of two vectors of the same length |
 | `mmul(A, B)` | the matrix product; A's columns must match B's rows |
 | `transpose(M)` | rows and columns swapped |
+| `submatrix(A, ir, jr, ic, jc)` | rows `ir` to `jr` and columns `ic` to `jc` of `A`, both ends included, counted from the document's index base |
+| `augment(A, B, …)` | the matrices side by side; they must have the same number of rows |
+| `stack(A, B, …)` | the matrices one below the other; they must have the same number of columns |
 | `lookup(xs, ys, x)` | the `ys` element whose `xs` element equals `x` |
 | `linterp(xs, ys, x)` | the straight-line interpolation of `ys` at `x` |
 | `spline(xs, ys, x)` | the interpolation along a natural cubic spline through every point |
@@ -224,10 +297,78 @@ Usually the element-by-element form is simpler: `t := 2·D` gives the same vecto
 - For `linterp` and `spline`, `xs` must be a single row or column, strictly increasing. Neither
   extrapolates: an `x` outside `xs` is an error, such as "1.6 in is outside NPS (0.5 in to
   1.5 in)".
-- In all three, `x` can be a vector, giving one result for each element.
+- `x` can be a vector in `lookup`, `linterp`, `spline` and `interp` (see
+  [Mathcad functions](#mathcad-functions)), giving one result for each element.
 
 These names are reserved, like the units and the other functions: `sum`, `length`, `rows`, `cols`,
-`mean`, `dot`, `mmul`, `transpose`, `lookup`, `linterp` and `spline` can't be variable names.
+`mean`, `dot`, `mmul`, `transpose`, `submatrix`, `augment`, `stack`, `lookup`, `linterp` and
+`spline` can't be variable names.
+
+### Mathcad functions
+
+These work as they do in Mathcad, with the same spelling and the same numbers. The matrix
+functions `submatrix`, `augment` and `stack` are in the table above.
+
+| Function | Gives |
+| --- | --- |
+| `Ceil(x, y)`, `Floor(x, y)`, `Round(x, y)` | `x` rounded up, down or to the nearest multiple of `y`. `x` and `y` must have the same dimension and `y` must be above 0; the result is in `x`'s unit. `Ceil(2.06 in, 0.125 in)` is `2.125 in` |
+| `cspline(vx, vy)`, `lspline(vx, vy)`, `pspline(vx, vy)` | the coefficient vector of the spline through every point, with cubic, linear or parabolic ends |
+| `regress(vx, vy, k)` | the coefficient vector of the least-squares polynomial of degree `k` |
+| `interp(vs, vx, vy, x)` | the value at `x` of the spline or regression `vs`, over the data `vx` and `vy` |
+| `slope(vx, vy)`, `intercept(vx, vy)` | the least-squares line; the slope is in `y`/`x` units and the intercept in `y` units |
+| `erf(x)` | the error function of a plain number |
+| `csc(θ)`, `cot(θ)`, `secant(θ)` | the reciprocal trigonometric functions; `θ` is an angle (`30°`) or a plain number in radians |
+| `atanh(x)` | the inverse hyperbolic tangent |
+| `J0(x)`, `J1(x)` | Bessel functions of the first kind, orders 0 and 1, of a plain number |
+
+**Rounding.** Lowercase `ceil`, `floor` and `round` are unchanged: they take one value and give a
+whole number (`ceil(2.06)` is 3). With a step, the capitalized names round to a multiple of it, so
+`Floor(2.06 in, 0.125 in)` is `2 in`, `Round(2.07 in, 0.125 in)` is `2.125 in`, and a negative `x`
+rounds the same way (`Floor(-2.06 in, 0.125 in)` is `-2.125 in`). A step of zero or less, or one in
+a different dimension (`Ceil(2.06 in, 0.1 lbf)`), is an error. Names are case sensitive, so the two
+spellings never mix.
+
+**`secant`.** Mathcad writes the secant `sec(x)`, but `sec` is the unit for seconds here, so write
+`secant(x)`. A calculation that calls `sec(x)` says so: "sec isn't a function — for the secant, use
+secant(x)".
+
+**Curve fitting.** `cspline`, `lspline` and `pspline` fit a spline through every point of `vy`
+against `vx`; `cspline` and `pspline` need at least 3 points and `lspline` 2. `regress(vx, vy, k)`
+fits a polynomial of degree `k`, a whole number from 1 to one less than the number of points. Each
+gives a coefficient vector, and `interp` evaluates it:
+
+```
+vx := [1, 2, 3, 4]
+vy := [1, 4, 9, 16]
+s := cspline(vx, vy)
+interp(s, vx, vy, 2.5) =          6.25
+f := regress(vx, vy, 2)
+interp(f, vx, vy, 5) =            25
+```
+
+The coefficient vector starts with a header of WordCraft's own, then the values:
+
+| Element | Holds |
+| --- | --- |
+| 0 | the kind: 1 for `lspline`, 2 for `pspline`, 3 for `cspline`, 4 for `regress` |
+| 1 | 3 |
+| 2 | the degree `k` for `regress`, 0 for a spline |
+| 3 onward | for a spline, its second derivatives at each of `vx`; for `regress`, the coefficients `a_0 … a_k`, `a_0` first |
+
+From element 3 on, `regress`'s coefficients match Mathcad's, so a worksheet that indexes into them
+gets the same numbers. The header (elements 0 to 2) is WordCraft's, and a spline's second
+derivatives from element 3 on are in WordCraft's layout, not yet confirmed against Mathcad's.
+
+`interp` takes the vector as it came from the fitting function and the same `vx` and `vy`. It
+refuses a vector that isn't one of these, or that was made over data of another size or units.
+A spline doesn't extrapolate, as for `spline`: an `x` outside `vx` is an error ("5 is outside vx
+(1 to 4)"). A `regress` is a formula, so its `interp` evaluates anywhere, outside `vx` too. `x` can
+be a vector, giving one result for each element. `slope` and `intercept` need `vx` and `vy` of the
+same length.
+
+All of the names in these two sections are reserved: `Ceil`, `Floor`, `Round`, `cspline`,
+`lspline`, `pspline`, `regress`, `interp`, `slope`, `intercept`, `erf`, `csc`, `cot`, `secant`,
+`atanh`, `J0` and `J1` can't be variable names.
 
 ### Data tables
 
@@ -365,10 +506,12 @@ grades := ["A106 B", "A312 TP316"]
 - A text can be up to 1,000 characters and can't contain a quote mark.
 - Text goes where a word belongs: a definition, a vector of texts, the result of a case or of
   `if(…)`, a `lookup` key or result, and `==` or `≠`. Indexing, `length`, `rows`, `cols` and
-  `transpose` work on a vector of texts as on numbers.
+  `transpose`, `submatrix`, `augment` and `stack` work on a vector of texts as on numbers (a text with
+  numbers in one matrix is an error).
 - Text can't be used in arithmetic, with a unit, in `<`, `>`, `≤`, `≥`, or in `min`, `max`, `sum`,
-  `mean`, `linterp` or `spline`. The error says so and names the text (`"OK" is text — it can't be
-  used in arithmetic`); a text is never turned into a number.
+  `mean`, `linterp`, `spline`, `cspline`, `lspline`, `pspline`, `regress`, `interp`, `slope` or
+  `intercept`. The error says so and names the text (`"OK" is text — it can't be used in
+  arithmetic`); a text is never turned into a number.
 - Two texts are equal when they match after ignoring spaces at either end and treating a run of
   spaces as one. Capital letters count: `"a" == "A"` is 0.
 - A text result shows in quotes (`check = "OK"`), and a vector of texts as a bracketed column. A
@@ -447,7 +590,7 @@ left brace, one line per case.
 - Inside a case, whole arrays stay whole. `sum(x)`, `x[0]` and the tables of `lookup(xs, ys, …)`
   see all of `x`, `xs` and `ys`, as they do outside a case; only the choice of result is per
   element.
-- The value looked up or interpolated at, the `x` of `lookup`, `linterp` and `spline`, is per
+- The value looked up or interpolated at, the `x` of `lookup`, `linterp`, `spline` and `interp`, is per
   element like arithmetic. With `xs` ending at 20, `linterp(xs, ys, x) if x ≤ 20, 0 otherwise`
   works for a vector `x` with elements past 20, giving 0 there. Likewise an element of `x` with no
   match in `xs` fails only if it picks that case.

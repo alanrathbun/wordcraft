@@ -631,6 +631,13 @@ fn symbol_menu_inserts_at_the_cursor() {
 }
 
 #[test]
+fn units_row_has_angstrom_and_percent() {
+    let units = calc_ui::SYMBOL_GROUPS.iter().find(|(group, _)| *group == "Units").expect("a Units group").1;
+    assert!(units.contains(&"Å"), "the angstrom is offered");
+    assert!(units.contains(&"%"), "the percent is offered");
+}
+
+#[test]
 fn insert_symbol_menu_works_in_the_box() {
     let mut h = ready(app());
     open_box(&mut h);

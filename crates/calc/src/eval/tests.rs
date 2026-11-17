@@ -347,6 +347,107 @@ fn min_max_round_mod() {
     assert!(matches!(err("mod(1 m, 1 s) ="), CalcError::Unit(UnitError::Mismatch { .. })));
 }
 
+/// `q` is `value` to relative `tol`, in dimension `dim`.
+fn close_rel(q: Quantity, value: f64, dim: Dim, tol: f64) {
+    assert_eq!(q.dim, dim, "dimension of {q:?}");
+    assert!((q.value - value).abs() <= tol * value.abs().max(1.0), "{} vs {value}", q.value);
+}
+
+/// Two quantities are equal as measures: the same dimension, values within rounding.
+fn same_quantity(a: Quantity, b: Quantity) {
+    assert_eq!(a.dim, b.dim);
+    assert!((a.value - b.value).abs() <= 1e-12 * b.value.abs().max(1e-300), "{} vs {}", a.value, b.value);
+}
+
+#[test]
+fn ceil_to_multiple() {
+    same_quantity(val("Ceil(2.06 in, 0.125 in) ="), val("2.125 in ="));
+    close(val("Ceil(7.2, 1) ="), 8.0, Dim::ONE);
+    // Mathcad's hicks_si_p_2.68.xmcd: 1.9 in up to a multiple of 25.4 mm is 2 in, which is 50.8 mm.
+    same_quantity(val("Ceil(1.9 in, 25.4 mm) ="), val("50.8 mm ="));
+    same_quantity(val("Floor(2.06 in, 0.125 in) ="), val("2 in ="));
+    same_quantity(val("Round(2.06 in, 0.125 in) ="), val("2 in ="));
+    // Halves go away from zero.
+    close(val("Round(2.0625, 0.125) ="), 2.125, Dim::ONE);
+    close(val("Round(-2.0625, 0.125) ="), -2.125, Dim::ONE);
+    // A value already on a multiple stays, whatever the unit conversions do to the last digit.
+    same_quantity(val("Ceil(0.375 in, 0.125 in) ="), val("0.375 in ="));
+    same_quantity(val("Floor(0.375 in, 3.175 mm) ="), val("0.375 in ="));
+    same_quantity(val("Ceil(0.75 in, 0.125 in) ="), val("0.75 in ="));
+    same_quantity(val("Ceil(50.8 mm, 2 in) ="), val("50.8 mm ="));
+    same_quantity(val("Round(2.0625 in, 0.125 in) ="), val("2.125 in ="));
+    same_quantity(val("Floor(-0.375 in, 0.125 in) ="), val("-0.375 in ="));
+    same_quantity(val("Ceil(-0.375 in, 0.125 in) ="), val("-0.375 in ="));
+    // The snap only absorbs rounding noise: a ratio just outside it still moves, and a tiny
+    // ratio is not an exact multiple of anything.
+    close(val("Ceil(2.0000001, 1) ="), 3.0, Dim::ONE);
+    close(val("Ceil(1000000.0000001, 1) ="), 1_000_001.0, Dim::ONE);
+    close(val("Floor(0.9999999, 1) ="), 0.0, Dim::ONE);
+    close(val("Ceil(1/10^13, 1) ="), 1.0, Dim::ONE);
+    close(val("Floor(-1/10^13, 1) ="), -1.0, Dim::ONE);
+    close(val("Round(1/10^13, 1) ="), 0.0, Dim::ONE);
+    // Element-wise over a grid, like the other scalar built-ins.
+    let mut env = Env::new();
+    run(&mut env, "v := [1.2, 2.5, 3.9]").expect("defines v");
+    close_all(&grid(&mut env, "Ceil(v, 1) =").1, &[2.0, 3.0, 4.0], Dim::ONE);
+}
+
+#[test]
+fn ceil_negative_and_bad_steps() {
+    close(val("Ceil(-2.06, 0.125) ="), -2.0, Dim::ONE);
+    close(val("Floor(-2.06, 0.125) ="), -2.125, Dim::ONE);
+    for src in ["Ceil(2, 0) =", "Floor(2, -1) =", "Round(2, 0) =", "Round(2 in, -1 in) ="] {
+        let msg = syntax_msg(err(src));
+        let name = src.split('(').next().expect("a name");
+        assert!(msg.contains(&format!("{name}'s step must be greater than 0")), "{src}: {msg}");
+    }
+    assert!(matches!(err("Ceil(2 in, 1 lbf) ="), CalcError::Unit(UnitError::Mismatch { .. })));
+    assert_eq!(err("Ceil(2) ="), CalcError::Arity("Ceil".into(), 2));
+    assert_eq!(err("Round(1, 2, 3) ="), CalcError::Arity("Round".into(), 2));
+}
+
+#[test]
+fn erf_matches_mathcad() {
+    // Molar Mass.xmcd.
+    close_rel(val("0.5·√π·12000·(1 + erf(15000/12000)) ="), 20449.510423409225, Dim::ONE, 1e-12);
+    close_rel(val("erf(0) ="), 0.0, Dim::ONE, 1e-15);
+    assert!(matches!(err("erf(2 in) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+}
+
+#[test]
+fn reciprocal_trig() {
+    close(val("csc(30 deg) ="), 2.0, Dim::ONE);
+    close(val("cot(45 deg) ="), 1.0, Dim::ONE);
+    close_rel(val("secant(60 deg) ="), 2.0, Dim::ONE, 1e-12);
+    close_rel(val("atanh(0.5) ="), 0.5493061443340548, Dim::ONE, 1e-14);
+    assert_eq!(err("csc(0) ="), CalcError::NonFinite);
+    assert_eq!(err("atanh(1) ="), CalcError::NonFinite);
+    assert!(matches!(err("cot(1 m) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+}
+
+#[test]
+fn bessel() {
+    close_rel(val("J0(1) ="), 0.7651976865579666, Dim::ONE, 1e-14);
+    close_rel(val("J1(1) ="), 0.44005058574493355, Dim::ONE, 1e-14);
+    assert!(matches!(err("J0(1 m) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+}
+
+#[test]
+fn lowercase_unchanged() {
+    close(val("ceil(2.1) ="), 3.0, Dim::ONE);
+    close(val("floor(2.7) ="), 2.0, Dim::ONE);
+    close(val("round(2.345, 2) ="), 2.35, Dim::ONE);
+    assert!(matches!(err("ceil(2.1, 1) ="), CalcError::Arity(..)));
+}
+
+#[test]
+fn new_scalar_function_names_reserved() {
+    for name in ["erf", "csc", "cot", "secant", "atanh", "J0", "J1", "Ceil", "Floor", "Round"] {
+        assert_eq!(check_name(name), Err(CalcError::ReservedName(name.into())), "{name}");
+        assert_eq!(err(&format!("{name} := 1")), CalcError::ReservedName(name.into()), "{name}");
+    }
+}
+
 #[test]
 fn arity_errors() {
     assert_eq!(err("sin() ="), CalcError::Arity("sin".into(), 1));
@@ -968,6 +1069,159 @@ fn products() {
     assert_eq!(syntax_msg(run(&mut env, "dot([1, 2], [1, 2, 3]) =").expect_err("lengths")), "dot needs a and b of the same length (2 and 3)");
 }
 
+/// An env holding `M := [1, 2, 3; 4, 5, 6; 7, 8, 9]`, numbered from `origin`.
+fn nine(origin: u8) -> Env {
+    let mut env = Env::new();
+    env.set_origin(origin);
+    run(&mut env, "M := [1, 2, 3; 4, 5, 6; 7, 8, 9]").expect("defines M");
+    env
+}
+
+#[test]
+fn submatrix_counts_from_index_base() {
+    let (shape, items) = grid(&mut nine(0), "submatrix(M, 1, 2, 0, 1) =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[4.0, 5.0, 7.0, 8.0], Dim::ONE);
+    let (shape, items) = grid(&mut nine(1), "submatrix(M, 1, 2, 1, 2) =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[1.0, 2.0, 4.0, 5.0], Dim::ONE);
+    // One row, one column, and one element: a single value is a 1 × 1 matrix.
+    let (shape, items) = grid(&mut nine(0), "submatrix(M, 2, 2, 0, 2) =");
+    assert_eq!(shape, (1, 3));
+    close_all(&items, &[7.0, 8.0, 9.0], Dim::ONE);
+    close(shown(&mut nine(0), "submatrix(M, 1, 1, 1, 1) ="), 5.0, Dim::ONE);
+    close(shown(&mut Env::new(), "submatrix(7, 0, 0, 0, 0) ="), 7.0, Dim::ONE);
+    // Units stay with the elements, and a text matrix gives texts.
+    let mut env = Env::new();
+    run(&mut env, "Q1 := [1, 2; 3, 4] in").expect("defines Q1");
+    let (_, items) = grid(&mut env, "submatrix(Q1, 1, 1, 0, 1) =");
+    close_all(&items, &[3.0 * INCH, 4.0 * INCH], Dim { exp: [1, 0, 0, 0, 0, 0, 0, 0] });
+    run(&mut env, "T := [\"a\", \"b\"; \"c\", \"d\"]").expect("defines T");
+    assert_eq!(
+        run_value(&mut env, "submatrix(T, 0, 1, 1, 1) ="),
+        Ok(Some(Value::TextGrid { rows: 2, cols: 1, items: vec!["b".into(), "d".into()] }))
+    );
+    assert_eq!(run_value(&mut env, "submatrix(T, 1, 1, 0, 0) ="), Ok(Some(Value::Text("c".into()))));
+}
+
+#[test]
+fn submatrix_range_errors_name_what_is_wrong() {
+    let msg = |origin: u8, src: &str| match run_value(&mut nine(origin), src) {
+        Err(CalcError::IndexRange(m) | CalcError::Syntax(m)) => m,
+        other => panic!("{src:?} should be an index or syntax error: {other:?}"),
+    };
+    assert_eq!(msg(0, "submatrix(M, 1, 3, 0, 1) ="), "submatrix row 3 (jr) is outside M (rows 0 to 2)");
+    assert_eq!(msg(0, "submatrix(M, 0, 1, 0, 3) ="), "submatrix column 3 (jc) is outside M (columns 0 to 2)");
+    assert_eq!(msg(1, "submatrix(M, 0, 1, 1, 2) ="), "submatrix row 0 (ir) is outside M (rows 1 to 3)");
+    assert_eq!(msg(0, "submatrix(M, 0, 1, -1, 1) ="), "submatrix column -1 (ic) is outside M (columns 0 to 2)");
+    assert_eq!(msg(0, "submatrix(M, 2, 1, 0, 1) ="), "submatrix needs ir to be at most jr (rows 2 and 1)");
+    assert_eq!(msg(0, "submatrix(M, 0, 1, 2, 0) ="), "submatrix needs ic to be at most jc (columns 2 and 0)");
+    assert_eq!(msg(0, "submatrix(M, 0.5, 1, 0, 1) ="), "submatrix needs ir to be a whole number");
+    assert_eq!(msg(0, "submatrix(M, 0, 1, 0, [1, 2]) ="), "submatrix needs jc to be a whole number");
+    assert_eq!(msg(0, "submatrix(M, 0, 1 in, 0, 1) ="), "submatrix needs jr to be a whole number");
+    assert!(matches!(err("submatrix([1, 2], 0, 0, 0) ="), CalcError::Arity(..)));
+}
+
+#[test]
+fn augment_and_stack() {
+    let (shape, items) = grid(&mut Env::new(), "augment([1; 2], [3; 4]) =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[1.0, 3.0, 2.0, 4.0], Dim::ONE);
+    let (shape, items) = grid(&mut Env::new(), "stack(transpose([1, 2]), transpose([3, 4])) =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[1.0, 2.0, 3.0, 4.0], Dim::ONE);
+    // More than two, matrices as well as vectors, and single values as 1 × 1.
+    let (shape, items) = grid(&mut Env::new(), "augment([1, 2; 3, 4], [5; 6], [7, 8; 9, 10]) =");
+    assert_eq!(shape, (2, 5));
+    close_all(&items, &[1.0, 2.0, 5.0, 7.0, 8.0, 3.0, 4.0, 6.0, 9.0, 10.0], Dim::ONE);
+    // (`[1, 2]` is a column: a row is `transpose([1, 2])`.)
+    let (shape, items) = grid(&mut Env::new(), "stack(transpose([1, 2]), [3, 4; 5, 6], transpose([7, 8])) =");
+    assert_eq!(shape, (4, 2));
+    close_all(&items, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], Dim::ONE);
+    let (shape, items) = grid(&mut Env::new(), "stack([1, 2], 3, [4; 5]) =");
+    assert_eq!(shape, (5, 1));
+    close_all(&items, &[1.0, 2.0, 3.0, 4.0, 5.0], Dim::ONE);
+    let (shape, items) = grid(&mut Env::new(), "augment(1, 2) =");
+    assert_eq!((shape, items.len()), ((1, 2), 2));
+    // The sizes must agree, and the message gives both.
+    let mut env = Env::new();
+    run(&mut env, "V1 := [1; 2]").expect("defines V1");
+    let e = run_value(&mut env, "augment(V1, [1; 2; 3]) =").expect_err("2 rows and 3 rows");
+    assert_eq!(syntax_msg(e), "augment needs V1 and argument 2 to have the same number of rows (V1 is 2 × 1, argument 2 is 3 × 1)");
+    let e = run_value(&mut env, "augment([1; 2], [3; 4], [5]) =").expect_err("2 rows and 1 row");
+    assert_eq!(syntax_msg(e), "augment needs argument 1 and argument 3 to have the same number of rows (argument 1 is 2 × 1, argument 3 is 1 × 1)");
+    let e = run_value(&mut env, "stack(transpose([1, 2]), transpose([1, 2, 3])) =").expect_err("2 columns and 3 columns");
+    assert_eq!(syntax_msg(e), "stack needs argument 1 and argument 2 to have the same number of columns (argument 1 is 1 × 2, argument 2 is 1 × 3)");
+    assert!(matches!(err("augment([1; 2]) ="), CalcError::Arity(..)));
+    assert!(matches!(err("stack([1, 2]) ="), CalcError::Arity(..)));
+    assert!(matches!(err("augment() ="), CalcError::Arity(..)));
+    // Units are kept per element.
+    let mut env = Env::new();
+    let (shape, items) = grid(&mut env, "augment([1; 2] in, [3; 4] lbf) =");
+    assert_eq!(shape, (2, 2));
+    let (len, force) = (quantities(&[1.0], "in")[0].dim, quantities(&[1.0], "lbf")[0].dim);
+    close(items[0], INCH, len);
+    close(items[1], quantities(&[3.0], "lbf")[0].value, force);
+    close(items[2], 2.0 * INCH, len);
+    close(items[3], quantities(&[4.0], "lbf")[0].value, force);
+}
+
+#[test]
+fn augment_text() {
+    let mut env = Env::new();
+    assert_eq!(
+        run_value(&mut env, "augment([\"a\"; \"b\"], [\"c\"; \"d\"]) ="),
+        Ok(Some(Value::TextGrid { rows: 2, cols: 2, items: vec!["a".into(), "c".into(), "b".into(), "d".into()] }))
+    );
+    assert_eq!(
+        run_value(&mut env, "stack(transpose([\"a\", \"b\"]), \"c\") =").map(|_| ()).map_err(|e| e.to_string()),
+        Err("stack needs argument 1 and argument 2 to have the same number of columns (argument 1 is 1 × 2, argument 2 is 1 × 1)".to_string())
+    );
+    assert_eq!(run_value(&mut env, "stack(\"a\", \"c\") ="), Ok(Some(Value::TextGrid { rows: 2, cols: 1, items: vec!["a".into(), "c".into()] })));
+    // Text with numbers is the mixed error, naming where in the result each would sit.
+    let e = run_value(&mut env, "augment([\"a\"; \"b\"], [1; 2]) =").expect_err("text with numbers");
+    assert_eq!(syntax_msg(e), "element [0, 1] is a number but element [0, 0] is text");
+    let e = run_value(&mut env, "augment([1; 2], [\"a\"; \"b\"]) =").expect_err("numbers with text");
+    assert_eq!(syntax_msg(e), "element [0, 1] is text but element [0, 0] is a number");
+    let e = run_value(&mut env, "stack(1, \"a\") =").expect_err("a number with a text");
+    assert_eq!(syntax_msg(e), "element 1 is text but element 0 is a number");
+}
+
+#[test]
+fn matrix_functions_are_charged_by_element() {
+    let stmt = |src: &str| parse(src).unwrap_or_else(|e| panic!("{src:?} did not parse: {e}"));
+    let spent = |env: &mut Env, src: &str| {
+        let pass = Pass::new(u64::MAX);
+        run_stmt_in(env, &stmt(src), &pass).unwrap();
+        pass.spent.get()
+    };
+    let mut env = nine(0);
+    // Each is what its operands cost (a name is its 9 elements and one step, a number one step), the
+    // elements it makes (4, 18 and 27) and one step for the name defined.
+    assert_eq!(spent(&mut env, "r1 := submatrix(M, 0, 1, 0, 1)"), (9 + 1) + 4 + 4 + 1);
+    assert_eq!(spent(&mut env, "r2 := augment(M, M)"), 2 * (9 + 1) + 18 + 1);
+    assert_eq!(spent(&mut env, "r3 := stack(M, M, M)"), 3 * (9 + 1) + 27 + 1);
+    // A result over 10 000 elements is refused before any of it is made, and the work stops a budget.
+    run(&mut env, "i := 0..4999").unwrap();
+    run(&mut env, "v[i] := 1").unwrap();
+    assert_eq!(run_value(&mut env, "augment(v, v, v) ="), Err(CalcError::TooLarge));
+    // The size is refused first, before anything else about the matrices is looked at.
+    run(&mut env, "tv[i] := \"a\"").unwrap();
+    assert_eq!(run_value(&mut env, "augment(v, tv, v) ="), Err(CalcError::TooLarge));
+    assert_eq!(run_value(&mut env, "stack(tv, v, v) ="), Err(CalcError::TooLarge));
+    let pass = Pass::new(2 * 5_001 + 100);
+    assert_eq!(run_stmt_in(&mut env, &stmt("w := stack(v, v)"), &pass), Err(CalcError::TooMuchWork));
+    // One step short of the whole: submatrix's operand (5000 elements and one step), its four
+    // numbers and the name defined fit in the budget; the 5000 elements it makes don't.
+    let src = "w := submatrix(v, 0, 4999, 0, 0)";
+    let made = 5_000;
+    let total = spent(&mut env, src);
+    assert_eq!(total, 5_001 + 4 + 1 + made);
+    let pass = Pass::new(total - 1);
+    assert_eq!(run_stmt_in(&mut env, &stmt(src), &pass), Err(CalcError::TooMuchWork));
+    assert_eq!(pass.spent(), total - made, "it stops at submatrix's own charge, with none of it counted");
+}
+
 #[test]
 fn lookup_is_exact() {
     let mut env = flanges();
@@ -1057,9 +1311,345 @@ fn interp_needs_increasing_xs() {
     assert_eq!(syntax_msg(e), "linterp needs xs strictly increasing — element 2 isn't more than element 1");
 }
 
+/// The pump curve of `Mathcad Verification Simple Pump Model.xmcd`.
+fn pump() -> Env {
+    let mut env = Env::new();
+    run(&mut env, "flowrate := [0, 1000, 2000, 3000, 3500, 4000] gpm").expect("defines flowrate");
+    run(&mut env, "head := [230, 228.5, 221, 200.5, 183.5, 157] ft").expect("defines head");
+    run(&mut env, "H(Q) := interp(cspline(flowrate, head), flowrate, head, Q)").expect("defines H");
+    env
+}
+
+#[test]
+fn cspline_matches_mathcad_pump_curve() {
+    let mut env = pump();
+    // Mathcad's saved values, to a relative 1e-12.
+    for (q, want) in [(100.0, 229.892), (200.0, 229.796), (500.0, 229.5), (1000.0, 228.5)] {
+        let got = shown(&mut env, &format!("H({q} gpm) ="));
+        assert_eq!(got.dim, Dim::LENGTH, "H({q})");
+        let want = quantity(want, "ft").value;
+        assert!((got.value - want).abs() <= 1e-12 * want, "H({q} gpm) = {} vs {want}", got.value);
+    }
+    run(&mut env, "Qv := [0, 100, 200] gpm").expect("defines Qv");
+    let (shape, items) = grid(&mut env, "H(Qv) =");
+    assert_eq!(shape, (3, 1));
+    for (got, want) in items.iter().zip([230.0, 229.892, 229.796]) {
+        let want = quantity(want, "ft").value;
+        assert_eq!(got.dim, Dim::LENGTH);
+        assert!((got.value - want).abs() <= 1e-12 * want, "{} vs {want}", got.value);
+    }
+}
+
+#[test]
+fn spline_coefficient_vectors_have_the_documented_layout() {
+    let mut env = pump();
+    for (f, kind) in [("lspline", 1.0), ("pspline", 2.0), ("cspline", 3.0)] {
+        run(&mut env, &format!("c := {f}(flowrate, head)")).expect("defines c");
+        let (shape, items) = grid(&mut env, "c =");
+        // n + 3 elements: the kind, 3 and 0, then a second derivative at each of the 6 points.
+        assert_eq!(shape, (9, 1), "{f}");
+        close_all(&items[..3], &[kind, 3.0, 0.0], Dim::ONE);
+        // The second derivatives are in vy/vx².
+        let per_flow_squared = Dim::LENGTH.div(quantity(1.0, "gpm").dim.powi(2).expect("squared")).expect("quotient");
+        assert!(items[3..].iter().all(|q| q.dim == per_flow_squared), "{f}: {items:?}");
+    }
+    // The same positions in a document numbered from 1: element 0 of an lspline's vector is 1
+    // (element 1 is 3 whatever the numbering), and base-1 c[5] is base-0 c[4], the second
+    // derivative at the second point (not 0, as at the ends of a natural spline).
+    run(&mut env, "c := lspline(flowrate, head)").expect("defines c");
+    let second = shown(&mut env, "c[4] =");
+    assert!(second.value != 0.0, "{second:?}");
+    env.set_origin(1);
+    close(shown(&mut env, "c[1] ="), 1.0, Dim::ONE);
+    assert_eq!(shown(&mut env, "c[5] ="), second);
+}
+
+#[test]
+fn lspline_is_natural() {
+    let mut env = flanges();
+    column(&mut env, "xs", &[0.0, 1.0, 3.0, 4.0, 7.0], "1");
+    column(&mut env, "ys", &[2.0, -1.0, 4.0, 4.5, 0.0], "1");
+    for x in ["0", "0.5", "2", "3.5", "5.25", "7"] {
+        let natural = shown(&mut env, &format!("spline(xs, ys, {x}) =")).value;
+        let fitted = shown(&mut env, &format!("interp(lspline(xs, ys), xs, ys, {x}) =")).value;
+        assert!((natural - fitted).abs() <= 1e-12 * natural.abs().max(1.0), "x = {x}: {natural} vs {fitted}");
+    }
+}
+
+#[test]
+fn pspline_parabolic_ends() {
+    let mut env = pump();
+    run(&mut env, "c := pspline(flowrate, head)").expect("defines c");
+    // M_0 = M_1 and M_5 = M_4; the other second derivatives differ.
+    assert_eq!(shown(&mut env, "c[3] =").value, shown(&mut env, "c[4] =").value);
+    assert_eq!(shown(&mut env, "c[8] =").value, shown(&mut env, "c[7] =").value);
+    assert_ne!(shown(&mut env, "c[4] =").value, shown(&mut env, "c[5] =").value);
+    // It passes through every point, and a parabola is reproduced exactly.
+    close_to(shown(&mut env, "interp(c, flowrate, head, 2000 gpm) ="), quantity(221.0, "ft"));
+    column(&mut env, "X", &[0.0, 1.0, 3.0, 4.0, 7.0], "1");
+    column(&mut env, "S", &[0.0, 1.0, 9.0, 16.0, 49.0], "1");
+    for x in ["0.5", "2", "3.5", "5.5"] {
+        let want: f64 = x.parse::<f64>().expect("a number").powi(2);
+        let got = shown(&mut env, &format!("interp(pspline(X, S), X, S, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-12 * want, "x = {x}: {got} vs {want}");
+        let got = shown(&mut env, &format!("interp(cspline(X, S), X, S, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-12 * want, "cspline, x = {x}: {got} vs {want}");
+    }
+}
+
+#[test]
+fn cspline_reproduces_a_cubic_and_small_data() {
+    let mut env = Env::new();
+    // Not-a-knot-like ends: a cubic is reproduced exactly by a spline whose M runs in a straight
+    // line across each end's two intervals.
+    column(&mut env, "X", &[0.0, 1.0, 2.5, 3.0, 5.0, 6.0], "1");
+    let cubic = |x: f64| 1.0 - 2.0 * x + 0.5 * x * x + 0.25 * x * x * x;
+    column(&mut env, "C", &[0.0, 1.0, 2.5, 3.0, 5.0, 6.0].map(cubic), "1");
+    for x in ["0.5", "1.75", "2.75", "4", "5.5"] {
+        let want = cubic(x.parse().expect("a number"));
+        let got = shown(&mut env, &format!("interp(cspline(X, C), X, C, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-11 * want.abs().max(1.0), "x = {x}: {got} vs {want}");
+    }
+    // Three points: the one parabola through them. Two points suit only lspline.
+    column(&mut env, "X3", &[1.0, 2.0, 4.0], "1");
+    column(&mut env, "Y3", &[1.0, 4.0, 16.0], "1");
+    for f in ["cspline", "pspline", "lspline"] {
+        assert!(run_value(&mut env, &format!("{f}(X3, Y3) =")).is_ok(), "{f}");
+    }
+    close(shown(&mut env, "interp(cspline(X3, Y3), X3, Y3, 3) ="), 9.0, Dim::ONE);
+    column(&mut env, "X2", &[1.0, 2.0], "1");
+    column(&mut env, "Y2", &[1.0, 4.0], "1");
+    assert!(run_value(&mut env, "lspline(X2, Y2) =").is_ok());
+    for f in ["cspline", "pspline"] {
+        assert_eq!(syntax_msg(run_value(&mut env, &format!("{f}(X2, Y2) =")).expect_err("too few")), format!("{f} needs at least 3 points in X2"));
+    }
+    let e = run_value(&mut env, "cspline([1, 3, 2], [1, 2, 3]) =").expect_err("not increasing");
+    assert_eq!(syntax_msg(e), "cspline needs vx strictly increasing — element 2 isn't more than element 1");
+    let e = run_value(&mut env, "regress([1, 2, 3], [1, 2], 1) =").expect_err("lengths differ");
+    assert_eq!(syntax_msg(e), "regress needs vx and vy of the same length (3 and 2)");
+}
+
+#[test]
+fn regress_matches_mathcad() {
+    let mut env = Env::new();
+    run(&mut env, "T := [100, 200, 300, 400, 500]").expect("defines T");
+    run(&mut env, "k := [0.25, 0.31, 0.40, 0.51, 0.64]").expect("defines k");
+    run(&mut env, "c := regress(T, k, 2)").expect("defines c");
+    let (shape, items) = grid(&mut env, "c =");
+    // k + 4 elements: the kind (4), 3 and k, then a_0 … a_k.
+    assert_eq!(shape, (6, 1));
+    close_all(&items[..3], &[4.0, 3.0, 2.0], Dim::ONE);
+    // ASTM C547 PolyRegress w Header.xmcd, to a relative 1e-9.
+    for (at, want) in [(3, 0.20799999999999994), (4, 0.0002942857142857147), (5, 1.1428571428571426E-06)] {
+        let got = shown(&mut env, &format!("c[{at}] =")).value;
+        assert!((got - want).abs() <= 1e-9 * want, "c[{at}] = {got} vs {want}");
+    }
+    // A fit evaluates anywhere, beyond the data too.
+    let want = 0.208 + 2.942857e-4 * 600.0 + 1.142857e-6 * 600.0 * 600.0;
+    let got = shown(&mut env, "interp(c, T, k, 600) =").value;
+    assert!((got - want).abs() <= 1e-6 * want, "{got} vs {want}");
+}
+
+#[test]
+fn regress_scales_and_keeps_units() {
+    let mut env = Env::new();
+    // x around 2000: a plain normal-equations solve loses its digits here.
+    run(&mut env, "Yrs := [2000, 2001, 2002, 2003, 2004, 2005]").expect("defines Yrs");
+    let poly = |t: f64| 3.0 + 0.5 * (t - 2002.0) + 0.25 * (t - 2002.0).powi(2);
+    column(&mut env, "v", &[2000.0, 2001.0, 2002.0, 2003.0, 2004.0, 2005.0].map(poly), "1");
+    run(&mut env, "c := regress(Yrs, v, 2)").expect("defines c");
+    for (x, want) in [2000.0_f64, 2002.0, 2004.0, 2010.0].map(|x| (x, poly(x))) {
+        let got = shown(&mut env, &format!("interp(c, Yrs, v, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-6, "x = {x}: {got} vs {want}");
+    }
+    // The units of a_j are those of vy/vx^j.
+    column(&mut env, "Dd", &[1.0, 2.0, 3.0, 4.0], "in");
+    column(&mut env, "Fo", &[10.0, 20.0, 40.0, 70.0], "lbf");
+    let (_, items) = grid(&mut env, "regress(Dd, Fo, 2) =");
+    let inch = quantity(1.0, "in").dim;
+    let lbf = quantity(1.0, "lbf").dim;
+    assert_eq!(items.len(), 6);
+    assert_eq!(items[3].dim, lbf);
+    assert_eq!(items[4].dim, lbf.div(inch).expect("per length"));
+    assert_eq!(items[5].dim, lbf.div(inch.powi(2).expect("squared")).expect("per area"));
+    // k = 1 is the straight line of `slope` and `intercept`.
+    let (_, line) = grid(&mut env, "regress(Dd, Fo, 1) =");
+    close_to(Quantity::new(line[3].value, line[3].dim), shown(&mut env, "intercept(Dd, Fo) ="));
+    close_to(Quantity::new(line[4].value, line[4].dim), shown(&mut env, "slope(Dd, Fo) ="));
+    // At the data's own points a fit through as many points as it has coefficients gives the data.
+    close_to(shown(&mut env, "interp(regress(Dd, Fo, 3), Dd, Fo, 3 in) ="), quantity(40.0, "lbf"));
+}
+
+#[test]
+fn slope_intercept() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 2, 3] in").expect("defines x");
+    run(&mut env, "y := [2, 4, 6] lbf").expect("defines y");
+    close_to(shown(&mut env, "slope(x, y) ="), quantity(2.0, "lbf").div(quantity(1.0, "in")).expect("a quotient"));
+    close_to(shown(&mut env, "intercept(x, y) ="), quantity(0.0, "lbf"));
+    // A line that doesn't pass through the origin, and noisy data: least squares.
+    run(&mut env, "u := [0, 1, 2, 3]").expect("defines u");
+    run(&mut env, "w := [1, 3, 4, 7]").expect("defines w");
+    close(shown(&mut env, "slope(u, w) ="), 1.9, Dim::ONE);
+    close(shown(&mut env, "intercept(u, w) ="), 0.9, Dim::ONE);
+    // No line through x values that are all the same, or through one point.
+    assert!(run(&mut env, "slope([2, 2, 2], [1, 2, 3]) =").is_err());
+    assert!(run(&mut env, "intercept([2], [1]) =").is_err());
+    let e = run(&mut env, "slope([1, 2, 3], [1, 2]) =").expect_err("lengths differ");
+    assert_eq!(syntax_msg(e), "slope needs vx and vy of the same length (3 and 2)");
+}
+
+#[test]
+fn interp_refuses_outside_spline_data() {
+    let mut env = pump();
+    let spline_error = run(&mut env, "spline(flowrate, head, 4100 gpm) =").expect_err("outside");
+    assert!(syntax_msg(spline_error.clone()).contains("is outside flowrate"), "{spline_error:?}");
+    for f in ["cspline", "lspline", "pspline"] {
+        let e = run(&mut env, &format!("interp({f}(flowrate, head), flowrate, head, 4100 gpm) =")).expect_err("outside");
+        assert_eq!(e, spline_error, "{f}");
+        let e = run(&mut env, &format!("interp({f}(flowrate, head), flowrate, head, -1 gpm) =")).expect_err("outside");
+        let msg = syntax_msg(e);
+        assert!(msg.starts_with("-3.85 in³/sec is outside flowrate"), "{f}: {msg}");
+    }
+    // The ends themselves are in the data.
+    close_to(shown(&mut env, "H(4000 gpm) ="), quantity(157.0, "ft"));
+}
+
+#[test]
+fn interp_rejects_foreign_vectors() {
+    let mut env = Env::new();
+    for src in ["xs := [1, 2, 3, 4]", "ys := [2, 3, 5, 9]", "xs2 := [1, 2, 3, 4, 5]", "ys2 := [2, 3, 5, 9, 1]"] {
+        run(&mut env, src).expect("defines");
+    }
+    let phrase = "cspline, lspline, pspline or regress";
+    let attempts = [
+        // Not from any of them.
+        "interp([1, 2, 3], xs, ys, 2) =",
+        "interp([1, 2, 3, 4, 5, 6, 7], xs, ys, 2) =",
+        "interp(5, xs, ys, 2) =",
+        // From a spline over data of another length.
+        "interp(cspline(xs, ys), xs2, ys2, 2) =",
+        "interp(lspline(xs2, ys2), xs, ys, 2) =",
+        // A regress vector whose length isn't its degree + 4, or a header that isn't ours.
+        "interp([4, 3, 2, 1, 1], xs, ys, 2) =",
+        "interp([9, 3, 0, 1, 1, 1, 1], xs, ys, 2) =",
+        "interp([3, 4, 0, 1, 1, 1, 1], xs, ys, 2) =",
+        "interp([3, 3, 1, 1, 1, 1, 1], xs, ys, 2) =",
+    ];
+    for src in attempts {
+        let e = run(&mut env, src).expect_err(src);
+        assert!(syntax_msg(e).contains(phrase), "{src}");
+    }
+    // A vector from the data's other units doesn't fit either.
+    column(&mut env, "Dd", &[1.0, 2.0, 3.0, 4.0], "in");
+    let e = run(&mut env, "interp(cspline(xs, ys), Dd, ys, 2 in) =").expect_err("units differ");
+    assert!(syntax_msg(e).contains(phrase));
+    // Too short for the header, counted in the right number.
+    let e = syntax_msg(run(&mut env, "interp(5, xs, ys, 2) =").expect_err("one element"));
+    assert!(e.ends_with("— it has 1 element, not even a header"), "{e}");
+    let e = syntax_msg(run(&mut env, "interp([5, 3], xs, ys, 2) =").expect_err("two elements"));
+    assert!(e.ends_with("— it has 2 elements, not even a header"), "{e}");
+    // A matrix isn't a vector.
+    assert!(run(&mut env, "interp([1, 2; 3, 4], xs, ys, 2) =").is_err());
+    // Four arguments.
+    assert_eq!(run(&mut env, "interp(cspline(xs, ys), xs, ys) =").expect_err("arity"), CalcError::Arity("interp".into(), 4));
+}
+
+#[test]
+fn interp_per_element_in_cases() {
+    let mut env = Env::new();
+    for src in ["xs := [0, 10, 20, 30]", "ys := [0, 100, 400, 900]", "x := [5, 15, 40]"] {
+        run(&mut env, src).unwrap();
+    }
+    run(&mut env, "c := cspline(xs, ys)").unwrap();
+    // Only the elements that pick the branch can fail in it.
+    let v = vector_in(&mut env, "y := interp(c, xs, ys, x) if x ≤ 30, 0 otherwise =");
+    assert_eq!(v.len(), 3);
+    assert_eq!(v[2], 0.0);
+    assert!(v[0] > 0.0 && v[1] > 100.0, "{v:?}");
+    assert_eq!(vector_in(&mut env, "y_2 := if(x ≤ 30, interp(c, xs, ys, x), 0) =")[2], 0.0);
+    assert_eq!(err_in(&mut env, "b := interp(c, xs, ys, x) if x ≥ 0, 0 otherwise ="), "element 2: 40 is outside xs (0 to 30)");
+    // Strict callers keep their errors.
+    assert_eq!(err_in(&mut env, "interp(c, xs, ys, x) ="), "element 2: 40 is outside xs (0 to 30)");
+    // The coefficient vector is taken whole: a failed element of it fails every element.
+    run(&mut env, "z := [4, 0, 9, 1]").unwrap();
+    assert_eq!(err_in(&mut env, "b := interp(1/z, xs, ys, x) if x ≤ 30, 0 otherwise ="), "element 1: result isn't a finite number");
+    // A regress vector evaluates anywhere, per element too.
+    run(&mut env, "r := regress(xs, ys, 2)").unwrap();
+    let v = vector_in(&mut env, "q := interp(r, xs, ys, x) if x ≤ 100, 0 otherwise =");
+    assert!((v[2] - 1600.0).abs() <= 1e-9, "{v:?}");
+}
+
+#[test]
+fn regress_degree_checks() {
+    let mut env = Env::new();
+    run(&mut env, "T := [100, 200, 300, 400, 500]").unwrap();
+    run(&mut env, "k := [0.25, 0.31, 0.40, 0.51, 0.64]").unwrap();
+    for bad in ["0", "5", "6", "1.5", "-1", "2.000001", "[1, 2]"] {
+        let e = run_value(&mut env, &format!("regress(T, k, {bad}) =")).expect_err(bad);
+        assert!(syntax_msg(e).contains("whole number from 1 to 4"), "{bad}");
+    }
+    let e = run_value(&mut env, "regress(T, k, 2 in) =").expect_err("not a plain number");
+    assert!(syntax_msg(e).contains("whole number from 1 to 4"));
+    for ok in ["1", "2", "4"] {
+        assert!(run_value(&mut env, &format!("regress(T, k, {ok}) =")).is_ok(), "{ok}");
+    }
+    // All x the same: no curve to fit.
+    assert!(run_value(&mut env, "regress([3, 3, 3], [1, 2, 4], 1) =").is_err());
+    // Two different values can't fix a parabola.
+    let e = run_value(&mut env, "regress([1, 2, 2, 2], [1, 2, 3, 4], 2) =").expect_err("too few different values");
+    assert_eq!(syntax_msg(e), "regress can't fit degree 2 to vx: it has too few different values");
+}
+
+#[test]
+fn curve_fitting_charges_the_pass() {
+    let mut env = Env::new();
+    column(&mut env, "X", &(0..50).map(f64::from).collect::<Vec<_>>(), "1");
+    column(&mut env, "Y", &(0..50).map(|k| f64::from(k * k)).collect::<Vec<_>>(), "1");
+    // A spline costs its points (and its vector); a fit costs its points times its degree squared.
+    fn spent(env: &mut Env, src: &str, limit: u64) -> (Result<Option<Data>, CalcError>, u64) {
+        let pass = Pass::new(limit);
+        let r = run_stmt_in(env, &parse(src).expect("parses"), &pass);
+        (r, pass.spent.get())
+    }
+    let (r, small) = spent(&mut env, "c := cspline(X, Y)", u64::MAX);
+    assert!(r.is_ok());
+    assert!(small >= 50, "{small}");
+    let (r, fit) = spent(&mut env, "r := regress(X, Y, 10)", u64::MAX);
+    assert!(r.is_ok());
+    assert!(fit >= 50 * 11 * 11, "{fit}");
+    assert_eq!(spent(&mut env, "r := regress(X, Y, 10)", 50 * 11 * 11 - 1).0, Err(CalcError::TooMuchWork));
+    assert_eq!(spent(&mut env, "c := cspline(X, Y)", 10).0, Err(CalcError::TooMuchWork));
+    // A fit of every point of a long table is refused before a matrix that size is built.
+    column(&mut env, "BigX", &(0..2000).map(f64::from).collect::<Vec<_>>(), "1");
+    assert_eq!(spent(&mut env, "r := regress(BigX, BigX, 1999)", u64::MAX).0, Err(CalcError::TooLarge));
+}
+
 #[test]
 fn new_function_names_are_reserved() {
-    for name in ["sum", "length", "rows", "cols", "mean", "dot", "mmul", "transpose", "lookup", "linterp", "spline"] {
+    for name in [
+        "sum",
+        "length",
+        "rows",
+        "cols",
+        "mean",
+        "dot",
+        "mmul",
+        "transpose",
+        "lookup",
+        "linterp",
+        "spline",
+        "cspline",
+        "lspline",
+        "pspline",
+        "regress",
+        "interp",
+        "slope",
+        "intercept",
+        "submatrix",
+        "augment",
+        "stack",
+    ] {
         assert_eq!(check_name(name), Err(CalcError::ReservedName(name.into())), "{name}");
     }
 }
@@ -1392,9 +1982,10 @@ fn whole_array_uses_refuse_lenient_failures() {
     run(&mut env, "x := [1, 0, 2]").unwrap();
     run(&mut env, "M := [1, 0; 2, 3]").unwrap();
     run(&mut env, "first(v) := v[0]").unwrap();
-    for src in ["sum(1/x)", "length(1/x)", "transpose(1/x)", "max(1/x)", "lookup(x, 1/x, 2)", "first(1/x)"] {
+    for src in ["sum(1/x)", "length(1/x)", "transpose(1/x)", "max(1/x)", "lookup(x, 1/x, 2)", "first(1/x)", "augment(1/x, x)", "stack(x, 1/x)"] {
         assert!(lenient_err(&env, src).starts_with("element 1:"), "{src}: {}", lenient_err(&env, src));
     }
+    assert!(lenient_err(&env, "submatrix(1/x, 0, 1, 0, 0)").starts_with("element 1:"), "{}", lenient_err(&env, "submatrix(1/x, 0, 1, 0, 0)"));
     assert!(lenient_err(&env, "sum(1/M)").starts_with("element [0, 1]:"), "{}", lenient_err(&env, "sum(1/M)"));
     // Work that runs out is never kept per element.
     let big = Env::new();
@@ -1823,4 +2414,57 @@ fn sums_are_bounded_work() {
     let opens: String = (0..40).map(|k| format!("∑(i_{k} = 1..1) ")).collect();
     let src = format!("{opens}1 =");
     assert_eq!(run(&mut env, &src).unwrap().unwrap().value, 1.0);
+}
+
+#[test]
+fn percent_unit() {
+    close(val("5 % · 200 ="), 10.0, Dim::ONE);
+    close(val("5 % ="), 0.05, Dim::ONE);
+    close(val("x := 0.25 = ? %"), 0.25, Dim::ONE);
+}
+
+#[test]
+fn hour_is_hr() {
+    close(val("1 hr ="), 3600.0, Dim::TIME);
+    let q = val("3412.14 Btu/hr = ? watt");
+    assert_eq!(q.dim, val("1 watt =").dim);
+    assert!((q.value - 1000.0).abs() < 1e-3, "{}", q.value);
+}
+
+#[test]
+fn h_hints_hr() {
+    let e = err("5 h =");
+    assert_eq!(e, CalcError::Undefined("h".into()));
+    assert_eq!(e.to_string(), "h isn't defined — for hours, use hr");
+    // Any other name has no hint.
+    assert_eq!(err("5 hh =").to_string(), "hh isn't defined");
+    // As a unit to show a result in, too, alone or inside a compound unit.
+    for src in ["t := 2 hr = ? h", "1 kW·hr = ? kW·h", "1 kW = ? BTU/h"] {
+        let e = err(src);
+        assert_eq!(e, CalcError::Unit(UnitError::UnknownUnit("h".into())), "{src}");
+        assert_eq!(e.to_string(), "unknown unit `h` — for hours, use hr", "{src}");
+    }
+    // Another unknown unit has no hint.
+    assert_eq!(err("1 in = ? hh").to_string(), "unknown unit `hh`");
+}
+
+#[test]
+fn sec_called_hints_secant() {
+    let e = syntax_msg(err("sec(60 deg) ="));
+    assert_eq!(e, "sec isn't a function — for the secant, use secant(x)");
+    // Another unit called keeps the plain message.
+    assert_eq!(syntax_msg(err("m(2) =")), "m isn't a function — it can't be called with ( )");
+    close(val("secant(60 deg) ="), 2.0, Dim::ONE);
+}
+
+#[test]
+fn newly_reserved_names() {
+    for name in ["bar", "day", "ton", "cal", "mbar", "kbar", "kcal"] {
+        let e = err(&format!("{name} := 3"));
+        assert_eq!(e, CalcError::ReservedName(name.into()), "{name}");
+    }
+    // bar takes no prefix: these stay free as names.
+    for name in ["ubar", "cbar", "nbar", "Mbar", "µbar"] {
+        assert_eq!(check_name(name), Ok(()), "{name}");
+    }
 }
