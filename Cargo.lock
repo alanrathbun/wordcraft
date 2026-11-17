@@ -1263,6 +1263,7 @@ dependencies = [
 [[package]]
 name = "craft-units"
 version = "0.1.0"
+source = "git+https://github.com/alanrathbun/craft-libs?rev=05f58ac578b362499782c9768a295ee1b7ebb739#05f58ac578b362499782c9768a295ee1b7ebb739"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
