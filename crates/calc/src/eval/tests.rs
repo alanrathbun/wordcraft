@@ -1205,10 +1205,21 @@ fn matrix_functions_are_charged_by_element() {
     run(&mut env, "i := 0..4999").unwrap();
     run(&mut env, "v[i] := 1").unwrap();
     assert_eq!(run_value(&mut env, "augment(v, v, v) ="), Err(CalcError::TooLarge));
+    // The size is refused first, before anything else about the matrices is looked at.
+    run(&mut env, "tv[i] := \"a\"").unwrap();
+    assert_eq!(run_value(&mut env, "augment(v, tv, v) ="), Err(CalcError::TooLarge));
+    assert_eq!(run_value(&mut env, "stack(tv, v, v) ="), Err(CalcError::TooLarge));
     let pass = Pass::new(2 * 5_001 + 100);
     assert_eq!(run_stmt_in(&mut env, &stmt("w := stack(v, v)"), &pass), Err(CalcError::TooMuchWork));
-    let pass = Pass::new(100);
-    assert_eq!(run_stmt_in(&mut env, &stmt("w := submatrix(v, 0, 4999, 0, 0)"), &pass), Err(CalcError::TooMuchWork));
+    // One step short of the whole: submatrix's operand (5000 elements and one step), its four
+    // numbers and the name defined fit in the budget; the 5000 elements it makes don't.
+    let src = "w := submatrix(v, 0, 4999, 0, 0)";
+    let made = 5_000;
+    let total = spent(&mut env, src);
+    assert_eq!(total, 5_001 + 4 + 1 + made);
+    let pass = Pass::new(total - 1);
+    assert_eq!(run_stmt_in(&mut env, &stmt(src), &pass), Err(CalcError::TooMuchWork));
+    assert_eq!(pass.spent(), total - made, "it stops at submatrix's own charge, with none of it counted");
 }
 
 #[test]

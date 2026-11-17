@@ -167,6 +167,8 @@ fn joined(name: &str, beside: bool, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>)
     }
     let total = pieces.iter().fold(0usize, |n, p| n.saturating_add(own(p)));
     let size = if beside { (first.rows, total) } else { (total, first.cols) };
+    // Refused before the order of its elements is built.
+    size.0.checked_mul(size.1).filter(|&n| n <= MAX_ELEMENTS).ok_or(CalcError::TooLarge)?;
     // Each matrix's first element in the result, for the error of text with numbers.
     let mut taken = 0usize;
     let starts = pieces.iter().map(|p| {
