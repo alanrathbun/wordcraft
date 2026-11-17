@@ -321,7 +321,8 @@ pub(super) fn interp(args: &[Data], exprs: &[Expr], cx: &Ctx<'_>) -> Result<Data
     let curve = vector("interp", vs, vs_name)?;
     // The header: the kind, 3, and the degree, all plain numbers.
     let [kind, mark, degree, data @ ..] = curve else {
-        return Err(foreign(format!("it has {} elements, not even a header", curve.len())));
+        let n = curve.len();
+        return Err(foreign(format!("it has {n} element{}, not even a header", if n == 1 { "" } else { "s" })));
     };
     if [kind, mark, degree].iter().any(|v| v.q.dim != Dim::ONE) || mark.q.value != 3.0 {
         return Err(foreign("it isn't one".to_string()));

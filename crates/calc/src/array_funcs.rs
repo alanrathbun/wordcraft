@@ -90,7 +90,7 @@ pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>
     if let Some(e) = args.iter().enumerate().filter(|(i, _)| per_x != Some(*i)).find_map(|(_, a)| a.failure(cx.origin)) {
         return Some(Err(e));
     }
-    // Numbers only, but for the sizes, `transpose` and `lookup`.
+    // Numbers only, but for the sizes, `transpose`, `lookup`, `submatrix`, `augment` and `stack`.
     if !matches!(name, "length" | "rows" | "cols" | "transpose" | "lookup" | "submatrix" | "augment" | "stack")
         && let Some(text) = args.iter().find_map(Data::text)
     {

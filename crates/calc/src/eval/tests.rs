@@ -1533,6 +1533,11 @@ fn interp_rejects_foreign_vectors() {
     column(&mut env, "Dd", &[1.0, 2.0, 3.0, 4.0], "in");
     let e = run(&mut env, "interp(cspline(xs, ys), Dd, ys, 2 in) =").expect_err("units differ");
     assert!(syntax_msg(e).contains(phrase));
+    // Too short for the header, counted in the right number.
+    let e = syntax_msg(run(&mut env, "interp(5, xs, ys, 2) =").expect_err("one element"));
+    assert!(e.ends_with("— it has 1 element, not even a header"), "{e}");
+    let e = syntax_msg(run(&mut env, "interp([5, 3], xs, ys, 2) =").expect_err("two elements"));
+    assert!(e.ends_with("— it has 2 elements, not even a header"), "{e}");
     // A matrix isn't a vector.
     assert!(run(&mut env, "interp([1, 2; 3, 4], xs, ys, 2) =").is_err());
     // Four arguments.
