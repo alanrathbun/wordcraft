@@ -347,6 +347,97 @@ fn min_max_round_mod() {
     assert!(matches!(err("mod(1 m, 1 s) ="), CalcError::Unit(UnitError::Mismatch { .. })));
 }
 
+/// `q` is `value` to relative `tol`, in dimension `dim`.
+fn close_rel(q: Quantity, value: f64, dim: Dim, tol: f64) {
+    assert_eq!(q.dim, dim, "dimension of {q:?}");
+    assert!((q.value - value).abs() <= tol * value.abs().max(1.0), "{} vs {value}", q.value);
+}
+
+/// Two quantities are equal as measures: the same dimension, values within rounding.
+fn same_quantity(a: Quantity, b: Quantity) {
+    assert_eq!(a.dim, b.dim);
+    assert!((a.value - b.value).abs() <= 1e-12 * b.value.abs().max(1e-300), "{} vs {}", a.value, b.value);
+}
+
+#[test]
+fn ceil_to_multiple() {
+    same_quantity(val("Ceil(2.06 in, 0.125 in) ="), val("2.125 in ="));
+    close(val("Ceil(7.2, 1) ="), 8.0, Dim::ONE);
+    // Mathcad's hicks_si_p_2.68.xmcd: 1.9 in up to a multiple of 25.4 mm is 2 in, which is 50.8 mm.
+    same_quantity(val("Ceil(1.9 in, 25.4 mm) ="), val("50.8 mm ="));
+    same_quantity(val("Floor(2.06 in, 0.125 in) ="), val("2 in ="));
+    same_quantity(val("Round(2.06 in, 0.125 in) ="), val("2 in ="));
+    // Halves go away from zero.
+    close(val("Round(2.0625, 0.125) ="), 2.125, Dim::ONE);
+    close(val("Round(-2.0625, 0.125) ="), -2.125, Dim::ONE);
+    // A value already on a multiple stays, whatever the unit conversions do to the last digit.
+    same_quantity(val("Ceil(0.375 in, 0.125 in) ="), val("0.375 in ="));
+    same_quantity(val("Floor(0.375 in, 3.175 mm) ="), val("0.375 in ="));
+    same_quantity(val("Ceil(0.75 in, 0.125 in) ="), val("0.75 in ="));
+    same_quantity(val("Ceil(50.8 mm, 2 in) ="), val("50.8 mm ="));
+    same_quantity(val("Round(2.0625 in, 0.125 in) ="), val("2.125 in ="));
+    // Element-wise over a grid, like the other scalar built-ins.
+    let mut env = Env::new();
+    run(&mut env, "v := [1.2, 2.5, 3.9]").expect("defines v");
+    close_all(&grid(&mut env, "Ceil(v, 1) =").1, &[2.0, 3.0, 4.0], Dim::ONE);
+}
+
+#[test]
+fn ceil_negative_and_bad_steps() {
+    close(val("Ceil(-2.06, 0.125) ="), -2.0, Dim::ONE);
+    close(val("Floor(-2.06, 0.125) ="), -2.125, Dim::ONE);
+    for src in ["Ceil(2, 0) =", "Floor(2, -1) =", "Round(2, 0) =", "Round(2 in, -1 in) ="] {
+        let msg = syntax_msg(err(src));
+        let name = src.split('(').next().expect("a name");
+        assert!(msg.contains(&format!("{name}'s step must be greater than 0")), "{src}: {msg}");
+    }
+    assert!(matches!(err("Ceil(2 in, 1 lbf) ="), CalcError::Unit(UnitError::Mismatch { .. })));
+    assert_eq!(err("Ceil(2) ="), CalcError::Arity("Ceil".into(), 2));
+    assert_eq!(err("Round(1, 2, 3) ="), CalcError::Arity("Round".into(), 2));
+}
+
+#[test]
+fn erf_matches_mathcad() {
+    // Molar Mass.xmcd.
+    close_rel(val("0.5·√π·12000·(1 + erf(15000/12000)) ="), 20449.510423409225, Dim::ONE, 1e-12);
+    close_rel(val("erf(0) ="), 0.0, Dim::ONE, 1e-15);
+    assert!(matches!(err("erf(2 in) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+}
+
+#[test]
+fn reciprocal_trig() {
+    close(val("csc(30 deg) ="), 2.0, Dim::ONE);
+    close(val("cot(45 deg) ="), 1.0, Dim::ONE);
+    close_rel(val("secant(60 deg) ="), 2.0, Dim::ONE, 1e-12);
+    close_rel(val("atanh(0.5) ="), 0.5493061443340548, Dim::ONE, 1e-14);
+    assert_eq!(err("csc(0) ="), CalcError::NonFinite);
+    assert_eq!(err("atanh(1) ="), CalcError::NonFinite);
+    assert!(matches!(err("cot(1 m) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+}
+
+#[test]
+fn bessel() {
+    close_rel(val("J0(1) ="), 0.7651976865579666, Dim::ONE, 1e-14);
+    close_rel(val("J1(1) ="), 0.44005058574493355, Dim::ONE, 1e-14);
+    assert!(matches!(err("J0(1 m) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+}
+
+#[test]
+fn lowercase_unchanged() {
+    close(val("ceil(2.1) ="), 3.0, Dim::ONE);
+    close(val("floor(2.7) ="), 2.0, Dim::ONE);
+    close(val("round(2.345, 2) ="), 2.35, Dim::ONE);
+    assert!(matches!(err("ceil(2.1, 1) ="), CalcError::Arity(..)));
+}
+
+#[test]
+fn new_scalar_function_names_reserved() {
+    for name in ["erf", "csc", "cot", "secant", "atanh", "J0", "J1", "Ceil", "Floor", "Round"] {
+        assert_eq!(check_name(name), Err(CalcError::ReservedName(name.into())), "{name}");
+        assert_eq!(err(&format!("{name} := 1")), CalcError::ReservedName(name.into()), "{name}");
+    }
+}
+
 #[test]
 fn arity_errors() {
     assert_eq!(err("sin() ="), CalcError::Arity("sin".into(), 1));

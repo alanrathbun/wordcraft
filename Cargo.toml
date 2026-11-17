@@ -44,6 +44,8 @@ wordcraft-calc = { path = "crates/calc" }
 # foundation
 kurbo = { version = "0.13", features = ["serde"] }
 thiserror = "2"
+# Mathcad's erf and Bessel functions (std has neither).
+libm = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
