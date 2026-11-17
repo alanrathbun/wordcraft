@@ -232,7 +232,8 @@ fn has_live_object(p: &Paragraph) -> bool {
 
 /// The name column `col`'s heading gives, whenever its name part reads — whatever its unit says
 /// and whatever else the cell holds: what a column in error still owns, so the calculations using
-/// it say the table has an error (and a later definition of the name is a duplicate).
+/// it say the table has an error (and a later definition of the name is a duplicate). A name that
+/// is a unit, function or constant counts: its uses fail rather than quietly meaning the unit.
 pub(crate) fn column_name(t: &Table, col: u32) -> Option<String> {
     let cell = t.rows.first()?.cells.get(usize::try_from(col).ok()?)?;
     // The first paragraph with text, its objects and tracked deletions left out.
@@ -244,7 +245,11 @@ pub(crate) fn column_name(t: &Table, col: u32) -> Option<String> {
         }
         Block::Table(_) => None,
     })?;
-    heading_name(text.trim()).ok().map(str::to_string)
+    match heading_name(text.trim()) {
+        Ok(name) => Some(name.to_string()),
+        Err(CalcError::ReservedName(name)) => Some(name),
+        Err(_) => None,
+    }
 }
 
 /// Whether `cells` hold text and all of it, at any depth, is tracked-deleted: a row (or table)

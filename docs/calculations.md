@@ -142,7 +142,9 @@ the Insert Symbol list; `Angstrom` types the same unit.
 
 Every one of these names is now a unit, so it can't be a variable name. A document that already
 defined `bar`, `day`, `ton` or `cal` shows the reserved-name error ("bar is a unit, function or
-constant name — choose another name") until the variable is renamed, for instance `bar_1`.
+constant name — choose another name") until the variable is renamed, for instance `bar_1`. Every
+calculation that uses the name shows "depends on a calculation with an error" until then, rather
+than quietly using the unit.
 
 ## How results are shown
 

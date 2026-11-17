@@ -160,7 +160,11 @@ pub fn defined_names(doc: &Document) -> Vec<(String, u64)> {
     let mut names: Vec<(String, u64)> = index
         .owners
         .iter()
-        .filter(|&(_, &i)| index.is_region(i) && matches!(index.parsed.get(i), Some(Ok(Stmt::Define { params, .. })) if params.is_empty()))
+        .filter(|&(name, &i)| {
+            check_name(name).is_ok()
+                && index.is_region(i)
+                && matches!(index.parsed.get(i), Some(Ok(Stmt::Define { params, .. })) if params.is_empty())
+        })
         .map(|(name, &i)| (name.clone(), ids.get(i).copied().unwrap_or(0)))
         .collect();
     names.sort();
@@ -177,7 +181,7 @@ pub fn defined_columns(doc: &Document) -> Vec<(String, u64, u32)> {
     let mut columns: Vec<(String, u64, u32)> = index
         .owners
         .iter()
-        .filter(|&(_, &i)| !index.is_region(i))
+        .filter(|&(name, &i)| check_name(name).is_ok() && !index.is_region(i))
         .filter_map(|(name, &i)| {
             let &(t, col) = index.columns.get(i.checked_sub(index.regions)?)?;
             Some((name.clone(), *table_ids.get(t)?, col))
@@ -729,7 +733,8 @@ struct Index {
     /// An error found before evaluation: parse, reserved name, duplicate, or a column whose
     /// values don't read.
     early: Vec<Option<CalcError>>,
-    /// Name → index of the definition that owns it.
+    /// Name → index of the definition that owns it. A name refused as a unit, function or constant
+    /// is owned by its first (failed) definition, so its uses fail.
     owners: HashMap<String, usize>,
     /// Regions edited outside the calculator: they keep owning their name but define nothing.
     edited: Vec<bool>,
@@ -789,6 +794,12 @@ impl Index {
                 }
             };
             let error = if let Err(e) = check_name(name) {
+                // A name refused as a unit, function or constant (a document from before it was
+                // reserved) is still owned by its first definition: that definition has failed, so
+                // every use of the name is an upstream error rather than quietly meaning the unit.
+                if matches!(e, CalcError::ReservedName(_)) {
+                    owners.entry(name.to_string()).or_insert(i);
+                }
                 Some(e)
             } else if let Some(&owner) = owners.get(name) {
                 // A column has no page of its own to name.
@@ -924,8 +935,9 @@ fn evaluate(index: &Index, settings: &CalcSettings) -> (Env, Vec<Outcome>, Vec<b
         } else if let Some(Some(name)) = index.names.get(i)
             && index.owners.get(name) == Some(&i)
         {
-            // A region that owns its name but failed before running (it uses a word that another
-            // definition tries to name): using its name is an upstream error.
+            // A region that owns its name but failed before running (its name is a unit, function or
+            // constant, or it uses a word that another definition tries to name): using its name is
+            // an upstream error.
             fail(&mut env, node, i);
         }
     }

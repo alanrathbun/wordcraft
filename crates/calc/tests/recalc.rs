@@ -225,9 +225,55 @@ fn pasted_unit_name_definition_is_error() {
     let mut d = doc_with(&["A := 2 in^2", "2 A ="]);
     recalc(&mut d, &no_page);
     assert_eq!(region(&d, 1).0.state, err(CalcError::ReservedName("A".into())));
+    // The document meant its own A, so the ampere would be a wrong number: the use fails too.
     let (r, linear, _) = region(&d, 2);
-    assert_eq!(r.state, CalcState::Fresh);
-    assert!(linear.ends_with("=2 \"A\""), "{linear}");
+    assert_eq!(r.state, err(CalcError::Upstream));
+    assert_eq!(linear, "2 \"A\" ⚠");
+}
+
+/// A definition refused because its name is a unit, function or constant (a document from before
+/// the name was reserved) fails every calculation using the name, wherever it is, rather than
+/// letting them quietly compute with the unit.
+#[test]
+fn a_name_refused_as_a_unit_function_or_constant_fails_its_uses() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("day := 7", "x := 2·day =", "day"),
+        ("ton := 2000", "W_t := 3·ton =", "ton"),
+        ("hr := 0.5", "y := hr·2 =", "hr"),
+        ("m := 5", "y := m·2 =", "m"),
+        ("m := 5", "y := 3 m =", "m"),
+        ("pi := 3", "y := 2·pi =", "pi"),
+        ("g_0 := 32", "y := 2·g_0 =", "g_0"),
+        // A function's name, the same way: the use points at the failed definition.
+        ("slope := 0.02", "y := slope·100 ft =", "slope"),
+    ];
+    for &(define, using, name) in cases {
+        for sources in [[define, using], [using, define]] {
+            let mut d = doc_with(&sources);
+            let report = recalc(&mut d, &no_page);
+            let (at_define, at_use) = if sources[0] == define { (1, 2) } else { (2, 1) };
+            assert_eq!(region(&d, at_define).0.state, err(CalcError::ReservedName(name.into())), "{sources:?}");
+            let (r, linear, _) = region(&d, at_use);
+            assert_eq!(r.state, err(CalcError::Upstream), "{sources:?}: {linear}");
+            // The error mark, and no result.
+            assert!(linear.ends_with(" ⚠") && !linear.contains('='), "{sources:?}: {linear}");
+            assert_eq!(report.errors, 2, "{sources:?}");
+        }
+    }
+    // The name stays refused, and is no variable to quote.
+    let d = doc_with(&["day := 7", "x := 2·day"]);
+    assert_eq!(check_new_name(&d, "day", None), Err(CalcError::ReservedName("day".into())));
+    assert!(defined_names(&d).iter().all(|(n, _)| n != "day"), "{:?}", defined_names(&d));
+}
+
+#[test]
+fn a_column_heading_refused_as_a_unit_fails_its_uses() {
+    let mut d = doc_of(vec![table_block(data_table(1, &[&["day (hr)"], &["1"], &["2"]])), para_block(para(vec![calc_eq(8, "x := 2·day =")]))]);
+    recalc(&mut d, &no_page);
+    let message = CalcError::ReservedName("day".into()).to_string();
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
+    let (r, linear, _) = region(&d, 8);
+    assert_eq!(r.state, err(CalcError::UpstreamTable), "{linear}");
 }
 
 #[test]
