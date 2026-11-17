@@ -39,7 +39,7 @@ only in a later importer was rejected by the user, who wants to type them.
 **Spellings the user chose for results.** Wherever WordCraft picks the unit text itself (natural
 units, composed base units), it writes `hr`, `sec`, `Btu`, `liter`, `watt` and `joule`; `mol`
 stays `mol`. Prefixed units keep the symbol: `kW`, `kJ`, `mL`, `ms` (user's call accepted: a spelled
-prefix like `kwatt` reads badly). Units the user typed, as in `= ? BTU/h`, show as typed. This
+prefix like `kwatt` reads badly). Units the user typed, as in `= ? BTU/hr`, show as typed. This
 applies to US and SI documents alike.
 
 **Accepted spellings.** Typing either form works:
