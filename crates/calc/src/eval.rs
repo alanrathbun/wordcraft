@@ -1790,6 +1790,10 @@ fn first(d: &Data) -> Option<Val> {
 }
 
 fn not_callable(name: &str) -> CalcError {
+    // Mathcad writes the secant `sec(x)`; here `sec` is the second.
+    if name == "sec" {
+        return CalcError::Syntax("sec isn't a function — for the secant, use secant(x)".to_string());
+    }
     CalcError::Syntax(format!("{name} isn't a function — it can't be called with ( )"))
 }
 

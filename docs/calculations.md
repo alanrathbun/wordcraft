@@ -105,7 +105,9 @@ their symbols: `ms`, `kW`, `kJ`, `mL`. A unit you wrote yourself shows as you wr
 shows `BTU/hr`, and `= ? s` shows `s`.
 
 - **The hour is `hr`.** `h` is not a unit, so it is free to use as a name. A document that still
-  uses `h` for hours shows "h isn't defined — for hours, use hr" on each calculation that uses it.
+  uses `h` for hours shows "h isn't defined — for hours, use hr" on each calculation that uses it,
+  and "unknown unit `h` — for hours, use hr" where `h` is a unit to show a result in
+  (`= ? kW·h`) or in a data table's heading (`Time (h)`).
   A time such as `3 hr` shows in `sec` unless you ask for another unit: `= ? hr`.
 - **`lb` and `R` are not units.** `lb` reads as force to many engineers, and `R` is a common name.
   Write `lbm` for pound-mass (or `lbf` for pound-force) and `°R` for degrees Rankine. Both words
@@ -324,7 +326,8 @@ a different dimension (`Ceil(2.06 in, 0.1 lbf)`), is an error. Names are case se
 spellings never mix.
 
 **`secant`.** Mathcad writes the secant `sec(x)`, but `sec` is the unit for seconds here, so write
-`secant(x)`.
+`secant(x)`. A calculation that calls `sec(x)` says so: "sec isn't a function — for the secant, use
+secant(x)".
 
 **Curve fitting.** `cspline`, `lspline` and `pspline` fit a spline through every point of `vy`
 against `vx`; `cspline` and `pspline` need at least 3 points and `lspline` 2. `regress(vx, vy, k)`

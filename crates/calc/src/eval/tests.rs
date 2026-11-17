@@ -2416,6 +2416,23 @@ fn h_hints_hr() {
     assert_eq!(e.to_string(), "h isn't defined — for hours, use hr");
     // Any other name has no hint.
     assert_eq!(err("5 hh =").to_string(), "hh isn't defined");
+    // As a unit to show a result in, too, alone or inside a compound unit.
+    for src in ["t := 2 hr = ? h", "1 kW·hr = ? kW·h", "1 kW = ? BTU/h"] {
+        let e = err(src);
+        assert_eq!(e, CalcError::Unit(UnitError::UnknownUnit("h".into())), "{src}");
+        assert_eq!(e.to_string(), "unknown unit `h` — for hours, use hr", "{src}");
+    }
+    // Another unknown unit has no hint.
+    assert_eq!(err("1 in = ? hh").to_string(), "unknown unit `hh`");
+}
+
+#[test]
+fn sec_called_hints_secant() {
+    let e = syntax_msg(err("sec(60 deg) ="));
+    assert_eq!(e, "sec isn't a function — for the secant, use secant(x)");
+    // Another unit called keeps the plain message.
+    assert_eq!(syntax_msg(err("m(2) =")), "m isn't a function — it can't be called with ( )");
+    close(val("secant(60 deg) ="), 2.0, Dim::ONE);
 }
 
 #[test]

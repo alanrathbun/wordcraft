@@ -2227,6 +2227,19 @@ fn numbers_look_up_texts_and_equal_text_keys_are_duplicates() {
 }
 
 #[test]
+fn an_h_heading_hints_hr() {
+    let mut d = doc_of(vec![table_block(data_table(1, &[&["Time (h)", "Flow (gpm)"], &["1", "2"]]))]);
+    recalc(&mut d, &no_page);
+    let message = "unknown unit `h` — for hours, use hr".to_string();
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
+    // A cell's own unit, the same way.
+    let mut d = doc_of(vec![table_block(data_table(1, &[&["Time (hr)"], &["1 h"]]))]);
+    recalc(&mut d, &no_page);
+    let message = "Time row 1: unknown unit `h` — for hours, use hr".to_string();
+    assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
+}
+
+#[test]
 fn a_quote_mark_of_any_kind_is_refused_in_a_text_cell() {
     let mut d = doc_of(vec![table_block(data_table(1, MATERIALS))]);
     for mark in ["\"", "“", "”"] {

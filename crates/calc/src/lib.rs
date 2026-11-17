@@ -67,10 +67,10 @@ pub enum CalcError {
     #[error("{0}")]
     Syntax(String),
     /// A name that is used but never defined (`h` is told to use `hr`).
-    #[error("{0} isn't defined{hint}", hint = if .0 == "h" { " — for hours, use hr" } else { "" })]
+    #[error("{0} isn't defined{hint}", hint = hours_hint(.0))]
     Undefined(String),
-    /// A unit or dimension error.
-    #[error("{0}")]
+    /// A unit or dimension error (an unknown unit `h` is told to use `hr`).
+    #[error("{0}{hint}", hint = match .0 { craft_units::UnitError::UnknownUnit(u) => hours_hint(u), _ => "" })]
     Unit(#[from] craft_units::UnitError),
     /// The result is NaN or infinite.
     #[error("result isn't a finite number")]
@@ -166,4 +166,9 @@ pub enum CalcError {
 /// The values a [`CalcError::NoCase`] names, in parentheses after a space; nothing for none.
 fn no_case_values(values: &[String]) -> String {
     if values.is_empty() { String::new() } else { format!(" ({})", values.join(", ")) }
+}
+
+/// The hint for `name` used as a name or a unit: `h` was the hour, which is `hr` now.
+fn hours_hint(name: &str) -> &'static str {
+    if name == "h" { " — for hours, use hr" } else { "" }
 }
