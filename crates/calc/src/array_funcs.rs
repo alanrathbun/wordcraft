@@ -3,6 +3,8 @@
 //! - **Sizes:** `length(v)`, `rows(M)`, `cols(M)`; a single value is one element.
 //! - **Reductions:** `min`/`max` over every element of every argument, `sum(v)`, `mean(v)`.
 //! - **Products:** `dot(a, b)`, `mmul(A, B)` (the matrix product), `transpose(A)`.
+//! - **Shape:** `submatrix(A, ir, jr, ic, jc)`, `augment(A, B, …)` (side by side) and `stack(A, B, …)`
+//!   (one below the other), of numbers or of texts ([`shape`]).
 //! - **Lookup:** `lookup(xs, ys, x)` is the `ys` value whose `xs` equals `x`.
 //! - **Interpolation:** `linterp(xs, ys, x)` (linear) and `spline(xs, ys, x)` (natural cubic
 //!   spline), over `xs` strictly increasing.
@@ -10,7 +12,7 @@
 //! - **Curve fitting** ([`fit`]): `cspline`, `lspline`, `pspline` and `regress` make a coefficient
 //!   vector that `interp(vs, vx, vy, x)` evaluates; `slope` and `intercept` give the best line.
 //!
-//! `length`, `rows`, `cols`, `transpose` and `lookup` also take text; every other one refuses it.
+//! `length`, `rows`, `cols`, `transpose`, `lookup`, `submatrix`, `augment` and `stack` also take text; every other one refuses it.
 //!
 //! None of them guesses: a lookup that matches no `xs` and an interpolation outside `xs` are
 //! errors, never the nearest value or an extrapolation. `x` may be a grid, giving one result per
@@ -20,6 +22,7 @@
 //! element work to the pass before doing it.
 
 mod fit;
+mod shape;
 
 use crate::array::{self, Data, Failures, Grid, MAX_ELEMENTS};
 use crate::eval::{Pass, Temp, Val, cut_text, picked, text_use};
@@ -66,6 +69,9 @@ pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>
         "mmul" => |_, args, exprs, cx| mmul(args, exprs, cx),
         "transpose" => |_, args, _, cx| transpose(args, cx),
         "lookup" => |_, args, exprs, cx| lookup(args, exprs, cx),
+        "submatrix" => |_, args, exprs, cx| shape::submatrix(args, exprs, cx),
+        "augment" => |_, args, exprs, cx| shape::augment(args, exprs, cx),
+        "stack" => |_, args, exprs, cx| shape::stack(args, exprs, cx),
         "linterp" | "spline" => interpolate,
         "cspline" | "lspline" | "pspline" => |name, args, exprs, cx| fit::spline(name, args, exprs, cx),
         "regress" => |_, args, exprs, cx| fit::regress(args, exprs, cx),
@@ -84,7 +90,7 @@ pub(crate) fn call_array(name: &str, args: &[Data], exprs: &[Expr], cx: &Ctx<'_>
         return Some(Err(e));
     }
     // Numbers only, but for the sizes, `transpose` and `lookup`.
-    if !matches!(name, "length" | "rows" | "cols" | "transpose" | "lookup")
+    if !matches!(name, "length" | "rows" | "cols" | "transpose" | "lookup" | "submatrix" | "augment" | "stack")
         && let Some(text) = args.iter().find_map(Data::text)
     {
         return Some(Err(text_use(text, format!("in {name}"))));

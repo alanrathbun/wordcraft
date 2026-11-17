@@ -30,6 +30,9 @@ const ARRAY_BUILTINS: &[&str] = &[
     "interp",
     "slope",
     "intercept",
+    "submatrix",
+    "augment",
+    "stack",
 ];
 
 /// Whether `name` is a built-in function, scalar or array.

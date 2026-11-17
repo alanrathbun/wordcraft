@@ -215,6 +215,9 @@ Usually the element-by-element form is simpler: `t := 2·D` gives the same vecto
 | `dot(a, b)` | the dot product of two vectors of the same length |
 | `mmul(A, B)` | the matrix product; A's columns must match B's rows |
 | `transpose(M)` | rows and columns swapped |
+| `submatrix(A, ir, jr, ic, jc)` | rows `ir` to `jr` and columns `ic` to `jc` of `A`, both ends included, counted from the document's index base |
+| `augment(A, B, …)` | the matrices side by side; they must have the same number of rows |
+| `stack(A, B, …)` | the matrices one below the other; they must have the same number of columns |
 | `lookup(xs, ys, x)` | the `ys` element whose `xs` element equals `x` |
 | `linterp(xs, ys, x)` | the straight-line interpolation of `ys` at `x` |
 | `spline(xs, ys, x)` | the interpolation along a natural cubic spline through every point |
@@ -237,8 +240,8 @@ Usually the element-by-element form is simpler: `t := 2·D` gives the same vecto
   anywhere.
 
 These names are reserved, like the units and the other functions: `sum`, `length`, `rows`, `cols`,
-`mean`, `dot`, `mmul`, `transpose`, `lookup`, `linterp`, `spline`, `cspline`, `lspline`, `pspline`,
-`regress`, `interp`, `slope` and `intercept` can't be variable names.
+`mean`, `dot`, `mmul`, `transpose`, `submatrix`, `augment`, `stack`, `lookup`, `linterp`, `spline`,
+`cspline`, `lspline`, `pspline`, `regress`, `interp`, `slope` and `intercept` can't be variable names.
 
 ### Data tables
 
@@ -376,7 +379,8 @@ grades := ["A106 B", "A312 TP316"]
 - A text can be up to 1,000 characters and can't contain a quote mark.
 - Text goes where a word belongs: a definition, a vector of texts, the result of a case or of
   `if(…)`, a `lookup` key or result, and `==` or `≠`. Indexing, `length`, `rows`, `cols` and
-  `transpose` work on a vector of texts as on numbers.
+  `transpose`, `submatrix`, `augment` and `stack` work on a vector of texts as on numbers (a text with
+  numbers in one matrix is an error).
 - Text can't be used in arithmetic, with a unit, in `<`, `>`, `≤`, `≥`, or in `min`, `max`, `sum`,
   `mean`, `linterp` or `spline`. The error says so and names the text (`"OK" is text — it can't be
   used in arithmetic`); a text is never turned into a number.

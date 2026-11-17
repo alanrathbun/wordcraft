@@ -1069,6 +1069,148 @@ fn products() {
     assert_eq!(syntax_msg(run(&mut env, "dot([1, 2], [1, 2, 3]) =").expect_err("lengths")), "dot needs a and b of the same length (2 and 3)");
 }
 
+/// An env holding `M := [1, 2, 3; 4, 5, 6; 7, 8, 9]`, numbered from `origin`.
+fn nine(origin: u8) -> Env {
+    let mut env = Env::new();
+    env.set_origin(origin);
+    run(&mut env, "M := [1, 2, 3; 4, 5, 6; 7, 8, 9]").expect("defines M");
+    env
+}
+
+#[test]
+fn submatrix_counts_from_index_base() {
+    let (shape, items) = grid(&mut nine(0), "submatrix(M, 1, 2, 0, 1) =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[4.0, 5.0, 7.0, 8.0], Dim::ONE);
+    let (shape, items) = grid(&mut nine(1), "submatrix(M, 1, 2, 1, 2) =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[1.0, 2.0, 4.0, 5.0], Dim::ONE);
+    // One row, one column, and one element: a single value is a 1 × 1 matrix.
+    let (shape, items) = grid(&mut nine(0), "submatrix(M, 2, 2, 0, 2) =");
+    assert_eq!(shape, (1, 3));
+    close_all(&items, &[7.0, 8.0, 9.0], Dim::ONE);
+    close(shown(&mut nine(0), "submatrix(M, 1, 1, 1, 1) ="), 5.0, Dim::ONE);
+    close(shown(&mut Env::new(), "submatrix(7, 0, 0, 0, 0) ="), 7.0, Dim::ONE);
+    // Units stay with the elements, and a text matrix gives texts.
+    let mut env = Env::new();
+    run(&mut env, "Q1 := [1, 2; 3, 4] in").expect("defines Q1");
+    let (_, items) = grid(&mut env, "submatrix(Q1, 1, 1, 0, 1) =");
+    close_all(&items, &[3.0 * INCH, 4.0 * INCH], Dim { exp: [1, 0, 0, 0, 0, 0, 0, 0] });
+    run(&mut env, "T := [\"a\", \"b\"; \"c\", \"d\"]").expect("defines T");
+    assert_eq!(
+        run_value(&mut env, "submatrix(T, 0, 1, 1, 1) ="),
+        Ok(Some(Value::TextGrid { rows: 2, cols: 1, items: vec!["b".into(), "d".into()] }))
+    );
+    assert_eq!(run_value(&mut env, "submatrix(T, 1, 1, 0, 0) ="), Ok(Some(Value::Text("c".into()))));
+}
+
+#[test]
+fn submatrix_range_errors_name_what_is_wrong() {
+    let msg = |origin: u8, src: &str| match run_value(&mut nine(origin), src) {
+        Err(CalcError::IndexRange(m) | CalcError::Syntax(m)) => m,
+        other => panic!("{src:?} should be an index or syntax error: {other:?}"),
+    };
+    assert_eq!(msg(0, "submatrix(M, 1, 3, 0, 1) ="), "submatrix row 3 (jr) is outside M (rows 0 to 2)");
+    assert_eq!(msg(0, "submatrix(M, 0, 1, 0, 3) ="), "submatrix column 3 (jc) is outside M (columns 0 to 2)");
+    assert_eq!(msg(1, "submatrix(M, 0, 1, 1, 2) ="), "submatrix row 0 (ir) is outside M (rows 1 to 3)");
+    assert_eq!(msg(0, "submatrix(M, 0, 1, -1, 1) ="), "submatrix column -1 (ic) is outside M (columns 0 to 2)");
+    assert_eq!(msg(0, "submatrix(M, 2, 1, 0, 1) ="), "submatrix needs ir to be at most jr (rows 2 and 1)");
+    assert_eq!(msg(0, "submatrix(M, 0, 1, 2, 0) ="), "submatrix needs ic to be at most jc (columns 2 and 0)");
+    assert_eq!(msg(0, "submatrix(M, 0.5, 1, 0, 1) ="), "submatrix needs ir to be a whole number");
+    assert_eq!(msg(0, "submatrix(M, 0, 1, 0, [1, 2]) ="), "submatrix needs jc to be a whole number");
+    assert_eq!(msg(0, "submatrix(M, 0, 1 in, 0, 1) ="), "submatrix needs jr to be a whole number");
+    assert!(matches!(err("submatrix([1, 2], 0, 0, 0) ="), CalcError::Arity(..)));
+}
+
+#[test]
+fn augment_and_stack() {
+    let (shape, items) = grid(&mut Env::new(), "augment([1; 2], [3; 4]) =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[1.0, 3.0, 2.0, 4.0], Dim::ONE);
+    let (shape, items) = grid(&mut Env::new(), "stack(transpose([1, 2]), transpose([3, 4])) =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[1.0, 2.0, 3.0, 4.0], Dim::ONE);
+    // More than two, matrices as well as vectors, and single values as 1 × 1.
+    let (shape, items) = grid(&mut Env::new(), "augment([1, 2; 3, 4], [5; 6], [7, 8; 9, 10]) =");
+    assert_eq!(shape, (2, 5));
+    close_all(&items, &[1.0, 2.0, 5.0, 7.0, 8.0, 3.0, 4.0, 6.0, 9.0, 10.0], Dim::ONE);
+    // (`[1, 2]` is a column: a row is `transpose([1, 2])`.)
+    let (shape, items) = grid(&mut Env::new(), "stack(transpose([1, 2]), [3, 4; 5, 6], transpose([7, 8])) =");
+    assert_eq!(shape, (4, 2));
+    close_all(&items, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], Dim::ONE);
+    let (shape, items) = grid(&mut Env::new(), "stack([1, 2], 3, [4; 5]) =");
+    assert_eq!(shape, (5, 1));
+    close_all(&items, &[1.0, 2.0, 3.0, 4.0, 5.0], Dim::ONE);
+    let (shape, items) = grid(&mut Env::new(), "augment(1, 2) =");
+    assert_eq!((shape, items.len()), ((1, 2), 2));
+    // The sizes must agree, and the message gives both.
+    let mut env = Env::new();
+    run(&mut env, "V1 := [1; 2]").expect("defines V1");
+    let e = run_value(&mut env, "augment(V1, [1; 2; 3]) =").expect_err("2 rows and 3 rows");
+    assert_eq!(syntax_msg(e), "augment needs V1 and argument 2 to have the same number of rows (V1 is 2 × 1, argument 2 is 3 × 1)");
+    let e = run_value(&mut env, "augment([1; 2], [3; 4], [5]) =").expect_err("2 rows and 1 row");
+    assert_eq!(syntax_msg(e), "augment needs argument 1 and argument 3 to have the same number of rows (argument 1 is 2 × 1, argument 3 is 1 × 1)");
+    let e = run_value(&mut env, "stack(transpose([1, 2]), transpose([1, 2, 3])) =").expect_err("2 columns and 3 columns");
+    assert_eq!(syntax_msg(e), "stack needs argument 1 and argument 2 to have the same number of columns (argument 1 is 1 × 2, argument 2 is 1 × 3)");
+    assert!(matches!(err("augment([1; 2]) ="), CalcError::Arity(..)));
+    assert!(matches!(err("stack([1, 2]) ="), CalcError::Arity(..)));
+    assert!(matches!(err("augment() ="), CalcError::Arity(..)));
+    // Units are kept per element.
+    let mut env = Env::new();
+    let (shape, items) = grid(&mut env, "augment([1; 2] in, [3; 4] lbf) =");
+    assert_eq!(shape, (2, 2));
+    let (len, force) = (quantities(&[1.0], "in")[0].dim, quantities(&[1.0], "lbf")[0].dim);
+    close(items[0], INCH, len);
+    close(items[1], quantities(&[3.0], "lbf")[0].value, force);
+    close(items[2], 2.0 * INCH, len);
+    close(items[3], quantities(&[4.0], "lbf")[0].value, force);
+}
+
+#[test]
+fn augment_text() {
+    let mut env = Env::new();
+    assert_eq!(
+        run_value(&mut env, "augment([\"a\"; \"b\"], [\"c\"; \"d\"]) ="),
+        Ok(Some(Value::TextGrid { rows: 2, cols: 2, items: vec!["a".into(), "c".into(), "b".into(), "d".into()] }))
+    );
+    assert_eq!(
+        run_value(&mut env, "stack(transpose([\"a\", \"b\"]), \"c\") =").map(|_| ()).map_err(|e| e.to_string()),
+        Err("stack needs argument 1 and argument 2 to have the same number of columns (argument 1 is 1 × 2, argument 2 is 1 × 1)".to_string())
+    );
+    assert_eq!(run_value(&mut env, "stack(\"a\", \"c\") ="), Ok(Some(Value::TextGrid { rows: 2, cols: 1, items: vec!["a".into(), "c".into()] })));
+    // Text with numbers is the mixed error, naming where in the result each would sit.
+    let e = run_value(&mut env, "augment([\"a\"; \"b\"], [1; 2]) =").expect_err("text with numbers");
+    assert_eq!(syntax_msg(e), "element [0, 1] is a number but element [0, 0] is text");
+    let e = run_value(&mut env, "augment([1; 2], [\"a\"; \"b\"]) =").expect_err("numbers with text");
+    assert_eq!(syntax_msg(e), "element [0, 1] is text but element [0, 0] is a number");
+    let e = run_value(&mut env, "stack(1, \"a\") =").expect_err("a number with a text");
+    assert_eq!(syntax_msg(e), "element 1 is text but element 0 is a number");
+}
+
+#[test]
+fn matrix_functions_are_charged_by_element() {
+    let stmt = |src: &str| parse(src).unwrap_or_else(|e| panic!("{src:?} did not parse: {e}"));
+    let spent = |env: &mut Env, src: &str| {
+        let pass = Pass::new(u64::MAX);
+        run_stmt_in(env, &stmt(src), &pass).unwrap();
+        pass.spent.get()
+    };
+    let mut env = nine(0);
+    // Each is what its operands cost (a name is its 9 elements and one step, a number one step), the
+    // elements it makes (4, 18 and 27) and one step for the name defined.
+    assert_eq!(spent(&mut env, "r1 := submatrix(M, 0, 1, 0, 1)"), (9 + 1) + 4 + 4 + 1);
+    assert_eq!(spent(&mut env, "r2 := augment(M, M)"), 2 * (9 + 1) + 18 + 1);
+    assert_eq!(spent(&mut env, "r3 := stack(M, M, M)"), 3 * (9 + 1) + 27 + 1);
+    // A result over 10 000 elements is refused before any of it is made, and the work stops a budget.
+    run(&mut env, "i := 0..4999").unwrap();
+    run(&mut env, "v[i] := 1").unwrap();
+    assert_eq!(run_value(&mut env, "augment(v, v, v) ="), Err(CalcError::TooLarge));
+    let pass = Pass::new(2 * 5_001 + 100);
+    assert_eq!(run_stmt_in(&mut env, &stmt("w := stack(v, v)"), &pass), Err(CalcError::TooMuchWork));
+    let pass = Pass::new(100);
+    assert_eq!(run_stmt_in(&mut env, &stmt("w := submatrix(v, 0, 4999, 0, 0)"), &pass), Err(CalcError::TooMuchWork));
+}
+
 #[test]
 fn lookup_is_exact() {
     let mut env = flanges();
@@ -1482,6 +1624,9 @@ fn new_function_names_are_reserved() {
         "interp",
         "slope",
         "intercept",
+        "submatrix",
+        "augment",
+        "stack",
     ] {
         assert_eq!(check_name(name), Err(CalcError::ReservedName(name.into())), "{name}");
     }
@@ -1815,9 +1960,10 @@ fn whole_array_uses_refuse_lenient_failures() {
     run(&mut env, "x := [1, 0, 2]").unwrap();
     run(&mut env, "M := [1, 0; 2, 3]").unwrap();
     run(&mut env, "first(v) := v[0]").unwrap();
-    for src in ["sum(1/x)", "length(1/x)", "transpose(1/x)", "max(1/x)", "lookup(x, 1/x, 2)", "first(1/x)"] {
+    for src in ["sum(1/x)", "length(1/x)", "transpose(1/x)", "max(1/x)", "lookup(x, 1/x, 2)", "first(1/x)", "augment(1/x, x)", "stack(x, 1/x)"] {
         assert!(lenient_err(&env, src).starts_with("element 1:"), "{src}: {}", lenient_err(&env, src));
     }
+    assert!(lenient_err(&env, "submatrix(1/x, 0, 1, 0, 0)").starts_with("element 1:"), "{}", lenient_err(&env, "submatrix(1/x, 0, 1, 0, 0)"));
     assert!(lenient_err(&env, "sum(1/M)").starts_with("element [0, 1]:"), "{}", lenient_err(&env, "sum(1/M)"));
     // Work that runs out is never kept per element.
     let big = Env::new();
