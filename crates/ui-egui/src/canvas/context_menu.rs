@@ -72,6 +72,13 @@ pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
             ui.close();
         }
     };
+    let calc_items = crate::calc_ui::menu_items(app);
+    if !calc_items.is_empty() {
+        for (label, id, params) in calc_items {
+            item(ui, app, label, id, params);
+        }
+        ui.separator();
+    }
     if let Some(issue) = app.canvas.context_issue.clone() {
         let sugg: Vec<String> = issue
             .get("suggestions")
@@ -203,6 +210,10 @@ pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
         item(ui, app, "Text Direction", "table.textDirection", json!({}));
         if pick == TablePick::Table {
             item(ui, app, "Insert Caption…", "references.caption", json!({}));
+        }
+        // A table in the main text can be calculation data: each column a vector its heading names.
+        if let Some((label, params)) = crate::calc_ui::data_table_item(app) {
+            item(ui, app, label, "calc.dataTable", params);
         }
         item(ui, app, "Table Properties…", "table.properties", json!({}));
     }

@@ -485,6 +485,9 @@ pub enum Dialog {
     /// File › Info › Properties › Advanced Properties › Custom: the document's custom
     /// properties (#2982).
     CustomProperties(Box<CustomPropertiesForm>),
+    /// Inline calculations: the source box, Calculated Value and Calculation Options
+    /// ([`crate::calc_ui`]).
+    Calc(Box<crate::calc_ui::CalcDialog>),
 }
 
 impl Dialog {
@@ -561,6 +564,7 @@ impl Dialog {
             Dialog::Organizer { .. } => "organizer",
             Dialog::CustomProperties(..) => "customProperties",
             Dialog::Layout(d) => d.name(),
+            Dialog::Calc(d) => d.name(),
         }
     }
 
@@ -593,6 +597,9 @@ impl Dialog {
         }
         if let Some(d) = crate::dialogs_layout::open(name, app) {
             return Some(Dialog::Layout(Box::new(d)));
+        }
+        if let Some(d) = crate::calc_ui::open(name, app) {
+            return Some(Dialog::Calc(Box::new(d)));
         }
         if matches!(name, "compare" | "combine" | "autoCorrect" | "restrictEditing") {
             return crate::dialogs_review::open(name, app).map(|d| Dialog::Review(Box::new(d)));

@@ -217,13 +217,23 @@ pub fn show(app: &mut WordApp, ctx: &egui::Context) {
         Dialog::Organizer { .. } => "Organizer",
         Dialog::CustomProperties { .. } => "Custom Document Properties",
         Dialog::Layout(d) => d.title(),
+        Dialog::Calc(d) => d.title(),
     };
     let id = egui::Id::unique(("dialog", title));
     let window = crate::window_close::window(ctx, egui::Window::new(tl!(title)).id(id).collapsible(false).resizable(false));
     // A file browser or Colors dialog it opened is above it and takes the keys: Escape or Enter
     // there doesn't also cancel or OK this one.
     let held = (app.file_browser_open() || app.colors.is_some()).then(|| ctx.input_mut(|i| std::mem::take(&mut i.events)));
-    let shown = place_dialog(ctx, id, window).show(ctx, |ui| {
+    // The calculation box opens at the caret; the rest are centred.
+    let anchor = match &d {
+        Dialog::Calc(c) => c.anchor(),
+        _ => None,
+    };
+    let window = match anchor {
+        Some(at) => window.fixed_pos(at),
+        None => place_dialog(ctx, id, window),
+    };
+    let shown = window.show(ctx, |ui| {
         ui.set_min_width(340.0);
         close = crate::rtl::root(ui, |ui| body(app, ui, &mut d));
     });

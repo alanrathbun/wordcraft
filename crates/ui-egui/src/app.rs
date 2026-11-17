@@ -269,6 +269,7 @@ impl WordApp {
         self.ensure_recover_fonts();
         self.ensure_recent_fonts();
         self.ensure_find_fonts();
+        self.ensure_calc_fonts();
         self.install_ui_fonts(ctx, lang);
         if let Some(answer) = self.desktop_theme.take_change() {
             self.desktop_dark = Some(answer);
@@ -380,6 +381,7 @@ impl WordApp {
         self.ensure_recover_fonts();
         self.ensure_recent_fonts();
         self.ensure_find_fonts();
+        self.ensure_calc_fonts();
         self.install_ui_fonts(ctx, lang);
         self.report_dirty();
     }

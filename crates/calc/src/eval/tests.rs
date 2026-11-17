@@ -1,0 +1,1826 @@
+use super::{Cx, Env, Frame, Pass, Val, check_display, check_name, compare_texts, eval_expr, eval_lenient, run_stmt, run_stmt_in};
+use crate::array::{Data, Grid, element_name};
+use crate::{CalcError, Expr, Op, Value, parse};
+use craft_units::{Dim, Precision, Quantity, UnitError, UnitSystem, format};
+
+fn run(env: &mut Env, src: &str) -> Result<Option<Quantity>, CalcError> {
+    run_value(env, src).map(|v| v.map(one))
+}
+
+fn run_value(env: &mut Env, src: &str) -> Result<Option<Value>, CalcError> {
+    let stmt = parse(src).unwrap_or_else(|e| panic!("{src:?} did not parse: {e}"));
+    run_stmt(env, &stmt)
+}
+
+/// The single value of `v`.
+fn one(v: Value) -> Quantity {
+    match v {
+        Value::One(q) => q,
+        other => panic!("expected a single value, got {other:?}"),
+    }
+}
+
+/// Run `src` in a fresh env and return its shown value.
+fn val(src: &str) -> Quantity {
+    shown(&mut Env::new(), src)
+}
+
+fn shown(env: &mut Env, src: &str) -> Quantity {
+    match run(env, src) {
+        Ok(Some(q)) => q,
+        other => panic!("{src:?} did not show a value: {other:?}"),
+    }
+}
+
+fn err(src: &str) -> CalcError {
+    match run(&mut Env::new(), src) {
+        Err(e) => e,
+        other => panic!("{src:?} should fail: {other:?}"),
+    }
+}
+
+fn close(q: Quantity, value: f64, dim: Dim) {
+    assert_eq!(q.dim, dim, "dimension of {q:?}");
+    assert!((q.value - value).abs() <= 1e-12 * value.abs().max(1.0), "{} vs {value}", q.value);
+}
+
+fn syntax_msg(e: CalcError) -> String {
+    match e {
+        CalcError::Syntax(m) => m,
+        other => panic!("expected a syntax error, got {other:?}"),
+    }
+}
+
+const AREA: Dim = Dim { exp: [2, 0, 0, 0, 0, 0, 0, 0] };
+
+#[test]
+fn stress_example() {
+    let mut env = Env::new();
+    assert_eq!(run(&mut env, "P := 1500 lbf").ok(), Some(None));
+    assert_eq!(run(&mut env, "A_b := 2.5 in^2").ok(), Some(None));
+    let q = shown(&mut env, "σ := P/A_b =");
+    let f = format(q, None, UnitSystem::UsCustomary, Precision::new(3)).expect("formats");
+    assert_eq!((f.number.as_str(), f.unit.as_str()), ("600", "psi"));
+}
+
+#[test]
+fn mixed_systems() {
+    close(val("len := 1 in + 25.4 mm ="), 0.0508, Dim::LENGTH);
+}
+
+#[test]
+fn unit_mismatch_message() {
+    assert!(matches!(err("x := 1 in + 1 lbf ="), CalcError::Unit(UnitError::Mismatch { .. })));
+}
+
+#[test]
+fn undefined_message() {
+    let e = err("y := z + 1 =");
+    assert_eq!(e, CalcError::Undefined("z".into()));
+    assert_eq!(e.to_string(), "z isn't defined");
+}
+
+#[test]
+fn user_function() {
+    let mut env = Env::new();
+    assert_eq!(run(&mut env, "f(x, y) := x^2 + y").ok(), Some(None));
+    close(shown(&mut env, "f(3 m, 1 m^2) ="), 10.0, AREA);
+}
+
+#[test]
+fn unit_names_cannot_be_variables() {
+    let mut env = Env::new();
+    for src in ["m := 5 kg", "A := 2 in^2", "kN := 1", "sin := 1", "f(m) := m", "min := 1", "π := 3", "e := 2", "pi := 3"] {
+        assert!(matches!(run(&mut env, src), Err(CalcError::ReservedName(_))), "{src}");
+    }
+    assert!(run(&mut env, "A_b := 2 in^2").is_ok());
+    close(shown(&mut env, "2 m ="), 2.0, Dim::LENGTH);
+    // A refused definition leaves nothing behind.
+    assert_eq!(env.names(), vec!["A_b".to_string()]);
+}
+
+#[test]
+fn trig_takes_angles() {
+    close(val("sin(30 deg) ="), 0.5, Dim::ONE);
+    close(val("cos(0) ="), 1.0, Dim::ONE);
+    assert!(matches!(err("sin(1 m) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+}
+
+#[test]
+fn non_finite_results_are_errors() {
+    for src in ["10^400 =", "1/0 =", "sqrt(-1) =", "0/0 =", "ln(0) =", "ln(-1) =", "10^300 * 10^300 =", "tan(90 deg) * 10^300 * 10^300 ="] {
+        assert_eq!(err(src), CalcError::NonFinite, "{src}");
+    }
+    // A hand-built non-finite literal is caught too.
+    let e = Expr::Num(f64::INFINITY);
+    assert_eq!(eval_expr(&Env::new(), &e), Err(CalcError::NonFinite));
+}
+
+#[test]
+fn recursion_bound() {
+    let mut env = Env::new();
+    assert!(run(&mut env, "f(x) := f(x)").is_ok());
+    assert_eq!(run(&mut env, "f(1) ="), Err(CalcError::TooComplex));
+}
+
+#[test]
+fn upstream() {
+    let mut env = Env::new();
+    env.mark_failed("a");
+    assert_eq!(run(&mut env, "b := a + 1 ="), Err(CalcError::Upstream));
+    assert_eq!(run(&mut env, "a(2) ="), Err(CalcError::Upstream));
+    // Defining it afterwards clears the mark.
+    env.define_var("a", Quantity::dimensionless(1.0));
+    close(shown(&mut env, "a + 1 ="), 2.0, Dim::ONE);
+}
+
+#[test]
+fn name_resolution_order() {
+    let mut env = Env::new();
+    // Parameters win over variables; constants and units resolve last.
+    env.define_var("x", Quantity::dimensionless(100.0));
+    assert_eq!(run(&mut env, "fa(x) := x + 1").ok(), Some(None));
+    close(shown(&mut env, "fa(1) ="), 2.0, Dim::ONE);
+    close(val("π ="), std::f64::consts::PI, Dim::ONE);
+    close(val("pi ="), std::f64::consts::PI, Dim::ONE);
+    close(val("e ="), std::f64::consts::E, Dim::ONE);
+    close(val("5 min ="), 300.0, Dim::TIME);
+}
+
+#[test]
+fn functions_see_globals_but_not_the_callers_parameters() {
+    let mut env = Env::new();
+    run(&mut env, "k := 10").expect("defines");
+    run(&mut env, "fa(x) := x * k").expect("defines");
+    run(&mut env, "fb(k) := fa(k)").expect("defines");
+    close(shown(&mut env, "fb(2) ="), 20.0, Dim::ONE);
+    // `fc` has no parameter `y`, and the caller's `y` does not leak in.
+    run(&mut env, "fc(x) := x + y").expect("defines");
+    run(&mut env, "fd(y) := fc(1)").expect("defines");
+    assert_eq!(run(&mut env, "fd(5) ="), Err(CalcError::Undefined("y".into())));
+}
+
+#[test]
+fn offset_units_only_as_a_lone_literal() {
+    close(val("212 °F ="), 373.15, Dim::TEMPERATURE);
+    close(val("100 °C ="), 373.15, Dim::TEMPERATURE);
+    close(val("-40 °F ="), 233.15, Dim::TEMPERATURE);
+    close(val("(5 °C) ="), 278.15, Dim::TEMPERATURE);
+    // Two absolute temperatures can't be added or subtracted, but an interval can be added.
+    for src in ["100 °C + 5 °C =", "100 °C - 5 °F ="] {
+        assert_eq!(err(src), CalcError::Unit(UnitError::AffineTemperature), "{src}");
+    }
+    close(val("100 °C + 5 Δ°C ="), 378.15, Dim::TEMPERATURE);
+    close(val("5 K + 100 °C ="), 378.15, Dim::TEMPERATURE);
+    close(val("100 °C - 5 Δ°C ="), 368.15, Dim::TEMPERATURE);
+    close(val("100 °C - 5 K ="), 368.15, Dim::TEMPERATURE);
+    for src in ["5 K - 100 °C =", "5 Δ°C - 100 °C =", "5 Δ°F - 100 °C ="] {
+        assert_eq!(err(src), CalcError::Unit(UnitError::AffineTemperature), "{src}");
+    }
+    close(val("5 Δ°F + 100 °C ="), 373.15 + 5.0 * 5.0 / 9.0, Dim::TEMPERATURE);
+    close(val("100 °C + 5 °R ="), 373.15 + 5.0 * 5.0 / 9.0, Dim::TEMPERATURE);
+    // An absolute literal beside a variable is refused; variables carry whether they are absolute
+    // (see `offset_display_needs_an_absolute_temperature`).
+    let mut env = Env::new();
+    run(&mut env, "T_1 := 100 °C").expect("defines");
+    run(&mut env, "T_2 := 20 °C").expect("defines");
+    close(shown(&mut env, "T_1 - T_2 ="), 80.0, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_1 + 5 K ="), 378.15, Dim::TEMPERATURE);
+    for src in ["T_1 + 5 °C =", "100 °C + T_1 =", "T_1 - 5 °F =", "100 °C + 5 m ="] {
+        assert_eq!(run(&mut env, src), Err(CalcError::Unit(UnitError::AffineTemperature)), "{src}");
+    }
+    for src in ["°F =", "1 / °F =", "5 °F / s =", "x := 2 °F^2 =", "3 + °C =", "-(5 °F) =", "(5 °F)^2 =", "2 (5 °F) =", "(5 °F) / 2 ="] {
+        assert_eq!(err(src), CalcError::Unit(UnitError::AffineTemperature), "{src}");
+    }
+    let mut env = Env::new();
+    run(&mut env, "t := 3").expect("defines");
+    assert_eq!(run(&mut env, "t °F ="), Err(CalcError::Unit(UnitError::AffineTemperature)));
+    // Added to an interval, an absolute temperature stays absolute.
+    close(val("100 °C + 5 K ="), 378.15, Dim::TEMPERATURE);
+    // A plain temperature unit is fine: 10 K, and a rankine.
+    close(val("10 K ="), 10.0, Dim::TEMPERATURE);
+    // Hand-built quantity literals take the same path.
+    let q = eval_expr(&Env::new(), &Expr::Quantity(32.0, "°F".into())).map(one).expect("evaluates");
+    close(q, 273.15, Dim::TEMPERATURE);
+}
+
+#[test]
+fn functions_are_not_values() {
+    let mut env = Env::new();
+    run(&mut env, "f(x) := x").expect("defines");
+    run(&mut env, "P := 2").expect("defines");
+    assert_eq!(syntax_msg(run(&mut env, "f + 1 =").unwrap_err()), "f is a function — call it like f(x)");
+    assert_eq!(syntax_msg(run(&mut env, "f^2 (3) =").unwrap_err()), "f is a function — call it like f(x)");
+    assert_eq!(syntax_msg(run(&mut env, "sin + 1 =").unwrap_err()), "sin is a function — call it like sin(x)");
+    assert!(syntax_msg(run(&mut env, "P(2) =").unwrap_err()).contains("P isn't a function"));
+    assert!(syntax_msg(run(&mut env, "m(2) =").unwrap_err()).contains("m isn't a function"));
+    assert_eq!(run(&mut env, "nope(2) ="), Err(CalcError::Undefined("nope".into())));
+}
+
+#[test]
+fn user_function_arity() {
+    let mut env = Env::new();
+    run(&mut env, "f(x, y) := x + y").expect("defines");
+    assert_eq!(run(&mut env, "f(1) ="), Err(CalcError::Arity("f".into(), 2)));
+    assert_eq!(run(&mut env, "f(1, 2, 3) ="), Err(CalcError::Arity("f".into(), 2)));
+}
+
+#[test]
+fn exponential_work_is_bounded() {
+    // Each level calls the one below twice: 2^30 evaluations unless the work is capped.
+    let mut env = Env::new();
+    run(&mut env, "g0(x) := x").expect("defines");
+    for i in 1..=30 {
+        run(&mut env, &format!("g{i}(x) := g{}(x) + g{}(x)", i - 1, i - 1)).expect("defines");
+    }
+    assert_eq!(run(&mut env, "g30(1) ="), Err(CalcError::TooComplex));
+}
+
+#[test]
+fn deep_expressions_evaluate_and_hostile_depth_is_refused() {
+    // Parser-limit shapes: 30 nested parentheses (its nesting limit is 64) and a 1000-term sum
+    // (a tree 1000 high) evaluate fine.
+    let nested = format!("{}1{} =", "(-".repeat(30), ")".repeat(30));
+    assert!(run(&mut Env::new(), &nested).is_ok());
+    let sum = format!("{} =", vec!["1"; 1000].join("+"));
+    close(val(&sum), 1000.0, Dim::ONE);
+    // A hand-built tree far deeper than the parser allows is refused, not a stack overflow.
+    let mut e = Expr::Num(1.0);
+    for _ in 0..3000 {
+        e = Expr::Unary(Op::Neg, Box::new(e));
+    }
+    assert_eq!(eval_expr(&Env::new(), &e), Err(CalcError::TooComplex));
+    // Function bodies nested through calls share one depth budget.
+    let mut env = Env::new();
+    let tail = " + 1".repeat(440);
+    run(&mut env, "n0(x) := x").expect("defines");
+    for i in 1..30 {
+        run(&mut env, &format!("n{i}(x) := n{}(x){tail}", i - 1)).expect("defines");
+    }
+    assert_eq!(run(&mut env, "n29(1) ="), Err(CalcError::TooComplex));
+    // Shallow enough chains still work.
+    close(shown(&mut env, "n3(1) ="), 1.0 + 3.0 * 440.0, Dim::ONE);
+}
+
+#[test]
+fn show_units_are_validated() {
+    close(val("1 in = ? mm"), 0.0254, Dim::LENGTH);
+    assert!(matches!(err("1 in = ? lbf"), CalcError::Unit(UnitError::Mismatch { .. })));
+    assert!(matches!(err("1 in = ? bogus"), CalcError::Unit(UnitError::UnknownUnit(_))));
+    // A failed show leaves a defined name undefined.
+    let mut env = Env::new();
+    assert!(run(&mut env, "a := 1 in = ? lbf").is_err());
+    assert!(env.names().is_empty());
+    assert!(syntax_msg(err("f(x) := x =")).contains("function"));
+}
+
+#[test]
+fn definitions_without_show_return_none() {
+    let mut env = Env::new();
+    assert_eq!(run(&mut env, "a := 3").ok(), Some(None));
+    assert_eq!(env.names(), vec!["a".to_string()]);
+    run(&mut env, "f(x) := x").expect("defines");
+    assert_eq!(env.names(), vec!["a".to_string(), "f".to_string()]);
+}
+
+#[test]
+fn powers() {
+    close(val("(2 m)^3 ="), 8.0, Dim::LENGTH.powi(3).expect("dim"));
+    close(val("2^0.5 ="), 2f64.sqrt(), Dim::ONE);
+    close(val("4 m^2 ^ 1 ="), 4.0, AREA);
+    assert!(matches!(err("2^(1 m) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+    assert!(matches!(err("(2 m)^0.5 ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+    close(val("|-3 m| ="), 3.0, Dim::LENGTH);
+}
+
+#[test]
+fn builtins_unary() {
+    close(val("sqrt(4 m^2) ="), 2.0, Dim::LENGTH);
+    close(val("√9 ="), 3.0, Dim::ONE);
+    assert!(matches!(err("sqrt(4 m) ="), CalcError::Unit(UnitError::Fractional)));
+    close(val("abs(-2 kg) ="), 2.0, Dim::MASS);
+    close(val("exp(0) ="), 1.0, Dim::ONE);
+    close(val("ln(e) ="), 1.0, Dim::ONE);
+    close(val("log(1000) ="), 3.0, Dim::ONE);
+    close(val("log(8, 2) ="), 3.0, Dim::ONE);
+    close(val("log(1000, 10) ="), 3.0, Dim::ONE);
+    close(val("log(81, 3) ="), 4.0, Dim::ONE);
+    assert!(matches!(err("exp(1 m) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+    close(val("sinh(0) + cosh(0) + tanh(0) ="), 1.0, Dim::ONE);
+    close(val("floor(2.7) + ceil(2.1) ="), 5.0, Dim::ONE);
+    assert!(matches!(err("floor(2.7 m) ="), CalcError::Unit(UnitError::NotDimensionless(_))));
+}
+
+#[test]
+fn inverse_trig_returns_angles() {
+    close(val("asin(1) ="), std::f64::consts::FRAC_PI_2, Dim::ANGLE);
+    close(val("acos(1) ="), 0.0, Dim::ANGLE);
+    close(val("atan(1) ="), std::f64::consts::FRAC_PI_4, Dim::ANGLE);
+    close(val("atan2(1 m, 1 m) ="), std::f64::consts::FRAC_PI_4, Dim::ANGLE);
+    close(val("atan2(1 m, 1000 mm) ="), std::f64::consts::FRAC_PI_4, Dim::ANGLE);
+    assert!(matches!(err("atan2(1 m, 1 s) ="), CalcError::Unit(UnitError::Mismatch { .. })));
+    assert_eq!(err("asin(2) ="), CalcError::NonFinite);
+    // An angle result goes back into trig.
+    close(val("sin(asin(0.5)) ="), 0.5, Dim::ONE);
+}
+
+#[test]
+fn min_max_round_mod() {
+    close(val("min(3 m, 1 ft, 2 m) ="), 0.3048, Dim::LENGTH);
+    close(val("max(3 m, 1 ft, 2 m) ="), 3.0, Dim::LENGTH);
+    close(val("max(1) ="), 1.0, Dim::ONE);
+    assert!(matches!(err("min(1 m, 1 s) ="), CalcError::Unit(UnitError::Mismatch { .. })));
+    assert_eq!(err("min() ="), CalcError::Arity("min".into(), 1));
+    close(val("round(2.5) ="), 3.0, Dim::ONE);
+    close(val("round(-2.5) ="), -3.0, Dim::ONE);
+    close(val("round(2.71828, 2) ="), 2.72, Dim::ONE);
+    close(val("round(1234, -2) ="), 1200.0, Dim::ONE);
+    assert!(syntax_msg(err("round(1.5, 0.5) =")).contains("whole number"));
+    assert!(syntax_msg(err("round(1.5, 99) =")).contains("-15 to 15"));
+    close(val("mod(7 m, 3 m) ="), 1.0, Dim::LENGTH);
+    close(val("mod(-1, 3) ="), 2.0, Dim::ONE);
+    close(val("mod(5, -3) ="), -1.0, Dim::ONE);
+    // A remainder too small to move the divisor is 0, never exactly the divisor.
+    close(val("mod(-1/10^20 m, 3 m) ="), 0.0, Dim::LENGTH);
+    assert!(val("mod(-1/10^20, 3) =").value < 3.0);
+    assert_eq!(err("mod(5, 0) ="), CalcError::NonFinite);
+    assert!(matches!(err("mod(1 m, 1 s) ="), CalcError::Unit(UnitError::Mismatch { .. })));
+}
+
+#[test]
+fn arity_errors() {
+    assert_eq!(err("sin() ="), CalcError::Arity("sin".into(), 1));
+    assert_eq!(err("sqrt(1, 2) ="), CalcError::Arity("sqrt".into(), 1));
+    assert_eq!(err("atan2(1) ="), CalcError::Arity("atan2".into(), 2));
+    assert_eq!(err("mod(1, 2, 3) ="), CalcError::Arity("mod".into(), 2));
+    assert_eq!(err("round(1, 2, 3) ="), CalcError::Arity("round".into(), 2));
+    assert_eq!(err("log() ="), CalcError::Arity("log".into(), 1));
+    assert_eq!(err("log(1, 2, 3) ="), CalcError::Arity("log".into(), 2));
+}
+
+#[test]
+fn check_name_rules() {
+    for bad in ["m", "mm", "kN", "psi", "lbf", "sin", "atan2", "round", "mod", "π", "pi", "e", "min", "max", "°F"] {
+        assert_eq!(check_name(bad), Err(CalcError::ReservedName(bad.into())), "{bad}");
+    }
+    for ok in ["x", "A_b", "σ", "P", "f", "foo", "L1"] {
+        assert!(check_name(ok).is_ok(), "{ok}");
+    }
+}
+
+#[test]
+fn redefinition_replaces_the_previous_entry() {
+    let mut env = Env::new();
+    env.define_var("a", Quantity::dimensionless(1.0));
+    env.define_fn("a", vec!["x".into()], Expr::Name("x".into()));
+    close(shown(&mut env, "a(4) ="), 4.0, Dim::ONE);
+    env.mark_failed("a");
+    assert_eq!(run(&mut env, "a(4) ="), Err(CalcError::Upstream));
+    assert_eq!(env.names(), vec!["a".to_string()]);
+}
+
+#[test]
+fn offset_display_needs_an_absolute_temperature() {
+    let not_absolute = |u: &str| CalcError::NotAbsolute(u.to_string());
+    // A difference shown on an offset scale would be −253.15 °C: refused.
+    assert_eq!(err("dT := 20 Δ°C = ? °C"), not_absolute("°C"));
+    let mut env = Env::new();
+    run(&mut env, "T_1 := 70 °F").expect("defines");
+    run(&mut env, "T_2 := 100 °F").expect("defines");
+    assert_eq!(run(&mut env, "T_2 - T_1 = ? °F"), Err(not_absolute("°F")));
+    assert_eq!(run(&mut env, "T_2 - T_1 = ? °C"), Err(not_absolute("°C")));
+    // The difference itself is fine in a difference unit, or a plain one.
+    close(shown(&mut env, "T_2 - T_1 = ? Δ°F"), 30.0 * 5.0 / 9.0, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_2 - T_1 = ? K"), 30.0 * 5.0 / 9.0, Dim::TEMPERATURE);
+    // Absolute temperatures, and an absolute temperature plus or minus a difference, show.
+    close(shown(&mut env, "T := 70 °F = ? °C"), 294.261_111_111_111_1, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_1 + 5 K = ? °C"), 294.261_111_111_111_1 + 5.0, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_1 + (T_2 - T_1)/2 = ? °F"), (85.0 - 32.0) * 5.0 / 9.0 + 273.15, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_3 := T_2 - 10 Δ°F = ? °F"), (90.0 - 32.0) * 5.0 / 9.0 + 273.15, Dim::TEMPERATURE);
+    close(shown(&mut env, "T_3 = ? °C"), (90.0 - 32.0) * 5.0 / 9.0 + 273.15, Dim::TEMPERATURE);
+    close(val("100 °C + 5 K = ? °C"), 378.15, Dim::TEMPERATURE);
+    close(val("T_K := 300 K = ? °C"), 300.0, Dim::TEMPERATURE);
+    // Anything else made from temperatures is not known to be absolute.
+    for src in ["(T_1 + T_2)/2 = ? °C", "2*T_1 = ? °C", "-T_1 + 600 K = ? °F", "5 K + 3 K = ? °C", "|T_1| = ? °C"] {
+        assert_eq!(run(&mut env, src), Err(not_absolute(src.rsplit(' ').next().unwrap())), "{src}");
+    }
+    // User functions pass it through their parameters and result.
+    run(&mut env, "warm(t) := t + 5 Δ°C").expect("defines");
+    run(&mut env, "twice(t) := 2*t").expect("defines");
+    close(shown(&mut env, "warm(T_1) = ? °C"), 294.261_111_111_111_1 + 5.0, Dim::TEMPERATURE);
+    assert_eq!(run(&mut env, "twice(T_1) = ? °C"), Err(not_absolute("°C")));
+    assert_eq!(run(&mut env, "warm(5 Δ°C) = ? °C"), Err(not_absolute("°C")));
+    // The larger of two absolute temperatures is one of them.
+    close(shown(&mut env, "max(T_1, T_2) = ? °F"), 310.927_777_777_777_8, Dim::TEMPERATURE);
+    assert_eq!(run(&mut env, "max(T_2 - T_1, 1 K) = ? °F"), Err(not_absolute("°F")));
+}
+
+#[test]
+fn engineering_constants_carry_their_units() {
+    let accel = Dim::LENGTH.div(Dim::TIME.powi(2).unwrap()).unwrap();
+    close(val("a := g_0 ="), 9.80665, accel);
+    close(val("v := c_0 ="), 299_792_458.0, Dim::LENGTH.div(Dim::TIME).unwrap());
+    let r = val("r := R_u =");
+    assert!((r.value - 8.314_462_618).abs() < 1e-9, "{}", r.value);
+    // A weight: 10 kg under standard gravity is 98.0665 N, and 1 lbm weighs 1 lbf.
+    close(val("F_w := 10 kg·g_0 ="), 98.0665, val("n_1 := 1 N =").dim);
+    let mut env = Env::new();
+    let w = shown(&mut env, "F_1 := 1 lbm·g_0 =");
+    let f = format(w, Some(&craft_units::parse_unit("lbf").unwrap()), UnitSystem::UsCustomary, Precision::new(6)).unwrap();
+    assert_eq!(f.number, "1");
+    // The constants are taken: they can't be redefined.
+    for name in ["g_0", "c_0", "R_u"] {
+        assert!(matches!(check_name(name), Err(CalcError::ReservedName(_))), "{name}");
+    }
+    assert!(check_name("g_1").is_ok(), "other subscripts are free");
+}
+
+#[test]
+fn g_is_gravity_when_the_document_says_so() {
+    let accel = Dim::LENGTH.div(Dim::TIME.powi(2).unwrap()).unwrap();
+    let mut env = Env::new();
+    env.set_g_is_gravity(true);
+    close(shown(&mut env, "a_1 := g ="), 9.80665, accel);
+    close(shown(&mut env, "F_w := 5 kg·g ="), 49.03325, val("n_1 := 1 N =").dim);
+    close(shown(&mut env, "m_1 := 5 gm ="), 0.005, Dim::MASS);
+    close(shown(&mut env, "m_2 := 5 kg ="), 5.0, Dim::MASS);
+    // `g` as a display unit would read as gravity: refused, with the way out named.
+    let e = run(&mut env, "m_3 := 5 kg = ? g").expect_err("g is gravity here");
+    assert!(e.to_string().contains("gm"), "{e}");
+    assert!(run(&mut env, "m_4 := 5 kg = ? gm").is_ok());
+    // Off (SI): g is the gram again.
+    close(val("m_5 := 5 g ="), 0.005, Dim::MASS);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Grids (vectors and matrices)
+// ---------------------------------------------------------------------------------------------
+
+/// `values` in `unit`, as SI quantities.
+fn quantities(values: &[f64], unit: &str) -> Vec<Quantity> {
+    let scale = craft_units::parse_unit(unit).expect("a unit");
+    values.iter().map(|&v| Quantity::new(v * scale.factor, scale.dim)).collect()
+}
+
+/// Define the column vector `name` of `values` in `unit`.
+fn column(env: &mut Env, name: &str, values: &[f64], unit: &str) {
+    env.define_array(name, values.len(), 1, quantities(values, unit)).expect("defines");
+}
+
+/// The grid `src` shows: its shape and its elements.
+fn grid(env: &mut Env, src: &str) -> ((usize, usize), Vec<Quantity>) {
+    match run_value(env, src) {
+        Ok(Some(Value::Grid { rows, cols, items })) => ((rows, cols), items),
+        other => panic!("{src:?} did not show a grid: {other:?}"),
+    }
+}
+
+/// Every element of `items` is close to the matching `want` (SI) and has dimension `dim`.
+fn close_all(items: &[Quantity], want: &[f64], dim: Dim) {
+    assert_eq!(items.len(), want.len(), "{items:?}");
+    for (q, w) in items.iter().zip(want) {
+        close(*q, *w, dim);
+    }
+}
+
+const INCH: f64 = 0.0254;
+
+#[test]
+fn vectors_add_element_wise() {
+    let mut env = Env::new();
+    column(&mut env, "D", &[1.0, 2.0, 3.0], "in");
+    column(&mut env, "t", &[0.1, 0.2, 0.3], "in");
+    let (shape, items) = grid(&mut env, "D + t =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[1.1 * INCH, 2.2 * INCH, 3.3 * INCH], Dim::LENGTH);
+    // A name holding a grid evaluates as that grid.
+    assert_eq!(run(&mut env, "D_t := D + t").ok(), Some(None));
+    let (shape, items) = grid(&mut env, "D_t - t =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[INCH, 2.0 * INCH, 3.0 * INCH], Dim::LENGTH);
+    // A shown unit must fit every element; one that doesn't names the element and defines nothing.
+    assert!(run_value(&mut env, "D = ? mm").is_ok());
+    let e = run_value(&mut env, "u := D = ? lbf").expect_err("inches aren't force");
+    assert!(e.to_string().starts_with("element 0: "), "{e}");
+    assert_eq!(run(&mut env, "u ="), Err(CalcError::Undefined("u".into())));
+}
+
+#[test]
+fn single_value_broadcasts() {
+    let mut env = Env::new();
+    column(&mut env, "D", &[1.0, 2.0, 3.0], "in");
+    let (shape, items) = grid(&mut env, "2·D =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[2.0 * INCH, 4.0 * INCH, 6.0 * INCH], Dim::LENGTH);
+    close_all(&grid(&mut env, "D/2 =").1, &[0.5 * INCH, INCH, 1.5 * INCH], Dim::LENGTH);
+    close_all(&grid(&mut env, "D^2 =").1, &[INCH * INCH, 4.0 * INCH * INCH, 9.0 * INCH * INCH], AREA);
+    close_all(&grid(&mut env, "1 in - D =").1, &[0.0, -INCH, -2.0 * INCH], Dim::LENGTH);
+    close_all(&grid(&mut env, "-D =").1, &[-INCH, -2.0 * INCH, -3.0 * INCH], Dim::LENGTH);
+    close_all(&grid(&mut env, "|1 in - D| =").1, &[0.0, INCH, 2.0 * INCH], Dim::LENGTH);
+    // A single value's unit rules still hold for every element.
+    let e = run_value(&mut env, "D + 1 lbf =").expect_err("can't add force to length");
+    assert!(e.to_string().starts_with("element 0: "), "{e}");
+    // Single values are unchanged: their errors aren't about an element.
+    assert!(matches!(err("x := 1 in + 1 lbf ="), CalcError::Unit(UnitError::Mismatch { .. })));
+}
+
+#[test]
+fn shape_mismatch_is_named() {
+    let mut env = Env::new();
+    column(&mut env, "D", &[1.0, 2.0, 3.0], "in");
+    column(&mut env, "E", &[1.0, 2.0, 3.0, 4.0], "in");
+    let e = run_value(&mut env, "D + E =").expect_err("shapes differ");
+    assert_eq!(e, CalcError::Shape { left: (3, 1), right: (4, 1) });
+    assert_eq!(e.to_string(), "shapes don't match: 3 rows × 1 vs 4 rows × 1");
+    // A row isn't a column.
+    env.define_array("R", 1, 3, quantities(&[1.0, 2.0, 3.0], "in")).expect("defines");
+    assert_eq!(run_value(&mut env, "D·R ="), Err(CalcError::Shape { left: (3, 1), right: (1, 3) }));
+}
+
+#[test]
+fn element_error_names_the_element() {
+    let mixed = vec![quantities(&[1.0], "in")[0], quantities(&[2.0], "lbf")[0]];
+    for (origin, at) in [(0, "element 1: "), (1, "element 2: ")] {
+        let mut env = Env::new();
+        env.set_origin(origin);
+        env.define_array("P", 2, 1, mixed.clone()).expect("defines");
+        column(&mut env, "Q", &[1.0, 1.0], "in");
+        let e = run_value(&mut env, "P + Q =").expect_err("lbf + in");
+        assert!(e.to_string().starts_with(at), "origin {origin}: {e}");
+        assert!(matches!(e, CalcError::Element { ref error, .. } if matches!(**error, CalcError::Unit(UnitError::Mismatch { .. }))), "{e:?}");
+    }
+    // A vector element has one index (a row vector counts along its columns); a matrix element two.
+    assert_eq!(element_name(3, 1, 2, 0), "2");
+    assert_eq!(element_name(1, 3, 2, 1), "3");
+    assert_eq!(element_name(2, 3, 4, 0), "[1, 1]");
+    assert_eq!(element_name(2, 3, 5, 1), "[2, 3]");
+    // An origin other than 0 or 1 is 0.
+    let mut env = Env::new();
+    env.set_origin(7);
+    env.define_array("P", 2, 1, mixed).expect("defines");
+    column(&mut env, "Q", &[1.0, 1.0], "in");
+    assert!(run_value(&mut env, "P + Q =").expect_err("lbf + in").to_string().starts_with("element 1: "));
+}
+
+#[test]
+fn builtins_apply_element_wise() {
+    let mut env = Env::new();
+    column(&mut env, "v", &[4.0, 9.0], "1");
+    column(&mut env, "r", &[1.26, 2.34], "1");
+    let (shape, items) = grid(&mut env, "sqrt(v) =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[2.0, 3.0], Dim::ONE);
+    close_all(&grid(&mut env, "round(r, 1) =").1, &[1.3, 2.3], Dim::ONE);
+    close_all(&grid(&mut env, "mod(v, 4) =").1, &[0.0, 1.0], Dim::ONE);
+    close_all(&grid(&mut env, "log(100, v) =").1, &[100f64.ln() / 4f64.ln(), 100f64.ln() / 9f64.ln()], Dim::ONE);
+    // Arity is checked before any element is.
+    assert_eq!(run_value(&mut env, "sqrt(v, v) ="), Err(CalcError::Arity("sqrt".into(), 1)));
+    // A per-element error names the element.
+    column(&mut env, "w", &[1.0, -1.0], "1");
+    assert!(run_value(&mut env, "sqrt(w) =").expect_err("sqrt(-1)").to_string().starts_with("element 1: "));
+    // min and max reduce an array to one value rather than applying element-wise.
+    close(shown(&mut env, "max(v) ="), 9.0, Dim::ONE);
+    close(shown(&mut env, "min(v, 1) ="), 1.0, Dim::ONE);
+}
+
+#[test]
+fn user_functions_apply_element_wise() {
+    let mut env = Env::new();
+    column(&mut env, "v", &[1.0, 2.0], "1");
+    run(&mut env, "f(x) := x^2 + 1").expect("defines");
+    let (shape, items) = grid(&mut env, "f(v) =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[2.0, 5.0], Dim::ONE);
+}
+
+#[test]
+fn arrays_are_bounded() {
+    let mut env = Env::new();
+    let e = env.define_array("big", 10_001, 1, vec![Quantity::dimensionless(1.0); 10_001]).expect_err("too large");
+    assert_eq!(e, CalcError::TooLarge);
+    assert_eq!(e.to_string(), "more than 10,000 elements");
+    assert!(env.define_array("big", 100, 101, Vec::new()).is_err_and(|e| e == CalcError::TooLarge));
+    // The cap is checked before the size, and an overflowing shape is too large rather than a panic.
+    assert_eq!(Grid::<Val>::new(101, 100, Vec::new()), Err(CalcError::TooLarge));
+    assert_eq!(Grid::<Val>::new(usize::MAX, 2, Vec::new()), Err(CalcError::TooLarge));
+    // A size that doesn't match the shape, or no elements at all, is refused.
+    assert!(Grid::<Val>::new(2, 2, Vec::new()).is_err());
+    assert!(Grid::<Val>::new(0, 1, Vec::new()).is_err());
+    // 10,000 is allowed, and so is arithmetic on it.
+    column(&mut env, "D", &vec![1.0; 10_000], "in");
+    assert_eq!(grid(&mut env, "D + D =").0, (10_000, 1));
+}
+
+#[test]
+fn element_operations_count_against_the_budget() {
+    let stmt = |src: &str| parse(src).expect("parses");
+    let mut env = Env::new();
+    column(&mut env, "D", &vec![1.0; 10_000], "in");
+    column(&mut env, "N", &vec![4.0; 10_000], "1");
+    // Each costs one step per node, 10,000 for reading the grid and 10,000 for the element-wise
+    // operation (an operator, a negation, a built-in).
+    for (src, nodes) in [("x := 2·D", 3), ("y := -D", 2), ("z := sqrt(N)", 2)] {
+        let pass = Pass::new(u64::MAX);
+        run_stmt_in(&mut env, &stmt(src), &pass).expect("runs");
+        assert_eq!(pass.spent.get(), nodes + 20_000, "{src}");
+        // The read fits in this budget; the operation doesn't.
+        assert_eq!(run_stmt_in(&mut env, &stmt(src), &Pass::new(15_000)), Err(CalcError::TooMuchWork), "{src}");
+    }
+    assert_eq!(run_stmt_in(&mut env, &stmt("w := 2·D"), &Pass::new(5_000)), Err(CalcError::TooMuchWork));
+    // Single values cost what they did: one step per node.
+    let pass = Pass::new(u64::MAX);
+    run_stmt_in(&mut env, &stmt("k := 2·3"), &pass).expect("runs");
+    assert_eq!(pass.spent.get(), 3);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Literals, indexes, ranges and indexed definitions
+// ---------------------------------------------------------------------------------------------
+
+/// An env holding `D := [0.840, 1.050, 1.315] in` and `M := [1, 2; 3, 4]`, numbered from `origin`.
+fn pipes(origin: u8) -> Env {
+    let mut env = Env::new();
+    env.set_origin(origin);
+    run(&mut env, "D := [0.840, 1.050, 1.315] in").expect("defines D");
+    run(&mut env, "M := [1, 2; 3, 4]").expect("defines M");
+    env
+}
+
+fn index_range_msg(e: CalcError) -> String {
+    match e {
+        CalcError::IndexRange(m) => m,
+        other => panic!("expected an index range error, got {other:?}"),
+    }
+}
+
+#[test]
+fn literal_evaluates() {
+    let mut env = pipes(0);
+    let (shape, items) = grid(&mut env, "D =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[0.840 * INCH, 1.050 * INCH, 1.315 * INCH], Dim::LENGTH);
+    // Each element keeps its own unit.
+    let (shape, items) = grid(&mut env, "[2 in, 50 mm] =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[2.0 * INCH, 0.050], Dim::LENGTH);
+    // A matrix, row by row.
+    let (shape, items) = grid(&mut env, "M =");
+    assert_eq!(shape, (2, 2));
+    close_all(&items, &[1.0, 2.0, 3.0, 4.0], Dim::ONE);
+    // Elements are expressions.
+    close_all(&grid(&mut env, "[1 + 1, D[0]/(1 in)] =").1, &[2.0, 0.840], Dim::ONE);
+    // An element that is itself a grid is refused, whichever way it is written.
+    for src in ["[2 [1]] =", "[D, 1] =", "[1, 2·D] ="] {
+        assert_eq!(syntax_msg(run_value(&mut env, src).expect_err(src)), "a matrix element can't be a vector", "{src}");
+    }
+}
+
+#[test]
+fn index_reads_an_element() {
+    let mut env = pipes(0);
+    close(shown(&mut env, "D[0] ="), 0.840 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "D[2] ="), 1.315 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "M[1, 0] ="), 3.0, Dim::ONE);
+    close(shown(&mut env, "M[0, 1] ="), 2.0, Dim::ONE);
+    // An index is an expression, and a column vector may also be given a row and a column.
+    close(shown(&mut env, "D[3 - 2] ="), 1.050 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "D[1, 0] ="), 1.050 * INCH, Dim::LENGTH);
+    // A function's parameter may be indexed.
+    run(&mut env, "f(x) := x[1]").expect("defines f");
+    close(shown(&mut env, "f(D) ="), 1.050 * INCH, Dim::LENGTH);
+
+    let mut env = pipes(1);
+    close(shown(&mut env, "D[1] ="), 0.840 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "D[3] ="), 1.315 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "M[2, 1] ="), 3.0, Dim::ONE);
+}
+
+#[test]
+fn index_must_be_a_whole_number_in_range() {
+    let mut env = pipes(0);
+    for src in ["D[1.5] =", "D[1 in] =", "D[1 rad] =", "D[[0]] =", "M[0.5, 0] =", "M[0, 1 in] ="] {
+        assert_eq!(syntax_msg(run_value(&mut env, src).expect_err(src)), "an index is a whole number, like D[2]", "{src}");
+    }
+    // Within 1e-9 of a whole number is that number.
+    close(shown(&mut env, "D[1 + 10^-12] ="), 1.050 * INCH, Dim::LENGTH);
+    assert_eq!(index_range_msg(run_value(&mut env, "D[3] =").expect_err("past the end")), "index 3 is outside D (0 to 2)");
+    assert_eq!(index_range_msg(run_value(&mut env, "D[-1] =").expect_err("before the start")), "index -1 is outside D (0 to 2)");
+    assert_eq!(index_range_msg(run_value(&mut env, "D[10^300] =").expect_err("far past the end")).split(' ').next(), Some("index"));
+    assert_eq!(index_range_msg(run_value(&mut env, "M[1] =").expect_err("one index")), "M is a matrix — give a row and a column, like M[1, 0]");
+    assert_eq!(
+        index_range_msg(run_value(&mut env, "M[2, 0] =").expect_err("no third row")),
+        "index [2, 0] is outside M (rows 0 to 1, columns 0 to 1)"
+    );
+    run(&mut env, "x := 5").expect("defines x");
+    assert_eq!(index_range_msg(run_value(&mut env, "x[0] =").expect_err("not a vector")), "x isn't a vector");
+    assert_eq!(index_range_msg(run_value(&mut env, "π[0] =").expect_err("not a vector")), "π isn't a vector");
+    assert_eq!(run_value(&mut env, "z[0] ="), Err(CalcError::Undefined("z".into())));
+    run(&mut env, "f(x) := x").expect("defines f");
+    assert!(matches!(run_value(&mut env, "f[0] ="), Err(CalcError::Syntax(_))));
+    env.mark_failed("F");
+    assert_eq!(run_value(&mut env, "F[0] ="), Err(CalcError::Upstream));
+    // Counting from 1, 0 is outside.
+    let mut env = pipes(1);
+    assert_eq!(index_range_msg(run_value(&mut env, "D[0] =").expect_err("before the start")), "index 0 is outside D (1 to 3)");
+}
+
+#[test]
+fn ranges_evaluate() {
+    let mut env = Env::new();
+    // A range includes both ends.
+    let (shape, items) = grid(&mut env, "i := 0..5 =");
+    assert_eq!(shape, (6, 1));
+    close_all(&items, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], Dim::ONE);
+    close_all(&grid(&mut env, "x := 1, 1.5..3 =").1, &[1.0, 1.5, 2.0, 2.5, 3.0], Dim::ONE);
+    close_all(&grid(&mut env, "len := 0 in, 0.5 in..1 in =").1, &[0.0, 0.5 * INCH, INCH], Dim::LENGTH);
+    // With no step, a range counts down as well as up.
+    close_all(&grid(&mut env, "c := 5..0 =").1, &[5.0, 4.0, 3.0, 2.0, 1.0, 0.0], Dim::ONE);
+    // The ends are expressions; a range of one element is a vector.
+    run(&mut env, "n := 3").expect("defines n");
+    close_all(&grid(&mut env, "k := 0..n-1 =").1, &[0.0, 1.0, 2.0], Dim::ONE);
+    assert_eq!(grid(&mut env, "o := 2..2 =").0, (1, 1));
+    // A step that doesn't land on the last value stops short of it.
+    close_all(&grid(&mut env, "ev := 0, 2..5 =").1, &[0.0, 2.0, 4.0], Dim::ONE);
+    // 10,000 elements is allowed.
+    assert_eq!(grid(&mut env, "big := 1..10000 =").0, (10_000, 1));
+    // A step that lands on the last value includes it, however the step rounds.
+    let tenths = grid(&mut env, "x := 0, 0.1..1 =").1;
+    assert_eq!(tenths.len(), 11, "{tenths:?}");
+    assert_eq!(tenths.last().map(|q| q.value), Some(1.0));
+}
+
+/// The ends of a range, and so its step, carry rounding error in proportion to their size: a
+/// range of large values whose step lands on its last value still ends on it.
+#[test]
+fn a_range_of_large_values_keeps_its_last_element() {
+    let mut env = Env::new();
+    for (src, count, first, last) in [
+        ("x := 100000, 100000.1..100002 =", 21, 100_000.0, 100_002.0),
+        ("x := 1000000, 1000000.01..1000000.1 =", 11, 1_000_000.0, 1_000_000.1),
+        ("x := 100002, 100001.9..100000 =", 21, 100_002.0, 100_000.0),
+        ("x := 500000, 500000.001..500000.1 =", 101, 500_000.0, 500_000.1),
+        ("x := 250000, 250000.05..250010 =", 201, 250_000.0, 250_010.0),
+    ] {
+        let (shape, items) = grid(&mut env, src);
+        assert_eq!(shape, (count, 1), "{src}");
+        assert_eq!(items.first().map(|q| q.value), Some(first), "{src}");
+        // The last element is the last value as written, exactly.
+        assert_eq!(items.last().map(|q| q.value), Some(last), "{src}");
+    }
+    // A step that doesn't land still stops short of the last value, at any size.
+    let (shape, items) = grid(&mut env, "x := 1000000, 1000002..1000005 =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[1_000_000.0, 1_000_002.0, 1_000_004.0], Dim::ONE);
+    // Counting by 1 from a large value is exact.
+    let (shape, items) = grid(&mut env, "x := 1000000000000..1000000000005 =");
+    assert_eq!(shape, (6, 1));
+    assert_eq!(items.last().map(|q| q.value), Some(1e12 + 5.0));
+    // The small ranges are as they were.
+    close_all(&grid(&mut env, "x := 1, 1.5..3 =").1, &[1.0, 1.5, 2.0, 2.5, 3.0], Dim::ONE);
+    close_all(&grid(&mut env, "x := 0..5 =").1, &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], Dim::ONE);
+    // A step too small for its values to tell where the range ends is an error, not a guess:
+    // 1e15 + 0.1 is 1e15 + 0.125 in a double.
+    let fine = run(&mut env, "x := 1e15, 1e15 + 0.1..1e15 + 1").expect_err("a step below the values' precision");
+    assert_eq!(syntax_msg(fine), "a range's step is too small next to its values to tell exactly where it ends");
+}
+
+#[test]
+fn bad_ranges_are_errors() {
+    let mut env = Env::new();
+    column(&mut env, "D", &[1.0, 2.0], "in");
+    let zero = run(&mut env, "x := 1, 1..3").expect_err("zero step");
+    assert!(matches!(zero, CalcError::Syntax(_)), "{zero:?}");
+    let away = run(&mut env, "x := 1, 0..3").expect_err("wrong direction");
+    assert!(matches!(away, CalcError::Syntax(_)), "{away:?}");
+    assert!(matches!(run(&mut env, "x := 0..5 in"), Err(CalcError::Unit(UnitError::Mismatch { .. }))));
+    assert!(matches!(run(&mut env, "x := 0 in, 1..5 in"), Err(CalcError::Unit(UnitError::Mismatch { .. }))));
+    assert_eq!(run(&mut env, "x := 0..20000"), Err(CalcError::TooLarge));
+    // A count too large for any integer is too large too, not a panic or a wrap.
+    assert_eq!(run(&mut env, "x := 0, 10^-300..1"), Err(CalcError::TooLarge));
+    assert_eq!(run(&mut env, "x := 0, 10^-300..10^300"), Err(CalcError::TooLarge));
+    // A range with units needs a step: counting by 1 in SI units would be a wrong-looking answer.
+    assert!(matches!(run(&mut env, "x := 0 in..1 in"), Err(CalcError::Syntax(_))));
+    // The ends are single values.
+    assert!(matches!(run(&mut env, "x := D..5"), Err(CalcError::Syntax(_))));
+    // A range defines a plain variable only.
+    for src in ["f(x) := 0..x", "t[i] := 0..5"] {
+        assert_eq!(syntax_msg(run(&mut env, src).expect_err(src)), "a range defines a variable, like i := 0..5", "{src}");
+    }
+    let built = Expr::Binary(
+        Op::Add,
+        Box::new(Expr::Range { first: Box::new(Expr::Num(0.0)), second: None, last: Box::new(Expr::Num(2.0)) }),
+        Box::new(Expr::Num(1.0)),
+    );
+    assert_eq!(syntax_msg(eval_expr(&env, &built).expect_err("a range inside an expression")), "a range defines a variable, like i := 0..5");
+    // Nothing failed defined anything.
+    assert_eq!(env.names(), vec!["D".to_string()]);
+    // The range's elements are charged before they are built.
+    let pass = Pass::new(u64::MAX);
+    run_stmt_in(&mut env, &parse("r := 0..9999").expect("parses"), &pass).expect("runs");
+    assert_eq!(pass.spent.get(), 3 + 10_000);
+    assert_eq!(run_stmt_in(&mut env, &parse("r := 0..9999").expect("parses"), &Pass::new(5_000)), Err(CalcError::TooMuchWork));
+}
+
+#[test]
+fn indexed_definition_fills_a_vector() {
+    let mut env = pipes(0);
+    run(&mut env, "i := 0..2").expect("defines i");
+    assert_eq!(run(&mut env, "t[i] := 2·D[i]"), Ok(None));
+    let (shape, items) = grid(&mut env, "t =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[1.68 * INCH, 2.1 * INCH, 2.63 * INCH], Dim::LENGTH);
+    // Shown as it is defined; `i` is each element in turn.
+    close_all(&grid(&mut env, "sq[i] := i^2 =").1, &[0.0, 1.0, 4.0], Dim::ONE);
+    // Counting from 1.
+    let mut env = pipes(1);
+    run(&mut env, "i := 1..3").expect("defines i");
+    run(&mut env, "t[i] := 2·D[i]").expect("defines t");
+    close_all(&grid(&mut env, "t =").1, &[1.68 * INCH, 2.1 * INCH, 2.63 * INCH], Dim::LENGTH);
+    // 10,000 elements fit in one recalculation's budget: reading D[i] doesn't copy D.
+    let mut env = Env::new();
+    column(&mut env, "D", &vec![1.0; 10_000], "in");
+    run(&mut env, "i := 0..9999").expect("defines i");
+    let pass = Pass::new(super::MAX_PASS_STEPS);
+    run_stmt_in(&mut env, &parse("t[i] := 2·D[i]").expect("parses"), &pass).expect("fits the budget");
+    assert_eq!(grid(&mut env, "t =").0, (10_000, 1));
+}
+
+#[test]
+fn indexed_definition_is_strict() {
+    let mut env = pipes(0);
+    run(&mut env, "i := 1..2").expect("defines i");
+    assert_eq!(syntax_msg(run(&mut env, "t[i] := 2·D[i]").expect_err("t[0] unset")), "t[0] isn't set by i — the range must cover every element");
+    // The body giving a grid for an element is an error.
+    run(&mut env, "j := 0..2").expect("defines j");
+    assert!(matches!(run(&mut env, "u[j] := D"), Err(CalcError::Syntax(_))));
+    // The range variable must be a vector of whole, plain numbers.
+    run(&mut env, "hf := 0, 0.5..2").expect("defines hf");
+    run(&mut env, "q := 0 in, 1 in..2 in").expect("defines q");
+    run(&mut env, "k := 1").expect("defines k");
+    for src in ["v[hf] := 1", "v[q] := 1", "v[k] := 1", "v[M] := 1"] {
+        assert!(matches!(run(&mut env, src), Err(CalcError::Syntax(_))), "{src}");
+    }
+    // An index before the origin, or one making the vector too large, is refused before any work.
+    run(&mut env, "n := -1..2").expect("defines n");
+    assert!(matches!(run(&mut env, "v[n] := 1"), Err(CalcError::IndexRange(_))));
+    run(&mut env, "w := [0, 20000]").expect("defines w");
+    assert_eq!(run(&mut env, "v[w] := 1"), Err(CalcError::TooLarge));
+    assert_eq!(run(&mut env, "v[z] := 1"), Err(CalcError::Undefined("z".into())));
+    // An element's error names the element.
+    let e = run(&mut env, "v[j] := 1/(j - 1)").expect_err("1/0");
+    assert_eq!(e, CalcError::Element { at: "1".into(), error: Box::new(CalcError::NonFinite) });
+    // Nothing failed defined anything.
+    for name in ["t", "u", "v"] {
+        assert!(!env.names().contains(&name.to_string()), "{name}");
+    }
+}
+
+#[test]
+fn nested_indexes_are_bounded_not_a_stack_overflow() {
+    let mut env = Env::new();
+    run(&mut env, "Z := [0]").expect("defines Z");
+    // As deep as the parser allows.
+    let src = format!("{}0{} =", "Z[".repeat(60), "]".repeat(60));
+    close(shown(&mut env, &src), 0.0, Dim::ONE);
+    // Hand-built: just inside the evaluator's depth limit evaluates, far past it is refused. An
+    // index or literal level costs less stack than a user-function call level (eval → call →
+    // call_user → eval), which already needs about 2.7 MB at the depth limit; 4 MB covers both.
+    let deep = move || {
+        let nest = |n: usize| (0..n).fold(Expr::Num(0.0), |e, _| Expr::Index("Z".into(), vec![e]));
+        assert_eq!(eval_expr(&env, &nest(2000)), Ok(Value::One(Quantity::dimensionless(0.0))));
+        assert_eq!(eval_expr(&env, &nest(3000)), Err(CalcError::TooComplex));
+        let literals =
+            |n: usize| (0..n).fold(Expr::Num(0.0), |e, _| Expr::Index("Z".into(), vec![Expr::Matrix { rows: 1, cols: 1, items: vec![e] }]));
+        assert!(eval_expr(&env, &literals(3000)).is_err());
+        let matrices = |n: usize| (0..n).fold(Expr::Num(0.0), |e, _| Expr::Matrix { rows: 1, cols: 1, items: vec![e] });
+        assert_eq!(eval_expr(&env, &matrices(3000)), Err(CalcError::TooComplex));
+    };
+    std::thread::Builder::new().stack_size(4 << 20).spawn(deep).expect("spawns").join().expect("no panic");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Array functions
+// ---------------------------------------------------------------------------------------------
+
+/// `q` is close to `want`, dimension and value.
+fn close_to(q: Quantity, want: Quantity) {
+    close(q, want.value, want.dim);
+}
+
+/// One value in `unit`, as an SI quantity.
+fn quantity(value: f64, unit: &str) -> Quantity {
+    quantities(&[value], unit).into_iter().next().expect("one quantity")
+}
+
+/// An env holding `NPS := [0.5, 0.75, 1, 1.5] in` and the flange torques
+/// `T := [30, 45, 60, 90] ft·lbf`.
+fn flanges() -> Env {
+    let mut env = Env::new();
+    run(&mut env, "NPS := [0.5, 0.75, 1, 1.5] in").expect("defines NPS");
+    run(&mut env, "T := [30, 45, 60, 90] ft·lbf").expect("defines T");
+    env
+}
+
+#[test]
+fn size_functions() {
+    let mut env = Env::new();
+    run(&mut env, "M := [1, 2; 3, 4; 5, 6]").expect("defines M");
+    close(shown(&mut env, "length(M) ="), 6.0, Dim::ONE);
+    close(shown(&mut env, "rows(M) ="), 3.0, Dim::ONE);
+    close(shown(&mut env, "cols(M) ="), 2.0, Dim::ONE);
+    close(shown(&mut env, "length(5 in) ="), 1.0, Dim::ONE);
+    assert_eq!(run(&mut env, "length(M, M) ="), Err(CalcError::Arity("length".into(), 1)));
+}
+
+#[test]
+fn reductions() {
+    let mut env = pipes(0);
+    close(shown(&mut env, "min([3, 1, 2] in) ="), INCH, Dim::LENGTH);
+    close(shown(&mut env, "max(D, 2 in) ="), 2.0 * INCH, Dim::LENGTH);
+    close(shown(&mut env, "max(D) ="), 1.315 * INCH, Dim::LENGTH);
+    close_to(shown(&mut env, "sum([1, 2] lbf) ="), quantity(3.0, "lbf"));
+    close(shown(&mut env, "mean([1, 2, 3] in) ="), 2.0 * INCH, Dim::LENGTH);
+    assert!(matches!(run(&mut env, "min([1 in, 2 lbf]) ="), Err(CalcError::Unit(_))));
+    assert!(matches!(run(&mut env, "sum([1 in, 2 lbf]) ="), Err(CalcError::Unit(_))));
+    assert_eq!(run(&mut env, "sum(D, D) ="), Err(CalcError::Arity("sum".into(), 1)));
+}
+
+#[test]
+fn products() {
+    let mut env = Env::new();
+    close_to(shown(&mut env, "dot([1, 2] in, [3, 4] lbf) ="), quantity(11.0, "lbf·in"));
+    let (shape, items) = grid(&mut env, "mmul([1, 2; 3, 4], [5; 6]) =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[17.0, 39.0], Dim::ONE);
+    // The inner sizes must agree: the message names the arguments, by name when they are names.
+    let e = run_value(&mut env, "mmul([1, 2, 3; 4, 5, 6], [1, 2, 3; 4, 5, 6]) =").expect_err("3 columns by 2 rows");
+    assert_eq!(syntax_msg(e), "mmul needs A's columns to match B's rows (3 and 2)");
+    run(&mut env, "M := [1, 2, 3; 4, 5, 6]").expect("defines M");
+    run(&mut env, "X := [1; 2]").expect("defines X");
+    let e = run_value(&mut env, "mmul(M, X) =").expect_err("3 columns by 2 rows");
+    assert_eq!(syntax_msg(e), "mmul needs M's columns to match X's rows (3 and 2)");
+    let (shape, items) = grid(&mut env, "transpose([1, 2, 3]) =");
+    assert_eq!(shape, (1, 3));
+    close_all(&items, &[1.0, 2.0, 3.0], Dim::ONE);
+    let (shape, items) = grid(&mut env, "transpose([1, 2; 3, 4; 5, 6]) =");
+    assert_eq!(shape, (2, 3));
+    close_all(&items, &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0], Dim::ONE);
+    assert_eq!(syntax_msg(run(&mut env, "dot([1, 2], [1, 2, 3]) =").expect_err("lengths")), "dot needs a and b of the same length (2 and 3)");
+}
+
+#[test]
+fn lookup_is_exact() {
+    let mut env = flanges();
+    let t90 = quantity(90.0, "ft·lbf");
+    assert_eq!(shown(&mut env, "lookup(NPS, T, 1.5 in) ="), t90);
+    close_to(shown(&mut env, "lookup(NPS, T, 38.1 mm) ="), t90);
+    assert_eq!(run(&mut env, "lookup(NPS, T, 2 in) ="), Err(CalcError::Syntax("2 in isn't in NPS".into())));
+    // A vector x gives one result per element; a miss names the element.
+    let (shape, items) = grid(&mut env, "lookup(NPS, T, [0.5, 1] in) =");
+    assert_eq!(shape, (2, 1));
+    assert_eq!(items, vec![quantity(30.0, "ft·lbf"), quantity(60.0, "ft·lbf")]);
+    let e = run_value(&mut env, "lookup(NPS, T, [0.5, 0.6] in) =").expect_err("0.6 in isn't a size");
+    assert_eq!(e.to_string(), "element 1: 0.6 in isn't in NPS");
+    assert!(matches!(run(&mut env, "lookup(NPS, T, 1 lbf) ="), Err(CalcError::Unit(UnitError::Mismatch { .. }))));
+    // A size listed twice matches more than one value: an error, never the first match.
+    run(&mut env, "NPS_2 := [0.5, 1.5, 1, 1.5] in").expect("defines NPS_2");
+    let e = run(&mut env, "lookup(NPS_2, T, 1.5 in) =").expect_err("two matches");
+    assert_eq!(syntax_msg(e), "1.5 in matches more than one value in NPS_2");
+    // Equal after conversion counts as a match too.
+    let e = run(&mut env, "lookup(NPS_2, T, 38.1 mm) =").expect_err("two matches");
+    assert_eq!(syntax_msg(e), "1.5 in matches more than one value in NPS_2");
+    close_to(shown(&mut env, "lookup(NPS_2, T, 1 in) ="), quantity(60.0, "ft·lbf"));
+}
+
+#[test]
+fn linterp_and_spline_never_extrapolate() {
+    let mut env = flanges();
+    close_to(shown(&mut env, "linterp(NPS, T, 1.25 in) ="), quantity(75.0, "ft·lbf"));
+    close_to(shown(&mut env, "linterp(NPS, T, 38.1 mm) ="), quantity(90.0, "ft·lbf"));
+    for f in ["linterp", "spline"] {
+        let outside = run(&mut env, &format!("{f}(NPS, T, 1.6 in) =")).expect_err("past the end");
+        assert_eq!(outside, CalcError::Syntax("1.6 in is outside NPS (0.5 in to 1.5 in)".into()), "{f}");
+        let below = run(&mut env, &format!("{f}(NPS, T, 0.25 in) =")).expect_err("before the start");
+        assert_eq!(below, CalcError::Syntax("0.25 in is outside NPS (0.5 in to 1.5 in)".into()), "{f}");
+    }
+    column(&mut env, "X", &[0.0, 1.0, 2.0, 3.0, 4.0], "1");
+    column(&mut env, "L", &[1.0, 3.0, 5.0, 7.0, 9.0], "1");
+    column(&mut env, "S", &[0.0, 1.0, 4.0, 9.0, 16.0], "1");
+    // A natural spline reproduces a line exactly.
+    assert_eq!(shown(&mut env, "spline(X, L, 1.5) ="), Quantity::dimensionless(4.0));
+    // Through y = x², it gives the knot values at the knots and lies between neighbours elsewhere.
+    for k in 0..5 {
+        assert_eq!(shown(&mut env, &format!("spline(X, S, {k}) =")).value, f64::from(k * k), "x = {k}");
+    }
+    let between = shown(&mut env, "spline(X, S, 1.5) =").value;
+    assert!(between > 1.0 && between < 4.0, "{between}");
+    // The solver itself: the second derivatives through y = x² at 0…4 are 0, 18/7, 12/7, 18/7, 0,
+    // so s(1.5) = 2.5 − (3/8)(18/7 + 12/7)/6 = 125/56.
+    assert!((between - 125.0 / 56.0).abs() <= 1e-9, "{between}");
+    // Uneven spacing (widths 1, 2, 3), where swapping an interval's neighbours' widths changes the
+    // answer: through y = x² at 0, 1, 3, 6 the second derivatives are 0, 15/7, 18/7, 0, giving
+    // s(2) = 107/28 and s(2.5) = 1367/224 (derived in the task 4 report).
+    column(&mut env, "X_u", &[0.0, 1.0, 3.0, 6.0], "1");
+    column(&mut env, "S_u", &[0.0, 1.0, 9.0, 36.0], "1");
+    for (x, want) in [("2", 107.0 / 28.0), ("2.5", 1367.0 / 224.0)] {
+        let got = shown(&mut env, &format!("spline(X_u, S_u, {x}) =")).value;
+        assert!((got - want).abs() <= 1e-9, "s({x}) = {got}, want {want}");
+    }
+    // A vector x gives one result per element.
+    let (shape, items) = grid(&mut env, "spline(X, L, [0.5, 1.5, 2.5]) =");
+    assert_eq!(shape, (3, 1));
+    close_all(&items, &[2.0, 4.0, 6.0], Dim::ONE);
+    let (shape, items) = grid(&mut env, "linterp(NPS, T, [0.5, 1.25] in) =");
+    assert_eq!(shape, (2, 1));
+    close_all(&items, &[quantity(30.0, "ft·lbf").value, quantity(75.0, "ft·lbf").value], quantity(1.0, "ft·lbf").dim);
+    let e = run_value(&mut env, "linterp(NPS, T, [1, 1.6] in) =").expect_err("1.6 in is past the end");
+    assert_eq!(e.to_string(), "element 1: 1.6 in is outside NPS (0.5 in to 1.5 in)");
+}
+
+#[test]
+fn interp_needs_increasing_xs() {
+    let mut env = flanges();
+    column(&mut env, "NPS_2", &[0.5, 1.0, 1.0, 1.5], "in");
+    column(&mut env, "T_3", &[30.0, 45.0, 60.0], "ft·lbf");
+    for f in ["linterp", "spline"] {
+        let e = run(&mut env, &format!("{f}(NPS_2, T, 1.25 in) =")).expect_err("not increasing");
+        assert_eq!(syntax_msg(e), format!("{f} needs NPS_2 strictly increasing — element 2 isn't more than element 1"));
+        let e = run(&mut env, &format!("{f}(NPS, T_3, 1 in) =")).expect_err("lengths differ");
+        assert_eq!(syntax_msg(e), format!("{f} needs NPS and T_3 of the same length (4 and 3)"));
+    }
+    let e = run(&mut env, "lookup(NPS, T_3, 1 in) =").expect_err("lengths differ");
+    assert_eq!(syntax_msg(e), "lookup needs NPS and T_3 of the same length (4 and 3)");
+    // An argument that isn't a bare name is called by what it is.
+    let e = run(&mut env, "lookup([1, 2, 3, 4], [1, 2, 3], 1) =").expect_err("lengths differ");
+    assert_eq!(syntax_msg(e), "lookup needs xs and ys of the same length (4 and 3)");
+    let e = run(&mut env, "linterp([1, 3, 2], [1, 2, 3], 1.5) =").expect_err("not increasing");
+    assert_eq!(syntax_msg(e), "linterp needs xs strictly increasing — element 2 isn't more than element 1");
+}
+
+#[test]
+fn new_function_names_are_reserved() {
+    for name in ["sum", "length", "rows", "cols", "mean", "dot", "mmul", "transpose", "lookup", "linterp", "spline"] {
+        assert_eq!(check_name(name), Err(CalcError::ReservedName(name.into())), "{name}");
+    }
+}
+
+#[test]
+fn products_are_bounded() {
+    let stmt = |src: &str| parse(src).expect("parses");
+    let mut env = Env::new();
+    env.define_array("C", 10_000, 1, vec![Quantity::dimensionless(1.0); 10_000]).expect("defines C");
+    env.define_array("R", 1, 10_000, vec![Quantity::dimensionless(1.0); 10_000]).expect("defines R");
+    // 10,000 × 10,000 elements: too large, before any of the product is worked out. The pass has
+    // paid only for the three nodes and for reading C and R.
+    let pass = Pass::new(u64::MAX);
+    assert_eq!(run_stmt_in(&mut env, &stmt("p := mmul(C, R)"), &pass), Err(CalcError::TooLarge));
+    assert_eq!(pass.spent.get(), 3 + 20_000);
+    // A product charges rows · cols · inner.
+    env.define_array("A", 2, 3, vec![Quantity::dimensionless(1.0); 6]).expect("defines A");
+    env.define_array("B", 3, 2, vec![Quantity::dimensionless(1.0); 6]).expect("defines B");
+    let pass = Pass::new(u64::MAX);
+    run_stmt_in(&mut env, &stmt("q := mmul(A, B)"), &pass).expect("runs");
+    assert_eq!(pass.spent.get(), 3 + 12 + 2 * 2 * 3);
+    // One element, but 10,000 products to sum.
+    let pass = Pass::new(u64::MAX);
+    run_stmt_in(&mut env, &stmt("r := mmul(R, C)"), &pass).expect("runs");
+    assert_eq!(pass.spent.get(), 3 + 20_000 + 10_000);
+    assert_eq!(run_stmt_in(&mut env, &stmt("r := mmul(R, C)"), &Pass::new(25_000)), Err(CalcError::TooMuchWork));
+}
+
+#[test]
+fn array_messages_use_the_display_format() {
+    let mut env = flanges();
+    env.set_display(UnitSystem::Si, Precision::new(4));
+    let e = run(&mut env, "linterp(NPS, T, 1.6 in) =").expect_err("past the end");
+    assert_eq!(syntax_msg(e), "0.0406 m is outside NPS (0.0127 m to 0.0381 m)");
+}
+
+#[test]
+fn reductions_of_temperatures_keep_what_they_stand_for() {
+    let mut env = Env::new();
+    // The smallest, largest or mean of temperatures is one; a sum isn't.
+    for src in ["min([300 K, 310 K]) = ? °C", "max([300 K, 310 K], 305 K) = ? °C", "mean([300 K, 310 K]) = ? °C"] {
+        assert!(run(&mut env, src).is_ok(), "{src}");
+    }
+    assert_eq!(run(&mut env, "sum([300 K, 310 K]) = ? °C"), Err(CalcError::NotAbsolute("°C".into())));
+    assert_eq!(run(&mut env, "max([300 K, 310 K], 5 Δ°C) = ? °C"), Err(CalcError::NotAbsolute("°C".into())));
+}
+
+#[test]
+fn array_messages_always_show_a_unit() {
+    let mut env = flanges();
+    // 10^307 m is too many inches to show: it shows in metres rather than as a bare number.
+    let e = run(&mut env, "linterp(NPS, T, 10^307 m) =").expect_err("past the end");
+    assert_eq!(syntax_msg(e), "1×10³⁰⁷ m is outside NPS (0.5 in to 1.5 in)");
+}
+
+#[test]
+fn text_values() {
+    let mut env = Env::new();
+    assert_eq!(run_value(&mut env, "c := \"OK\" ="), Ok(Some(Value::Text("OK".into()))));
+    assert_eq!(
+        run_value(&mut env, "v := [\"A\", \"B\"; \"C\", \"D\"] ="),
+        Ok(Some(Value::TextGrid { rows: 2, cols: 2, items: vec!["A".into(), "B".into(), "C".into(), "D".into()] }))
+    );
+    assert_eq!(run_value(&mut env, "v[1, 0] ="), Ok(Some(Value::Text("C".into()))));
+    run_value(&mut env, "w := transpose(v)").unwrap();
+    assert_eq!(run_value(&mut env, "w[0, 1] ="), Ok(Some(Value::Text("C".into()))));
+    assert_eq!(val("length([\"A\", \"B\", \"C\"]) ="), Quantity::dimensionless(3.0));
+    assert_eq!(err("\"OK\" + 1 =").to_string(), "\"OK\" is text — it can't be used in arithmetic");
+    assert_eq!(err("-\"OK\" =").to_string(), "\"OK\" is text — it can't be used in arithmetic");
+    assert_eq!(err("sqrt(\"OK\") =").to_string(), "\"OK\" is text — it can't be used in sqrt");
+    assert_eq!(err("sum([\"A\", \"B\"]) =").to_string(), "\"A\" is text — it can't be used in sum");
+    assert_eq!(err("\"OK\" = ? in").to_string(), "\"OK\" is text — it can't be used with a unit");
+    assert_eq!(err("[\"A\", 2] =").to_string(), "element 1 is a number but element 0 is text");
+    let long = "y".repeat(60);
+    assert_eq!(err(&format!("\"{long}\" + 1 =")).to_string(), format!("\"{}…\" is text — it can't be used in arithmetic", "y".repeat(40)));
+    // Functions pass text through; indexed definitions build text vectors.
+    run_value(&mut env, "label(x) := \"size\"").unwrap();
+    assert_eq!(run_value(&mut env, "label(2) ="), Ok(Some(Value::Text("size".into()))));
+}
+
+#[test]
+fn text_in_vectors_and_other_places() {
+    let mut env = Env::new();
+    run_value(&mut env, "i := 0..2").unwrap();
+    run_value(&mut env, "t[i] := \"n\"").unwrap();
+    assert_eq!(run_value(&mut env, "t ="), Ok(Some(Value::TextGrid { rows: 3, cols: 1, items: vec!["n".into(), "n".into(), "n".into()] })));
+    // A user function maps text through its parameter, and an element can be read back.
+    run_value(&mut env, "id(x) := x").unwrap();
+    assert_eq!(run_value(&mut env, "id(\"A\") ="), Ok(Some(Value::Text("A".into()))));
+    // Numbers and text never share a vector.
+    let mixed = |env: &mut Env, src: &str| run_value(env, src).unwrap_err().to_string();
+    assert_eq!(mixed(&mut env, "[1, \"A\"] ="), "element 1 is text but element 0 is a number");
+    assert_eq!(mixed(&mut env, "[1, 2; 3, \"A\"] ="), "element [1, 1] is text but element [0, 0] is a number");
+    // Other places that need a number.
+    assert_eq!(mixed(&mut env, "r := \"A\"..3"), "\"A\" is text — it can't be used in a range");
+    assert_eq!(mixed(&mut env, "max([\"B\", \"A\"]) ="), "\"B\" is text — it can't be used in max");
+    assert_eq!(mixed(&mut env, "mmul([\"B\"], [1]) ="), "\"B\" is text — it can't be used in mmul");
+    assert_eq!(mixed(&mut env, "|\"A\"| ="), "\"A\" is text — it can't be used in arithmetic");
+    assert_eq!(mixed(&mut env, "[\"A\", \"B\"] + 1 ="), "\"A\" is text — it can't be used in arithmetic");
+    assert_eq!(mixed(&mut env, "[t, t] ="), "a matrix element can't be a vector");
+    assert_eq!(val("rows([\"A\", \"B\"; \"C\", \"D\"]) ="), Quantity::dimensionless(2.0));
+    assert_eq!(val("cols([\"A\", \"B\"; \"C\", \"D\"]) ="), Quantity::dimensionless(2.0));
+    // Indexing text that isn't a vector, and past the end, are the usual index errors.
+    run_value(&mut env, "c := \"OK\"").unwrap();
+    assert_eq!(mixed(&mut env, "c[0] ="), "c isn't a vector");
+    assert_eq!(mixed(&mut env, "t[3] ="), "index 3 is outside t (0 to 2)");
+    // The error for a mix names the later element first, counted from the origin.
+    assert_eq!(crate::array::mixed(2, 1, 1, 0, 1).to_string(), "element 2 is text but element 1 is a number");
+    assert_eq!(crate::array::mixed(2, 1, 0, 1, 0).to_string(), "element 1 is a number but element 0 is text");
+}
+
+#[test]
+fn text_is_charged_by_size() {
+    let long = "é".repeat(1000); // 2000 bytes: 62 steps each at one per 32 bytes
+    let stmt = |src: &str| parse(src).unwrap_or_else(|e| panic!("{src:?} did not parse: {e}"));
+    let spent = |env: &mut Env, src: &str| {
+        let pass = Pass::new(u64::MAX);
+        run_stmt_in(env, &stmt(src), &pass).unwrap();
+        pass.spent.get()
+    };
+    let mut env = Env::new();
+    spent(&mut env, "i := 0..99");
+    spent(&mut env, &format!("t[i] := \"{long}\""));
+    spent(&mut env, "v[i] := 1");
+    // Copying a name: its elements, plus the text's bytes; the name itself is one step.
+    assert_eq!(spent(&mut env, "a := v"), 100 + 1);
+    assert_eq!(spent(&mut env, "b := t"), 100 + 100 * 62 + 1);
+    assert_eq!(spent(&mut env, "c := t[3]"), 62 + 1 + 1);
+    assert_eq!(spent(&mut env, "d := transpose(t)"), 2 * (100 + 100 * 62) + 2); // the copy of `t`, and the transposed copy
+    // So repeated copies of the text exhaust a budget that the same number of number copies doesn't.
+    let (numbers, texts) = (Pass::new(10_000), Pass::new(10_000));
+    let mut copies = |name: &str, pass: &Pass| (0..60).try_for_each(|k| run_stmt_in(&mut env, &stmt(&format!("x_{k} := {name}")), pass).map(|_| ()));
+    assert_eq!(copies("v", &numbers), Ok(()));
+    assert_eq!(copies("t", &texts), Err(CalcError::TooMuchWork));
+}
+
+/// Run `src` in a fresh env and return the plain values of the grid it shows.
+fn vector(src: &str) -> Vec<f64> {
+    let mut env = Env::new();
+    let stmt = parse(&format!("{src} =")).unwrap_or_else(|e| panic!("{src:?} did not parse: {e}"));
+    match run_stmt(&mut env, &stmt) {
+        Ok(Some(Value::Grid { items, .. })) => items.iter().map(|q| q.value).collect(),
+        other => panic!("{src:?} did not show a grid: {other:?}"),
+    }
+}
+
+#[test]
+fn comparisons() {
+    let t = |src: &str| val(&format!("{src} =")).value;
+    assert_eq!(t("38.1 mm == 1.5 in"), 1.0);
+    assert_eq!(t("38.1 mm > 1.5 in"), 0.0);
+    assert_eq!(t("212 °F ≤ 100 °C"), 1.0);
+    assert_eq!(t("100 °C == 212 °F"), 1.0);
+    assert_eq!(t("0.1 + 0.2 == 0.3"), 1.0);
+    assert_eq!(t("1e-20 == 0"), 0.0);
+    assert_eq!(t("0 ≤ 0.5 ≤ 1"), 1.0);
+    assert_eq!(t("0 ≤ 1.5 ≤ 1"), 0.0);
+    assert_eq!(t("\"A106 B\" == \" A106\u{a0} B \""), 1.0);
+    assert_eq!(t("\"a\" ≠ \"A\""), 1.0);
+    assert!(matches!(run(&mut Env::new(), "1 in < 1 lbf ="), Err(CalcError::Unit(_))));
+    assert_eq!(err("\"a\" < \"b\" =").to_string(), "\"a\" is text — it can't be used with <");
+    assert_eq!(err("\"OK\" == 1 =").to_string(), "can't compare \"OK\" with a number");
+    let v = vector("[1, 5, 9] > 4");
+    assert_eq!(v, vec![0.0, 1.0, 1.0]);
+}
+
+#[test]
+fn comparison_results_are_plain_one_and_zero() {
+    let q = val("3 in < 4 in =");
+    assert_eq!(q.dim, Dim::ONE);
+    assert_eq!(q.value, 1.0);
+    // Text grids compare element by element, and a text broadcasts.
+    assert_eq!(vector("[\"OK\", \"NG\", \" OK \"] == \"OK\""), vec![1.0, 0.0, 1.0]);
+    assert_eq!(vector("[\"a\", \"b\"] ≠ [\"a\", \"c\"]"), vec![0.0, 1.0]);
+    assert_eq!(err("[1, 2] < [1, 2, 3] =").to_string(), "shapes don't match: 2 rows × 1 vs 3 rows × 1");
+    assert_eq!(err("[1, 2] < \"a\" =").to_string(), "can't compare \"a\" with a number");
+    // A chain over a vector compares every link element by element.
+    assert_eq!(vector("0 ≤ [0.5, 2, 1] ≤ 1"), vec![1.0, 0.0, 1.0]);
+    assert_eq!(err("1 in == 2 =").to_string(), CalcError::Unit(UnitError::Mismatch { left: Dim::LENGTH, right: Dim::ONE }).to_string());
+}
+
+#[test]
+fn temperature_comparisons() {
+    let mut env = Env::new();
+    for src in ["T := 950 °F", "T_K := 700 K", "ΔT := 20 Δ°F", "T_1 := 100 °F", "T_2 := 200 °F"] {
+        run(&mut env, src).unwrap();
+    }
+    assert_eq!(run(&mut env, "T ≤ 900 °F =").unwrap().unwrap().value, 0.0);
+    assert_eq!(run(&mut env, "T ≤ 800 K =").unwrap().unwrap().value, 1.0); // 950 °F is 783.15 K
+    assert_eq!(run(&mut env, "ΔT ≤ 10 Δ°F =").unwrap().unwrap().value, 0.0);
+    assert_eq!(run(&mut env, "T_K > ΔT =").unwrap().unwrap().value, 1.0);
+    let msg = "can't compare an absolute temperature with a temperature difference — write an average as T_1 + (T_2 − T_1)/2";
+    assert_eq!(run(&mut env, "ΔT ≤ 10 °F =").unwrap_err().to_string(), msg);
+    assert_eq!(run(&mut env, "(T_1 + T_2)/2 ≤ 900 °F =").unwrap_err().to_string(), msg);
+    assert_eq!(run(&mut env, "T_1 + (T_2 - T_1)/2 ≤ 900 °F =").unwrap().unwrap().value, 1.0);
+}
+
+#[test]
+fn logic() {
+    let t = |src: &str| val(&format!("{src} =")).value;
+    assert_eq!(t("1 < 2 and 3 < 4"), 1.0);
+    assert_eq!(t("1 > 2 or not 3 > 4"), 1.0);
+    assert_eq!(t("0.5 and 1"), 1.0); // nonzero is true
+    assert_eq!(err("1 in and 1 =").to_string(), "a condition must be a comparison or a plain number");
+    assert_eq!(err("\"OK\" or 1 =").to_string(), "\"OK\" is text — it can't be used as a condition");
+    // A single false left side decides `and` without evaluating the right.
+    assert_eq!(t("1 > 2 and undefined_name > 0"), 0.0);
+    assert_eq!(t("1 < 2 or undefined_name > 0"), 1.0);
+    assert_eq!(vector("[1, 0, 2] > 0 and [1, 1, 0] > 0"), vec![1.0, 0.0, 0.0]);
+}
+
+#[test]
+fn logic_on_vectors_and_not() {
+    assert_eq!(vector("not [1, 0, 2]"), vec![0.0, 1.0, 0.0]);
+    assert_eq!(vector("[1, 0] > 0 or [0, 0] > 0"), vec![1.0, 0.0]);
+    assert_eq!(err("not 1 in =").to_string(), "a condition must be a comparison or a plain number");
+    assert_eq!(val("not not 1 =").value, 1.0);
+}
+
+#[test]
+fn keywords_are_not_names() {
+    for word in ["and", "or", "not", "if", "otherwise"] {
+        assert_eq!(check_name(word), Err(CalcError::Keyword(word.into())), "{word}");
+    }
+    assert_eq!(CalcError::Keyword("or".into()).to_string(), "or is a reserved word — choose another name");
+    assert!(check_name("order").is_ok());
+}
+
+/// The expression of `src` (written without its `=`), parsed.
+fn expr_of(src: &str) -> Expr {
+    match parse(&format!("{src} =")) {
+        Ok(crate::Stmt::Eval { expr, .. }) => expr,
+        other => panic!("{src:?} is not an expression: {other:?}"),
+    }
+}
+
+/// `src` evaluated in `env` with element failures kept per element.
+fn lenient_result(env: &Env, src: &str) -> Result<Data, CalcError> {
+    let pass = Pass::new(u64::MAX);
+    let cx = Cx::new(env, &pass);
+    let result = eval_lenient(&cx, &Frame::GLOBAL, &expr_of(src), 0);
+    assert_eq!(cx.lenient.get(), 0, "eval_lenient restores the flag");
+    result
+}
+
+fn lenient(env: &Env, src: &str) -> Data {
+    lenient_result(env, src).unwrap_or_else(|e| panic!("{src:?} failed: {e}"))
+}
+
+fn lenient_err(env: &Env, src: &str) -> String {
+    match lenient_result(env, src) {
+        Err(e) => e.to_string(),
+        Ok(d) => panic!("{src:?} should fail: {d:?}"),
+    }
+}
+
+/// The error of running `src` in `env`, as shown.
+fn err_in(env: &mut Env, src: &str) -> String {
+    match run(env, src) {
+        Err(e) => e.to_string(),
+        other => panic!("{src:?} should fail: {other:?}"),
+    }
+}
+
+/// Run `src` in `env` and return the plain values of the grid it shows.
+fn vector_in(env: &mut Env, src: &str) -> Vec<f64> {
+    match run_value(env, src) {
+        Ok(Some(Value::Grid { items, .. })) => items.iter().map(|q| q.value).collect(),
+        other => panic!("{src:?} did not show a grid: {other:?}"),
+    }
+}
+
+fn failed_at<T>(g: &Grid<T>) -> Vec<usize> {
+    g.failed.iter().map(|(k, _)| *k).collect()
+}
+
+#[test]
+fn lenient_grids_keep_element_failures() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 0, 2]").unwrap();
+    let d = lenient(&env, "1/x");
+    let Data::Grid(g) = &d else { panic!("{d:?}") };
+    assert_eq!(g.failed.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [1]);
+    // Element-wise work carries the failure along; whole-array use refuses it.
+    let Data::Grid(g) = lenient(&env, "2·(1/x) + 1") else { panic!() };
+    assert_eq!(g.failed.len(), 1);
+    assert_eq!(g.items[2].q.value, 2.0);
+    assert!(lenient_err(&env, "sum(1/x)").starts_with("element 1:"));
+    // Strict evaluation is unchanged.
+    assert!(err_in(&mut env, "1/x =").starts_with("element 1:"));
+}
+
+#[test]
+fn lenient_failures_are_named_once() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 0, 2]").unwrap();
+    let strict = err_in(&mut env, "1/x =");
+    assert_eq!(lenient_err(&env, "sum(1/x)"), strict);
+    assert_eq!(lenient_err(&env, "sum(2·(1/x) + 1)"), strict);
+    // The raw error is kept, not one already naming the element.
+    let Data::Grid(g) = lenient(&env, "1/x") else { panic!() };
+    assert!(!matches!(g.failed[0].1, CalcError::Element { .. }), "{:?}", g.failed[0].1);
+}
+
+#[test]
+fn lenient_failures_pass_through_element_wise_operations() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 0, 4]").unwrap();
+    run(&mut env, "y := [1, 0, -4]").unwrap();
+    run(&mut env, "f(v) := v·2").unwrap();
+    // Built-ins applied element by element, comparisons, logic, `not`, user functions.
+    for src in
+        ["sqrt(1/x)", "-(1/x)", "|1/x|", "1/x > 0", "not (1/x > 0)", "1/x > 0 and x > 0", "x > 0 or 1/x > 0", "f(1/x)", "1/x + 1/x", "1/x < 2 < 3"]
+    {
+        let Data::Grid(g) = lenient(&env, src) else { panic!("{src}") };
+        assert_eq!(failed_at(&g), [1], "{src}");
+    }
+    // Each element keeps its own failure, in element order.
+    let Data::Grid(g) = lenient(&env, "sqrt(y)/y") else { panic!() };
+    assert_eq!(failed_at(&g), [1, 2]);
+    // The left side's failure wins where both fail.
+    let Data::Grid(g) = lenient(&env, "1/y + sqrt(y - 1)") else { panic!() };
+    assert_eq!(failed_at(&g), [1, 2]);
+    assert_eq!(g.failed[0].1, CalcError::NonFinite);
+}
+
+#[test]
+fn whole_array_uses_refuse_lenient_failures() {
+    let mut env = Env::new();
+    run(&mut env, "x := [1, 0, 2]").unwrap();
+    run(&mut env, "M := [1, 0; 2, 3]").unwrap();
+    run(&mut env, "first(v) := v[0]").unwrap();
+    for src in ["sum(1/x)", "length(1/x)", "transpose(1/x)", "max(1/x)", "lookup(x, 1/x, 2)", "first(1/x)"] {
+        assert!(lenient_err(&env, src).starts_with("element 1:"), "{src}: {}", lenient_err(&env, src));
+    }
+    assert!(lenient_err(&env, "sum(1/M)").starts_with("element [0, 1]:"), "{}", lenient_err(&env, "sum(1/M)"));
+    // Work that runs out is never kept per element.
+    let big = Env::new();
+    let pass = Pass::new(10);
+    let cx = Cx::new(&big, &pass);
+    assert_eq!(eval_lenient(&cx, &Frame::GLOBAL, &expr_of("1/[1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]"), 0), Err(CalcError::TooMuchWork));
+    assert_eq!(cx.lenient.get(), 0);
+}
+
+#[test]
+fn strict_boundaries_refuse_failed_grids() {
+    let env = Env::new();
+    let failed = Grid { rows: 2, cols: 1, items: vec![Val::plain(Quantity::dimensionless(1.0)); 2], failed: vec![(1, CalcError::NonFinite)] };
+    let d = Data::Grid(failed);
+    let want = "element 1: result isn't a finite number";
+    assert_eq!(d.clone().strict(0).map_err(|e| e.to_string()), Err(want.to_string()));
+    assert_eq!(check_display(&env, "m", &d).map_err(|e| e.to_string()).err().as_deref(), Some(want));
+    // Text grids too: a comparison keeps or refuses their failures like numbers.
+    let texts =
+        Data::TextGrid(Grid { rows: 3, cols: 1, items: vec!["a".into(), String::new(), "b".into()], failed: vec![(1, CalcError::NonFinite)] });
+    assert!(texts.clone().strict(0).is_err());
+    let pass = Pass::new(u64::MAX);
+    let cx = Cx::new(&env, &pass);
+    let b = Data::Text("b".into());
+    assert_eq!(compare_texts(&cx, &texts, crate::Cmp::Eq, &b).map_err(|e| e.to_string()), Err(want.to_string()));
+    cx.lenient.set(1);
+    let Ok(Data::Grid(g)) = compare_texts(&cx, &b, crate::Cmp::Eq, &texts) else { panic!() };
+    assert_eq!(failed_at(&g), [1]);
+    assert_eq!(g.items[2].q.value, 1.0);
+}
+
+#[test]
+fn piecewise() {
+    let mut env = Env::new();
+    let y = |env: &mut Env, t: &str| {
+        run(env, &format!("T_{} := {t}", t.len())).unwrap();
+        run(env, &format!("Y_{} := 0.4 if T_{} ≤ 900 °F, 0.5 if T_{} ≤ 950 °F, 0.7 otherwise =", t.len(), t.len(), t.len())).unwrap().unwrap().value
+    };
+    assert_eq!(y(&mut env, "900 °F"), 0.4);
+    assert_eq!(y(&mut env, "900.1 °F"), 0.5);
+    assert_eq!(y(&mut env, "482.2222222222222 °C"), 0.4); // 900 °F
+    assert_eq!(y(&mut env, "1000 °F"), 0.7);
+    run(&mut env, "T := 1000 °F").unwrap();
+    let e = run(&mut env, "Z := 0.4 if T ≤ 900 °F, 0.5 if T ≤ 950 °F").unwrap_err().to_string();
+    assert!(e.starts_with("no case applies (T = 1"), "{e}");
+}
+
+#[test]
+fn per_element_branches() {
+    let mut env = Env::new();
+    run(&mut env, "x := [4, -1, 9, 0]").unwrap();
+    assert_eq!(vector_in(&mut env, "r := sqrt(x) if x ≥ 0, 0 otherwise ="), vec![2.0, 0.0, 3.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "q := if(x ≠ 0, 1/x, 0) ="), vec![0.25, -1.0, 1.0 / 9.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "a := x ≠ 0 and 1/x > 0.2 ="), vec![1.0, 0.0, 0.0, 0.0]);
+    // Whole arrays stay whole inside a branch.
+    // (`s` is the second, so the sum is `s_x`.)
+    assert_eq!(vector_in(&mut env, "s_x := sum(x) if x > 0, 0 otherwise ="), vec![12.0, 0.0, 12.0, 0.0]);
+    // A picked element that fails fails; an unpicked one doesn't.
+    assert!(err_in(&mut env, "b := 1/x if x ≥ 0, 0 otherwise =").starts_with("element 3:"));
+    // Text verdicts per element, and counting them. (`m` is the metre, so the margins are `margin`.)
+    run(&mut env, "margin := [0.1, -0.2, 0.3] in").unwrap();
+    run(&mut env, "check := \"OK\" if margin ≥ 0 in, \"NG\" otherwise").unwrap();
+    assert_eq!(run_value(&mut env, "check ="), Ok(Some(Value::TextGrid { rows: 3, cols: 1, items: vec!["OK".into(), "NG".into(), "OK".into()] })));
+    assert_eq!(run(&mut env, "sum(check == \"NG\") =").unwrap().unwrap().value, 1.0);
+    assert_eq!(err_in(&mut env, "mix := \"OK\" if margin ≥ 0 in, 0 otherwise ="), "element 1 is a number but element 0 is text");
+    // No otherwise: the unmatched element names itself.
+    assert!(err_in(&mut env, "z := 1 if margin > 0 in =").starts_with("element 1: no case applies (margin = "));
+    // A single value may be text in one case and a number in another.
+    assert_eq!(run_value(&mut env, "w := \"none\" if 1 > 2, 5 otherwise ="), Ok(Some(Value::One(Quantity::dimensionless(5.0)))));
+    // Review Focus 4: inside a user function called with a vector.
+    run(&mut env, "f(v) := sqrt(v) if v ≥ 0, 0 otherwise").unwrap();
+    assert_eq!(vector_in(&mut env, "f([4, -1, 9]) ="), vec![2.0, 0.0, 3.0]);
+    // A nested piecewise inside a lenient branch keeps its element failures to itself: g_2 has no
+    // case for x ≤ 0, but those elements never pick the branch that calls it. (`g` is the gram.)
+    run(&mut env, "g_2(v) := 1 if v > 5, 2 if v > 0").unwrap();
+    assert_eq!(vector_in(&mut env, "n := g_2(x) if x > 0, 0 otherwise ="), vec![2.0, 0.0, 1.0, 0.0]);
+}
+
+/// The `x` of `lookup`, `linterp` and `spline` is per element in a branch: an element that picks
+/// another branch can't fail there, and `x`'s own failed elements fail only their own results.
+/// The tables stay whole, and strict callers keep their errors.
+#[test]
+fn lookups_and_interpolations_fail_only_the_elements_that_pick_them() {
+    let mut env = Env::new();
+    for src in ["xs := [0, 10, 20]", "ys := [0, 100, 400]", "x := [5, 15, 30]", "k := [1, 2, 9]", "xs_2 := [1, 2, 3]", "ys_2 := [10, 20, 30]"] {
+        run(&mut env, src).unwrap();
+    }
+    // The reproductions: per-element results.
+    assert_eq!(vector_in(&mut env, "y := linterp(xs, ys, x) if x ≤ 20, 0 otherwise ="), vec![50.0, 250.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "y_2 := if(x ≤ 20, linterp(xs, ys, x), 0) ="), vec![50.0, 250.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "y_3 := lookup(xs_2, ys_2, k) if k ≤ 3, 0 otherwise ="), vec![10.0, 20.0, 0.0]);
+    let s = vector_in(&mut env, "y_4 := spline(xs, ys, x) if x ≤ 20, 0 otherwise =");
+    assert_eq!((s.len(), s[2]), (3, 0.0));
+    // `x`'s own failed element (`1/z` at 0) passes through, as in `2·(1/z)`.
+    run(&mut env, "z := [4, 0, 9]").unwrap();
+    assert_eq!(vector_in(&mut env, "y_5 := 2·(1/z) if z ≠ 0, 0 otherwise ="), vec![0.5, 0.0, 2.0 / 9.0]);
+    let v = vector_in(&mut env, "y_6 := linterp([0, 1], [0, 10], 1/z) if z ≠ 0, 0 otherwise =");
+    assert_eq!(v.len(), 3);
+    assert!((v[0] - 2.5).abs() < 1e-12 && v[1] == 0.0 && (v[2] - 10.0 / 9.0).abs() < 1e-12, "{v:?}");
+    assert_eq!(vector_in(&mut env, "y_7 := lookup([0.25, 1/9], [1, 2], 1/z) if z ≠ 0, 0 otherwise ="), vec![1.0, 0.0, 2.0]);
+    // A picked element that fails still fails, named once.
+    assert_eq!(err_in(&mut env, "b := linterp(xs, ys, x) if x ≥ 0, 0 otherwise ="), "element 2: 30 is outside xs (0 to 20)");
+    assert_eq!(err_in(&mut env, "b := linterp([0, 1], [0, 10], 1/z) if z ≥ 0, 0 otherwise ="), "element 1: result isn't a finite number");
+    // Strict callers: the errors as before.
+    assert_eq!(err_in(&mut env, "linterp(xs, ys, x) ="), "element 2: 30 is outside xs (0 to 20)");
+    assert_eq!(err_in(&mut env, "spline(xs, ys, x) ="), "element 2: 30 is outside xs (0 to 20)");
+    assert_eq!(err_in(&mut env, "lookup(xs_2, ys_2, k) ="), "element 2: 9 isn't in xs_2");
+    // The tables are taken whole, even in a branch: a failed element of `xs` fails every element.
+    assert_eq!(err_in(&mut env, "b := lookup(1/z, ys, 1) if z ≠ 0, 0 otherwise ="), "element 1: result isn't a finite number");
+}
+
+/// Text lookups follow the same rule, for a text `x` and for a text result.
+#[test]
+fn text_lookups_fail_only_the_elements_that_pick_them() {
+    let mut env = Env::new();
+    for src in [
+        "Material := [\"A\", \"B\"]",
+        "S := [10, 20]",
+        "mat := [\"A\", \"C\", \"B\"]",
+        "k := [1, 2, 9]",
+        "words := [\"ten\", \"twenty\", \"thirty\"]",
+        "pair := [\"ten\", \"twenty\"]",
+    ] {
+        run(&mut env, src).unwrap();
+    }
+    assert_eq!(vector_in(&mut env, "s_1 := lookup(Material, S, mat) if mat ≠ \"C\", 0 otherwise ="), vec![10.0, 0.0, 20.0]);
+    assert_eq!(
+        run_value(&mut env, "w := lookup([1, 2, 3], words, k) if k ≤ 3, \"none\" otherwise ="),
+        Ok(Some(Value::TextGrid { rows: 3, cols: 1, items: vec!["ten".into(), "twenty".into(), "none".into()] }))
+    );
+    assert_eq!(
+        run_value(&mut env, "w_2 := lookup(Material, pair, mat) if mat ≠ \"C\", \"none\" otherwise ="),
+        Ok(Some(Value::TextGrid { rows: 3, cols: 1, items: vec!["ten".into(), "none".into(), "twenty".into()] }))
+    );
+    assert_eq!(err_in(&mut env, "lookup(Material, S, mat) ="), "element 1: \"C\" isn't in Material");
+    // An `x` whose every element failed is no number to refuse against text `xs`: each element
+    // keeps its own failure.
+    run(&mut env, "z_0 := [0, 0]").unwrap();
+    assert_eq!(err_in(&mut env, "b := lookup(Material, S, 1/z_0) if z_0 == 0, 0 otherwise ="), "element 0: result isn't a finite number");
+}
+
+/// A chain is the `and` of its links: a link's right operand is worked out only where every
+/// earlier link holds, and a failure where an element is already false is ignored.
+#[test]
+fn a_chain_is_the_and_of_its_links() {
+    let mut env = Env::new();
+    run(&mut env, "b := 0").unwrap();
+    assert_eq!(run(&mut env, "0 < b < 1/b =").unwrap().unwrap().value, 0.0);
+    assert_eq!(run(&mut env, "0 < b and b < 1/b =").unwrap().unwrap().value, 0.0);
+    // A single false stops the chain before a later operand is worked out.
+    assert_eq!(run(&mut env, "1 < 0 < undefined_name =").unwrap().unwrap().value, 0.0);
+    assert_eq!(run(&mut env, "5 < 3 < [1, 2] ="), Ok(Some(Quantity::dimensionless(0.0))));
+    // A link that is reached and fails still fails.
+    assert_eq!(err_in(&mut env, "-1 < b < 1/b ="), "result isn't a finite number");
+    // Per element.
+    run(&mut env, "v := [0.5, 0, 2]").unwrap();
+    assert_eq!(vector_in(&mut env, "0 < v < 1/v ="), vec![1.0, 0.0, 0.0]);
+    assert_eq!(vector_in(&mut env, "0 < v and v < 1/v ="), vec![1.0, 0.0, 0.0]);
+    assert_eq!(err_in(&mut env, "-1 < v < 1/v ="), "element 1: result isn't a finite number");
+    // Three links: the third operand only where the first two hold.
+    run(&mut env, "w := [1, 0, -1, 0.5]").unwrap();
+    assert_eq!(vector_in(&mut env, "0 < w ≤ 1 < 2/w ="), vec![1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(err_in(&mut env, "-1 < w ≤ 1 < 2/w ="), "element 1: result isn't a finite number");
+    // In a branch, as a condition.
+    assert_eq!(vector_in(&mut env, "c := 1 if 0 < v < 1/v, 2 otherwise ="), vec![1.0, 2.0, 2.0]);
+}
+
+#[test]
+fn piecewise_details() {
+    let mut env = Env::new();
+    run(&mut env, "x := [4, -1, 9, 0]").unwrap();
+    // Only the picked branch of a single condition is evaluated.
+    assert_eq!(run(&mut env, "p := 1 if 1 > 0, undefined_name otherwise =").unwrap().unwrap().value, 1.0);
+    assert_eq!(run(&mut env, "p_2 := if(1 < 0, undefined_name, 2) =").unwrap().unwrap().value, 2.0);
+    // A later condition that fails for an element already decided doesn't fail it; a still
+    // undecided one does, and so does a picked branch that fails as a whole.
+    assert_eq!(vector_in(&mut env, "c := 1 if x ≤ 0, 2 if 1/x > 0.2, 3 otherwise ="), vec![2.0, 1.0, 3.0, 1.0]);
+    assert!(err_in(&mut env, "c_2 := 1 if x < 0, 2 if 1/x > 0.2, 3 otherwise =").starts_with("element 3: result isn't a finite number"));
+    assert_eq!(err_in(&mut env, "c_3 := [1, 2] if x > 0, 0 otherwise ="), "shapes don't match: 4 rows × 1 vs 2 rows × 1");
+    assert_eq!(err_in(&mut env, "c_4 := 1 if x > 0, 2 if [1, 0] > 0, 3 otherwise ="), "shapes don't match: 4 rows × 1 vs 2 rows × 1");
+    // ... but an unpicked branch that fails as a whole doesn't matter.
+    assert_eq!(vector_in(&mut env, "c_5 := 1 if x > -5, undefined_name otherwise ="), vec![1.0; 4]);
+    // A single condition after a vector one decides every element still undecided.
+    assert_eq!(vector_in(&mut env, "c_6 := x if x > 5, 7 if 1 > 0 ="), vec![7.0, 7.0, 9.0, 7.0]);
+    // Each element keeps what its value stands for as a temperature.
+    run(&mut env, "T := 100 °F if x > 0, 200 °F otherwise").unwrap();
+    assert!(run_value(&mut env, "T = ? °F").is_ok());
+    // A condition must be a plain number; text or a unit value is an error.
+    assert_eq!(err_in(&mut env, "d := 1 if \"a\", 2 otherwise ="), "\"a\" is text — it can't be used as a condition");
+    assert_eq!(err_in(&mut env, "d := 1 if 1 in, 2 otherwise ="), "a condition must be a comparison or a plain number");
+    assert_eq!(err_in(&mut env, "d := 1 if x > 0, 2 if 1 in, 3 otherwise ="), "a condition must be a comparison or a plain number");
+    // `if` takes three arguments.
+    assert_eq!(err_in(&mut env, "d := if(1, 2) ="), "if expects 3 argument(s)");
+    // The no-case message: up to three variables, never units, functions or constants.
+    run(&mut env, "a := 1").unwrap();
+    run(&mut env, "b := \"x\"").unwrap();
+    run(&mut env, "k := 2 in").unwrap();
+    run(&mut env, "id(v) := v").unwrap();
+    assert_eq!(err_in(&mut env, "n_c := 1 if id(a) > 2 and π > 4 and k > 1 m and b == \"y\" ="), "no case applies (a = 1, k = 2 in, b = \"x\")");
+    assert_eq!(err_in(&mut env, "n_c := 1 if 1 > 2 ="), "no case applies");
+    // Text grids, matrices and the origin.
+    env.set_origin(1);
+    run(&mut env, "M := [1, -2; 3, -4]").unwrap();
+    assert!(err_in(&mut env, "n_c := 1 if M > 0 =").starts_with("element [1, 2]: no case applies (M = -2)"));
+}
+
+#[test]
+fn logic_short_circuits_per_element() {
+    let mut env = Env::new();
+    run(&mut env, "x := [4, -1, 9, 0]").unwrap();
+    assert_eq!(vector_in(&mut env, "o := x == 0 or 1/x > 0.2 ="), vec![1.0, 0.0, 0.0, 1.0]);
+    // An element the left side doesn't decide takes the right side's failure.
+    assert!(err_in(&mut env, "o := x ≠ 4 and 1/x > 0 =").starts_with("element 3: result isn't a finite number"));
+    // A left side that decides every element leaves the right side unevaluated.
+    assert_eq!(vector_in(&mut env, "o := x > 100 and undefined_name ="), vec![0.0; 4]);
+    // The right side broadcasts a single value, and must otherwise have the left's shape.
+    assert_eq!(vector_in(&mut env, "o := x > 0 or 1 > 2 ="), vec![1.0, 0.0, 1.0, 0.0]);
+    assert_eq!(err_in(&mut env, "o := x > 0 or [1, 0] > 0 ="), "shapes don't match: 4 rows × 1 vs 2 rows × 1");
+}
+
+#[test]
+fn piecewise_element_errors_are_named_once_at_a_strict_caller() {
+    let mut env = Env::new();
+    run(&mut env, "x := [4, -1, 9, 0]").unwrap();
+    let want = "element 3: result isn't a finite number";
+    // A definition that shows its value, and one that doesn't.
+    assert_eq!(err_in(&mut env, "b := 1/x if x ≥ 0, 0 otherwise ="), want);
+    assert_eq!(err_in(&mut env, "b := 1/x if x ≥ 0, 0 otherwise"), want);
+    assert!(env.data("b").is_none(), "nothing failed is defined");
+    // An evaluation, through `run_stmt` and through `eval_expr`.
+    assert_eq!(err_in(&mut env, "if(x ≥ 0, 1/x, 0) ="), want);
+    assert_eq!(eval_expr(&env, &expr_of("if(x ≥ 0, 1/x, 0)")).map_err(|e| e.to_string()), Err(want.to_string()));
+    // A function's piecewise body called with a vector.
+    run(&mut env, "f(v) := 1/v if v ≥ 0, 0 otherwise").unwrap();
+    assert_eq!(err_in(&mut env, "f(x) ="), want);
+    // An indexed definition: element by element, a failing element is named once; a body that
+    // is a vector is that error, even when one of its elements failed.
+    run(&mut env, "i := 0..3").unwrap();
+    assert_eq!(err_in(&mut env, "t[i] := 1/x[i] if x[i] ≥ 0, 0 otherwise"), want);
+    assert_eq!(err_in(&mut env, "t[i] := 1/x if x ≥ 0, 0 otherwise"), "t[i] is one element — its right side can't be a vector");
+    assert_eq!(vector_in(&mut env, "t[i] := 1/x[i] if x[i] > 0, 0 otherwise ="), vec![0.25, 0.0, 1.0 / 9.0, 0.0]);
+}
+
+#[test]
+fn piecewise_work_is_bounded() {
+    // Many cases over a large vector: each condition's work is counted, and an element decided
+    // early stops the rest from being tried.
+    let mut env = Env::new();
+    run(&mut env, "v := 1..10000").unwrap();
+    let many = (0..300).map(|k| format!("{k} if v < {k}")).collect::<Vec<_>>().join(", ");
+    let stmt = parse(&format!("y := {many}, -1 otherwise")).unwrap();
+    assert_eq!(run_stmt_in(&mut env, &stmt, &Pass::new(100_000)).unwrap_err(), CalcError::TooMuchWork);
+    // A long chain of nested piecewise functions is bounded by the call depth.
+    let mut env = Env::new();
+    run(&mut env, "f_0(v) := v").unwrap();
+    for k in 1..40 {
+        run(&mut env, &format!("f_{k}(v) := f_{}(v) + 1 if v > 0, 0 otherwise", k - 1)).unwrap();
+    }
+    assert_eq!(err_in(&mut env, "f_39([1, 2]) ="), "too complex");
+}
+
+#[test]
+fn text_errors_name_a_text_that_did_not_fail() {
+    let texts =
+        Data::TextGrid(Grid { rows: 3, cols: 1, items: vec![String::new(), "b".into(), "c".into()], failed: vec![(0, CalcError::NonFinite)] });
+    assert_eq!(texts.text(), Some("b"));
+}
+
+#[test]
+fn deep_piecewise_is_refused_not_a_stack_overflow() {
+    // Hand-built `if(x > 0, if(x > 0, …), 0)` with a vector `x`, so every level decides per
+    // element: just inside the depth limit evaluates, far past it is refused. Each level costs
+    // more stack than a call level (eval → call → piecewise → per_element → eval); 8 MB covers it,
+    // well inside a recalculation's own stack.
+    let mut env = Env::new();
+    run(&mut env, "x := [1, -1]").unwrap();
+    let deep = move || {
+        let condition = expr_of("x > 0");
+        let nest = |n: usize| (0..n).fold(Expr::Num(1.0), |e, _| Expr::Call("if".into(), vec![condition.clone(), e, Expr::Num(0.0)]));
+        assert_eq!(
+            eval_expr(&env, &nest(1000)),
+            Ok(Value::Grid { rows: 2, cols: 1, items: vec![Quantity::dimensionless(1.0), Quantity::dimensionless(0.0)] })
+        );
+        assert_eq!(eval_expr(&env, &nest(3000)), Err(CalcError::TooComplex));
+        let cases = |n: usize| {
+            (0..n).fold(Expr::Num(1.0), |e, _| Expr::Cases { cases: vec![(e, condition.clone())], otherwise: Some(Box::new(Expr::Num(0.0))) })
+        };
+        assert_eq!(eval_expr(&env, &cases(3000)), Err(CalcError::TooComplex));
+    };
+    std::thread::Builder::new().stack_size(8 << 20).spawn(deep).expect("spawns").join().expect("no panic");
+}
+
+#[test]
+fn no_case_messages_are_written_only_when_they_can_be_seen() {
+    let spent = |env: &mut Env, src: &str| {
+        let pass = Pass::new(u64::MAX);
+        let _ = run_stmt_in(env, &parse(src).unwrap(), &pass);
+        pass.spent.get()
+    };
+    let mut env = Env::new();
+    run(&mut env, "v := 1..10000").unwrap();
+    run(&mut env, "neg(w) := 5 if w < 2").unwrap();
+    run(&mut env, "neg_2(w) := 5 if w < 2, 6 otherwise").unwrap();
+    // In a branch only the first element picks, the other 9,999 elements' messages are still
+    // written (the branch keeps them), and each counts as work.
+    let without = spent(&mut env, "n := neg_2(v) if v < 2, 0 otherwise");
+    let with = spent(&mut env, "n := neg(v) if v < 2, 0 otherwise");
+    assert!(with >= without + 9_990, "{with} vs {without}");
+    let tight = Pass::new(without + 5_000);
+    assert_eq!(run_stmt_in(&mut env, &parse("n := neg(v) if v < 2, 0 otherwise").unwrap(), &tight), Err(CalcError::TooMuchWork));
+    assert_eq!(run(&mut env, "n := neg(v) if v < 2, 0 otherwise"), Ok(None));
+    // A strict caller is told of the first failed element only, so only that message is written.
+    let (strict, decided) = (spent(&mut env, "n := 5 if v < 0"), spent(&mut env, "n := 5 if v < 0, 6 otherwise"));
+    assert!(strict <= decided + 5, "{strict} vs {decided}");
+    assert_eq!(err_in(&mut env, "n := 5 if v < 0"), "element 0: no case applies (v = 1)");
+    // The first failed element is reported, whatever failed it.
+    run(&mut env, "x := [0, 5, -1]").unwrap();
+    assert_eq!(err_in(&mut env, "n := 1/x if x < 1"), "element 0: result isn't a finite number");
+    assert_eq!(err_in(&mut env, "n := 1/x if x < 0"), "element 0: no case applies (x = 0)");
+}
+
+#[test]
+fn statement_boundaries_refuse_a_failed_grid() {
+    // No strict evaluation hands these boundaries a grid with failed elements (it names the
+    // element itself), so the grid is put in the environment directly, as the smallest seam that
+    // reaches each `strict` call.
+    let mut env = Env::new();
+    let items = vec![Val::plain(Quantity::dimensionless(1.0)), crate::array::placeholder(), Val::plain(Quantity::dimensionless(3.0))];
+    let failed = Grid::with_failed(3, 1, items, vec![(1, CalcError::NonFinite)]).unwrap();
+    env.entries.insert("f".into(), super::Entry::Var(Data::Grid(failed)));
+    let want = "element 1: result isn't a finite number".to_string();
+    // `eval_expr`.
+    assert_eq!(eval_expr(&env, &Expr::Name("f".into())).map_err(|e| e.to_string()), Err(want.clone()));
+    // `run_stmt_in`: an evaluation, and a definition with and without show; nothing is defined.
+    assert_eq!(err_in(&mut env, "f ="), want);
+    assert_eq!(err_in(&mut env, "y := f ="), want);
+    assert_eq!(err_in(&mut env, "y := f"), want);
+    assert!(env.data("y").is_none());
+    // An indexed body that is a failed grid is a vector, checked before its failures.
+    run(&mut env, "i := 0..2").unwrap();
+    assert_eq!(err_in(&mut env, "t[i] := f"), "t[i] is one element — its right side can't be a vector");
+}
+
+#[test]
+fn sums() {
+    let mut env = Env::new();
+    for src in ["A_b := 0.5 in^2", "r := [2, 3, 4] in", "a := [1, 2, 3]", "b := [4, 5, 6]"] {
+        run(&mut env, src).unwrap();
+    }
+    assert_eq!(run(&mut env, "∑(i = 0..2) a[i]·b[i] =").unwrap().unwrap().value, 32.0);
+    assert_eq!(run(&mut env, "∑(i = 0..2) a[i]·b[i] + 1 =").unwrap().unwrap().value, 33.0);
+    let i = run(&mut env, "I := ∑(i = 0..length(r) - 1) A_b·r[i]^2 = ? in^4").unwrap().unwrap();
+    assert!((i.value - 0.5 * (4.0 + 9.0 + 16.0) * 0.0254_f64.powi(4)).abs() < 1e-15);
+    assert_eq!(run(&mut env, "∑(i = 1..3) ∑(j = 1..i) j =").unwrap().unwrap().value, 10.0);
+    assert_eq!(run(&mut env, "∑(k = 1, 3..7) k =").unwrap().unwrap().value, 16.0);
+    // Two sums may share an index; a defined name may not be one.
+    assert_eq!(run(&mut env, "∑(i = 1..2) i + ∑(i = 1..3) i =").unwrap().unwrap().value, 9.0);
+    assert_eq!(run(&mut env, "∑(a = 1..2) a =").unwrap_err().to_string(), "the sum's index a is already defined — choose another name");
+    assert_eq!(run(&mut env, "∑(i = 1..2) ∑(i = 1..2) i =").unwrap_err().to_string(), "the sum's index i is already defined — choose another name");
+    assert!(matches!(run(&mut env, "∑(m = 1..2) m ="), Err(CalcError::ReservedName(_))));
+    assert_eq!(run(&mut env, "∑(i = 1..0) i =").unwrap_err().to_string(), "the sum's range is empty — its last value is below its first");
+    assert!(run(&mut env, "∑(i = 0..2) (a[i] + r[i]) =").is_err(), "mixed units");
+    assert!(matches!(run(&mut env, "∑(i = 1..1e9) i ="), Err(CalcError::TooLarge | CalcError::TooMuchWork)));
+    // Review Focus 5: a parameter in the range.
+    run(&mut env, "tri(n) := ∑(i = 1..n) i").unwrap();
+    assert_eq!(run(&mut env, "tri(4) =").unwrap().unwrap().value, 10.0);
+}
+
+#[test]
+fn a_sum_binds_its_index_only_in_its_body() {
+    let mut env = Env::new();
+    // An outer index is a value in the ends of an inner sum, and a parameter too.
+    assert_eq!(run(&mut env, "∑(i = 1..3) ∑(j = i..3) j =").unwrap().unwrap().value, 6.0 + 5.0 + 3.0);
+    run(&mut env, "tri(n) := ∑(i = 1..n) i").unwrap();
+    assert_eq!(run(&mut env, "∑(k = 1..3) tri(k) =").unwrap().unwrap().value, 1.0 + 3.0 + 6.0);
+    // A parameter can't be an index, and a function's body doesn't see the caller's index.
+    run(&mut env, "bad(n) := ∑(n = 1..2) n").unwrap();
+    assert_eq!(err_in(&mut env, "bad(1) ="), "the sum's index n is already defined — choose another name");
+    run(&mut env, "leak(x) := x + k").unwrap();
+    assert_eq!(err_in(&mut env, "∑(k = 1..2) leak(k) ="), "k isn't defined");
+    // The index isn't left behind.
+    assert_eq!(err_in(&mut env, "∑(k = 1..2) k + k ="), "k isn't defined");
+}
+
+#[test]
+fn a_sum_index_must_be_unused_by_functions_and_failed_names() {
+    let mut env = Env::new();
+    run(&mut env, "f(x) := x").unwrap();
+    let msg = "the sum's index f is already defined — choose another name";
+    assert_eq!(err_in(&mut env, "∑(f = 1..2) f ="), msg);
+    env.mark_failed("w");
+    assert_eq!(err_in(&mut env, "∑(w = 1..2) w ="), "the sum's index w is already defined — choose another name");
+}
+
+#[test]
+fn sum_terms_add_under_the_unit_rules() {
+    let mut env = Env::new();
+    // Whole vectors add element by element.
+    run(&mut env, "M := [1, 2; 3, 4]").unwrap();
+    match run_value(&mut env, "∑(i = 1..3) M·i =").unwrap().unwrap() {
+        Value::Grid { items, rows, cols } => {
+            assert_eq!((rows, cols), (2, 2));
+            assert_eq!(items.iter().map(|q| q.value).collect::<Vec<_>>(), vec![6.0, 12.0, 18.0, 24.0]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Shapes must match across terms.
+    run(&mut env, "u := [1, 2, 3]").unwrap();
+    run(&mut env, "w := [1, 2]").unwrap();
+    assert!(run_value(&mut env, "∑(i = 0..1) if(i == 0, u, w) =").is_err());
+    // Units must agree, and text is refused with its place.
+    assert!(run(&mut env, "∑(i = 1..2) i·1 in =").is_ok());
+    assert!(run(&mut env, "∑(i = 1..2) if(i == 1, 1 in, 1 lbf) =").is_err());
+    assert_eq!(err_in(&mut env, "∑(i = 1..2) \"a\" ="), "\"a\" is text — it can't be used in a sum");
+    // A single term is the term itself, in its own unit.
+    let one_term = run(&mut env, "∑(i = 2..2) i·3 in =").unwrap().unwrap();
+    close(one_term, 6.0 * 0.0254, Dim { exp: [1, 0, 0, 0, 0, 0, 0, 0] });
+}
+
+#[test]
+fn sums_are_bounded_work() {
+    let mut env = Env::new();
+    // 10,000 × 10,000 terms is far past the budget.
+    assert!(matches!(run(&mut env, "∑(i = 1..10000) ∑(j = 1..10000) j ="), Err(CalcError::TooComplex | CalcError::TooMuchWork)));
+    // A sum nested as deep as the parser allows still evaluates.
+    let opens: String = (0..40).map(|k| format!("∑(i_{k} = 1..1) ")).collect();
+    let src = format!("{opens}1 =");
+    assert_eq!(run(&mut env, &src).unwrap().unwrap().value, 1.0);
+}

@@ -199,6 +199,24 @@ pub(super) fn insert(app: &mut WordApp, ui: &mut Ui) {
     });
     group(ui, "Symbols", None, app, |ui, app| {
         crate::equation_tab::insert_button(ui, app);
+        stack(ui, |ui| {
+            small(
+                ui,
+                app,
+                "formula",
+                Some("Calculation"),
+                "Insert a calculation with units (P := 1500 lbf)",
+                crate::widgets::ButtonAction::new("insert.calculation", json!({}), false),
+            );
+            small(
+                ui,
+                app,
+                "mergeField",
+                Some("Calculated Value"),
+                "Insert a calculated variable's value in the text",
+                crate::widgets::ButtonAction::new("insert.calcValue", json!({}), false),
+            );
+        });
         menu_button(ui, app, crate::widgets::MenuButtonOptions::new("symbol", Some("Symbol"), "Symbol", true, "insert.symbol"), |ui, app| {
             // Recently used symbols first (their font on hover), then common ones.
             let mut items: Vec<(String, String)> = app.ui.recent_symbols.iter().map(|r| (r.ch.clone(), r.font.clone())).collect();

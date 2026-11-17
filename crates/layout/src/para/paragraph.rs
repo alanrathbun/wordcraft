@@ -343,7 +343,7 @@ impl<'a> Shaped<'a> {
             _ if o.is_drawing() => self.drawing(cx, (k, o), slot, rc.position),
             InlineObject::Field { .. } => self.field(cx, (k, o), slot, rc),
             InlineObject::NoteRef { kind, id, custom } => self.note_ref(cx, (*kind, *id, custom), slot, rc),
-            InlineObject::Equation { linear, display, math } => self.equation(cx, k, slot, rc, (linear, *display, math)),
+            InlineObject::Equation { linear, display, math, .. } => self.equation(cx, k, slot, rc, (linear, *display, math)),
             // A note separator's line: a short one, or one across the column.
             _ if o.as_note_separator().is_some() => {
                 let cont = o.as_note_separator() == Some(true);

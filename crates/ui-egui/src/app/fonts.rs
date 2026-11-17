@@ -63,6 +63,28 @@ impl WordApp {
         }
     }
 
+    /// The calculation box shows a typed `:=` as `≔`, and `∧` `∨` as symbols, which the interface
+    /// fonts lack: while it is open, borrow the faces equations draw them with
+    /// ([`crate::calc_ui::define_mark_face`], [`crate::calc_ui::logic_mark_face`]).
+    pub(super) fn ensure_calc_fonts(&mut self) {
+        if !matches!(self.dialog, Some(crate::dialogs::Dialog::Calc(_))) {
+            return;
+        }
+        let wanted: [(&[char], fn() -> Option<std::sync::Arc<wordcraft_fonts::FontFace>>); 2] = [
+            (&[crate::calc_ui::DEFINE_MARK], crate::calc_ui::define_mark_face),
+            (&[crate::calc_ui::AND_MARK, crate::calc_ui::OR_MARK], crate::calc_ui::logic_mark_face),
+        ];
+        for (chars, face) in wanted {
+            if chars.iter().all(|c| self.canvas.ime_faces.iter().any(|f| f.covers(*c))) {
+                continue;
+            }
+            if let Some(face) = face() {
+                self.canvas.ime_faces.push(face);
+                self.styled = false;
+            }
+        }
+    }
+
     /// File › Recover draws the recovered documents' names with the interface faces too: a
     /// Chinese name was a row of boxes, an Arabic or Hebrew one likewise. The same treatment as
     /// the caption (and as the Recent list, `ensure_recent_fonts`): CJK loads the CJK UI font,

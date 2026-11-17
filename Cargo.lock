@@ -1261,6 +1261,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-units"
+version = "0.1.0"
+source = "git+https://github.com/alanrathbun/craft-libs?rev=04872b543c68bfa63dc583e7334df694c738cd83#04872b543c68bfa63dc583e7334df694c738cd83"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "craft-update"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=6e03f65bf45181db77ba6229716e6624db9eb25b#6e03f65bf45181db77ba6229716e6624db9eb25b"
@@ -7007,6 +7016,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wordcraft-calc"
+version = "0.18.1"
+dependencies = [
+ "craft-units",
+ "proptest",
+ "serde",
+ "thiserror 2.0.21",
+ "wordcraft-doc",
+]
+
+[[package]]
 name = "wordcraft-cli"
 version = "0.18.1"
 dependencies = [
@@ -7066,6 +7086,7 @@ dependencies = [
  "quick-xml 0.41.0",
  "serde",
  "serde_json",
+ "wordcraft-calc",
  "wordcraft-doc",
  "wordcraft-geom",
  "zip 3.0.0",
@@ -7092,6 +7113,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "wordcraft-calc",
  "wordcraft-doc",
  "wordcraft-docbin",
  "wordcraft-docx",
@@ -7253,6 +7275,7 @@ dependencies = [
  "sys-locale",
  "toml",
  "web-time",
+ "wordcraft-calc",
  "wordcraft-doc",
  "wordcraft-engine",
  "wordcraft-fonts",

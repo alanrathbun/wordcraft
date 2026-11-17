@@ -171,6 +171,26 @@ pub(super) fn references(app: &mut WordApp, ui: &mut Ui) {
             );
         });
     });
+    group(ui, "Calculation", None, app, |ui, app| {
+        stack(ui, |ui| {
+            small(
+                ui,
+                app,
+                "update",
+                Some("Recalculate"),
+                "Recalculate every calculation now",
+                crate::widgets::ButtonAction::new("calc.recalculate", json!({}), false),
+            );
+            small(
+                ui,
+                app,
+                "options",
+                Some("Options"),
+                "Calculation Options: unit system, decimal places, manual recalculation",
+                crate::widgets::ButtonAction::new("calc.settings", json!({}), false),
+            );
+        });
+    });
 }
 
 /// Zotero (`docs/zotero.md`): the Zotero desktop app does the work in its own window.

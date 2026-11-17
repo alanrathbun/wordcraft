@@ -1034,6 +1034,9 @@ fn input_dialog_insert(id: &str, params: &Value) -> Option<&'static str> {
         "insert.bookmark" | "insert.deleteBookmark" if !has_value(params, "name") => Some("bookmark"),
         "format.enclose" if params.get("shape").is_none() => Some("enclose"),
         "insert.crossReference" if !has_value(params, "target") => Some("crossReference"),
+        "insert.calculation" if !has_value(params, "source") => Some("calculation"),
+        "insert.calcValue" if !has_value(params, "name") => Some("calcValue"),
+        "calc.edit" => Some("editCalculation"),
         _ => None,
     }
 }
@@ -1063,6 +1066,7 @@ fn input_dialog_references(id: &str, params: &Value) -> Option<&'static str> {
         "references.markEntry" if !has_value(params, "entry") => Some("markEntry"),
         "references.sources" if no_settings(params) => Some("sourceManager"),
         "references.citation" if !has_value(params, "tag") && !has_value(params, "source") => Some("createSource"),
+        "calc.settings" if no_settings(params) => Some("calcOptions"),
         _ => None,
     }
 }
