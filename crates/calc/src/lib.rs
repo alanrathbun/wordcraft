@@ -66,8 +66,8 @@ pub enum CalcError {
     /// The text isn't a valid calculation.
     #[error("{0}")]
     Syntax(String),
-    /// A name that is used but never defined.
-    #[error("{0} isn't defined")]
+    /// A name that is used but never defined (`h` is told to use `hr`).
+    #[error("{0} isn't defined{hint}", hint = if .0 == "h" { " — for hours, use hr" } else { "" })]
     Undefined(String),
     /// A unit or dimension error.
     #[error("{0}")]

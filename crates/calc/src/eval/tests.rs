@@ -1824,3 +1824,35 @@ fn sums_are_bounded_work() {
     let src = format!("{opens}1 =");
     assert_eq!(run(&mut env, &src).unwrap().unwrap().value, 1.0);
 }
+
+#[test]
+fn percent_unit() {
+    close(val("5 % · 200 ="), 10.0, Dim::ONE);
+    close(val("5 % ="), 0.05, Dim::ONE);
+    close(val("x := 0.25 = ? %"), 0.25, Dim::ONE);
+}
+
+#[test]
+fn hour_is_hr() {
+    close(val("1 hr ="), 3600.0, Dim::TIME);
+    let q = val("3412.14 Btu/hr = ? watt");
+    assert_eq!(q.dim, val("1 watt =").dim);
+    assert!((q.value - 1000.0).abs() < 1e-3, "{}", q.value);
+}
+
+#[test]
+fn h_hints_hr() {
+    let e = err("5 h =");
+    assert_eq!(e, CalcError::Undefined("h".into()));
+    assert_eq!(e.to_string(), "h isn't defined — for hours, use hr");
+    // Any other name has no hint.
+    assert_eq!(err("5 hh =").to_string(), "hh isn't defined");
+}
+
+#[test]
+fn newly_reserved_names() {
+    for name in ["bar", "day", "ton", "cal"] {
+        let e = err(&format!("{name} := 3"));
+        assert_eq!(e, CalcError::ReservedName(name.into()), "{name}");
+    }
+}

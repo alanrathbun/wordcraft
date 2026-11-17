@@ -393,6 +393,13 @@ fn unit_names_lex_as_names() {
 }
 
 #[test]
+fn percent_lexes_as_a_unit_name() {
+    assert_eq!(expr_of("5 %"), bin(Op::Mul, num(5.0), name("%")));
+    assert_eq!(expr_of("5 % · 200"), bin(Op::Mul, bin(Op::Mul, num(5.0), name("%")), num(200.0)));
+    assert_eq!(body_of("x := 0.25 %"), bin(Op::Mul, num(0.25), name("%")));
+}
+
+#[test]
 fn definition_heads() {
     assert_eq!(defined_name(&parse("A_b := 2 in^2").unwrap()), Some("A_b"));
     assert_eq!(defined_name(&parse("g(a) := a").unwrap()), Some("g"));

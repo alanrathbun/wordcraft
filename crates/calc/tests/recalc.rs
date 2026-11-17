@@ -2190,3 +2190,52 @@ fn a_quote_mark_of_any_kind_is_refused_in_a_text_cell() {
         assert_eq!(table_calc(&d, 0).errors, [ColumnError { col: Some(0), message }]);
     }
 }
+
+/// The shown result of each calculation in `sources` (its text after the last `=`), in a document
+/// with `system` units.
+fn shown_in(system: wordcraft_doc::calc::UnitSystem, sources: &[&str]) -> Vec<String> {
+    let mut d = doc_with(sources);
+    d.calc_settings = Some(CalcSettings { system, ..CalcSettings::default() });
+    recalc(&mut d, &no_page);
+    (1..=sources.len() as u64).map(|id| region(&d, id).1).collect()
+}
+
+#[test]
+fn percent_shows_as_a_unit() {
+    let shown = shown_in(wordcraft_doc::calc::UnitSystem::UsCustomary, &["x := 0.25", "x = ? %", "y := 5 % * 200 ="]);
+    assert_eq!(shown[1], "x=25 \"%\"");
+    assert_eq!(shown[2], "y≔5 \"%\"·200=10");
+}
+
+#[test]
+fn hour_is_hr() {
+    let shown = shown_in(wordcraft_doc::calc::UnitSystem::UsCustomary, &["q := 3412.14 Btu/hr", "q = ? watt"]);
+    assert_eq!(shown[1], "q=1000 \"watt\"");
+}
+
+#[test]
+fn typed_units_show_as_typed() {
+    let shown = shown_in(
+        wordcraft_doc::calc::UnitSystem::UsCustomary,
+        &["q := 1 kW", "q = ? BTU/hr", "q = ? Btu/hr", "t := 90 s", "t = ? s", "t = ? sec", "t = ? min"],
+    );
+    assert_eq!(shown[1], "q=3412.142 \"BTU/hr\"");
+    assert_eq!(shown[2], "q=3412.142 \"Btu/hr\"");
+    assert_eq!(shown[4], "t=90 \"s\"");
+    assert_eq!(shown[5], "t=90 \"sec\"");
+    assert_eq!(shown[6], "t=1.5 \"min\"");
+}
+
+#[test]
+fn si_results_spell_units() {
+    let shown = shown_in(wordcraft_doc::calc::UnitSystem::Si, &["1 kJ/sec =", "9.8 m/sec^2 =", "5 s ="]);
+    let result = |text: &str| text.rsplit('=').next().unwrap_or_default().to_string();
+    assert_eq!(result(&shown[0]), "1000 \"watt\"");
+    assert_eq!(result(&shown[1]), "9.8 \"m/sec²\"");
+    assert_eq!(result(&shown[2]), "5 \"sec\"");
+}
+
+#[test]
+fn percent_displays_upright_as_a_unit() {
+    assert_eq!(render::display("x := 5 %", None, &CalcState::Fresh), "x≔5 \"%\"");
+}

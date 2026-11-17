@@ -349,6 +349,8 @@ fn lex(src: &str) -> Result<Vec<Tok>, CalcError> {
             ',' => Kind::Comma,
             ';' => Kind::Semi,
             '√' => Kind::Sqrt,
+            // The percent unit: a one-character name, so `5 %` is an implied product like `5 m`.
+            '%' => Kind::Name("%".to_string()),
             '≔' => Kind::Define,
             '≤' => Kind::Le,
             '≥' => Kind::Ge,
