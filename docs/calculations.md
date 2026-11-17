@@ -345,8 +345,7 @@ f := regress(vx, vy, 2)
 interp(f, vx, vy, 5) =            25
 ```
 
-The coefficient vector uses Mathcad's layout, so a worksheet that indexes into it gets the same
-numbers:
+The coefficient vector starts with a header of WordCraft's own, then the values:
 
 | Element | Holds |
 | --- | --- |
@@ -354,6 +353,10 @@ numbers:
 | 1 | 3 |
 | 2 | the degree `k` for `regress`, 0 for a spline |
 | 3 onward | for a spline, its second derivatives at each of `vx`; for `regress`, the coefficients `a_0 … a_k`, `a_0` first |
+
+From element 3 on, `regress`'s coefficients match Mathcad's, so a worksheet that indexes into them
+gets the same numbers. The header (elements 0 to 2) is WordCraft's, and a spline's second
+derivatives from element 3 on are in WordCraft's layout, not yet confirmed against Mathcad's.
 
 `interp` takes the vector as it came from the fitting function and the same `vx` and `vy`. It
 refuses a vector that isn't one of these, or that was made over data of another size or units.

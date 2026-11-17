@@ -1342,9 +1342,15 @@ fn spline_coefficient_vectors_have_the_documented_layout() {
         let per_flow_squared = Dim::LENGTH.div(quantity(1.0, "gpm").dim.powi(2).expect("squared")).expect("quotient");
         assert!(items[3..].iter().all(|q| q.dim == per_flow_squared), "{f}: {items:?}");
     }
-    // The same positions in a document numbered from 1.
+    // The same positions in a document numbered from 1: element 0 of an lspline's vector is 1
+    // (element 1 is 3 whatever the numbering), and base-1 c[5] is base-0 c[4], the second
+    // derivative at the second point (not 0, as at the ends of a natural spline).
+    run(&mut env, "c := lspline(flowrate, head)").expect("defines c");
+    let second = shown(&mut env, "c[4] =");
+    assert!(second.value != 0.0, "{second:?}");
     env.set_origin(1);
-    close(shown(&mut env, "c[1] ="), 3.0, Dim::ONE);
+    close(shown(&mut env, "c[1] ="), 1.0, Dim::ONE);
+    assert_eq!(shown(&mut env, "c[5] ="), second);
 }
 
 #[test]
