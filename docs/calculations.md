@@ -296,8 +296,6 @@ Usually the element-by-element form is simpler: `t := 2·D` gives the same vecto
   1.5 in)".
 - `x` can be a vector in `lookup`, `linterp`, `spline` and `interp` (see
   [Mathcad functions](#mathcad-functions)), giving one result for each element.
-`submatrix` counts from the document's index base (0 unless you chose 1), so `submatrix(M, 0, 1, 1, 2)`
-is the first two rows and the second and third columns of `M` when arrays count from 0.
 
 These names are reserved, like the units and the other functions: `sum`, `length`, `rows`, `cols`,
 `mean`, `dot`, `mmul`, `transpose`, `submatrix`, `augment`, `stack`, `lookup`, `linterp` and
@@ -508,8 +506,9 @@ grades := ["A106 B", "A312 TP316"]
   `transpose`, `submatrix`, `augment` and `stack` work on a vector of texts as on numbers (a text with
   numbers in one matrix is an error).
 - Text can't be used in arithmetic, with a unit, in `<`, `>`, `≤`, `≥`, or in `min`, `max`, `sum`,
-  `mean`, `linterp` or `spline`. The error says so and names the text (`"OK" is text — it can't be
-  used in arithmetic`); a text is never turned into a number.
+  `mean`, `linterp`, `spline`, `cspline`, `lspline`, `pspline`, `regress`, `interp`, `slope` or
+  `intercept`. The error says so and names the text (`"OK" is text — it can't be used in
+  arithmetic`); a text is never turned into a number.
 - Two texts are equal when they match after ignoring spaces at either end and treating a run of
   spaces as one. Capital letters count: `"a" == "A"` is 0.
 - A text result shows in quotes (`check = "OK"`), and a vector of texts as a bracketed column. A
